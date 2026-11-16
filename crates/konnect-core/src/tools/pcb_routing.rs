@@ -12,7 +12,7 @@ use crate::tools::{
     with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
 use anyhow::Context;
-use konnect_sexp::writer::{apply_edits, write_atomic, write_atomic_if_unchanged, SexpEdit};
+use konnect_sexp::writer::{apply_edits, write_atomic_if_unchanged, SexpEdit};
 use prost::Message;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
@@ -1300,10 +1300,12 @@ fn project_settings_path(board_path: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Load the project JSON, refusing (rather than inventing a file KiCad never
-/// reads) when it is absent.
+/// reads) when it is absent. Also returns the exact text it was parsed from,
+/// the `expected` for a revision-checked save (#964).
+#[allow(clippy::type_complexity)]
 fn load_project_settings(
     board_path: &std::path::Path,
-) -> anyhow::Result<Result<(std::path::PathBuf, serde_json::Value), CallToolResult>> {
+) -> anyhow::Result<Result<(std::path::PathBuf, serde_json::Value, String), CallToolResult>> {
     let pro = project_settings_path(board_path);
     if !pro.exists() {
         return Ok(Err(CallToolResult::error(format!(
@@ -1313,9 +1315,10 @@ fn load_project_settings(
             pro.display()
         ))));
     }
-    let settings: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pro)?)
+    let text = std::fs::read_to_string(&pro)?;
+    let settings: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", pro.display()))?;
-    Ok(Ok((pro, settings)))
+    Ok(Ok((pro, settings, text)))
 }
 
 /// The netclass writers' guard. Saving the board in KiCad also rewrites the
@@ -1341,17 +1344,23 @@ async fn refuse_while_kicad_holds_the_project(
     ))
 }
 
+/// Save the project JSON only while the file still holds `expected`, the
+/// text `settings` was loaded from (#964). Returns a `conflict` result, with
+/// the file left untouched, when something rewrote it in between.
 fn save_project_settings(
     pro: &std::path::Path,
+    operation: &str,
+    expected: String,
     settings: &serde_json::Value,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<CallToolResult>> {
     // KiCad's own writer emits 2-space-indented JSON with alphabetical keys;
     // serde_json's pretty printer matches both, so the diff stays minimal.
-    write_atomic(
+    crate::tools::pcb_board::write_project_if_unchanged(
         pro,
-        &format!("{}\n", serde_json::to_string_pretty(settings)?),
-    )?;
-    Ok(())
+        operation,
+        expected,
+        format!("{}\n", serde_json::to_string_pretty(settings)?),
+    )
 }
 
 /// The class every other class inherits from. `SetName` marks it on an exact
@@ -1413,7 +1422,7 @@ async fn handle_create_netclass(
     // Only the Default must be complete. Every other class may stay sparse.
     let is_default = name == DEFAULT_CLASS_NAME;
 
-    let (pro, mut settings) = match load_project_settings(&board_path)? {
+    let (pro, mut settings, project_text) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -1500,7 +1509,11 @@ async fn handle_create_netclass(
     // whole project file — the serialiser re-emits the document rather than
     // patching it — for a call that decided nothing.
     if changed {
-        save_project_settings(&pro, &settings)?;
+        if let Some(conflict) =
+            save_project_settings(&pro, "create_netclass", project_text, &settings)?
+        {
+            return Ok(conflict);
+        }
     }
 
     let note = if backfilled.is_empty() {
@@ -1604,7 +1617,7 @@ async fn handle_get_netclasses(
         Ok(source) => source,
         Err(refusal) => return Ok(refusal),
     };
-    let (pro, settings) = match load_project_settings(&board_path)? {
+    let (pro, settings, _) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -1840,7 +1853,7 @@ async fn handle_assign_net_to_class(
         return Ok(refusal);
     }
 
-    let (pro, mut settings) = match load_project_settings(&board_path)? {
+    let (pro, mut settings, project_text) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -1901,7 +1914,11 @@ async fn handle_assign_net_to_class(
     } else {
         patterns.push(json!({ "netclass": netclass, "pattern": net_name }));
     }
-    save_project_settings(&pro, &settings)?;
+    if let Some(conflict) =
+        save_project_settings(&pro, "assign_net_to_class", project_text, &settings)?
+    {
+        return Ok(conflict);
+    }
 
     Ok(CallToolResult::json(&json!({
         "assigned": true,

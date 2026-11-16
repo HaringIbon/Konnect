@@ -3,6 +3,16 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: project-file writers refuse a .kicad_pro that changed mid-edit (patch release)
+
+`set_design_rules`, `set_predefined_sizes`, `create_netclass` and
+`assign_net_to_class` now replace the sibling `.kicad_pro` only while it still
+holds the text they read. If another call, Konnect server or KiCad program
+rewrote it in between, the call returns `conflict` naming the project file and
+leaves that newer file untouched; retry to apply the change on top of it. A
+file that no longer holds the edit when read back after the write returns
+`mutation_outcome_uncertain`. Successful responses are unchanged (#964).
+
 ## Unreleased: board file fallbacks refuse a board that changed mid-edit (patch release)
 
 `add_layer` always edits the saved board file. `set_board_size`,

@@ -290,3 +290,50 @@ async fn each_writer_writes_when_no_kicad_program_holds_the_project() {
         );
     }
 }
+
+/// Another writer rewrites the project file between a writer's read and its
+/// write (#964): a concurrent call on the HTTP transport, a second Konnect
+/// server, or KiCad. The writer refuses as `conflict`, names the file, and
+/// leaves the other writer's bytes in place instead of restoring its own
+/// older read with its edit on top.
+#[tokio::test]
+async fn each_writer_refuses_a_project_file_changed_between_read_and_write() {
+    use crate::tools::pcb_board::board_write_hook;
+    for tool in PROJECT_FILE_WRITERS {
+        let project = project();
+        let original = std::fs::read_to_string(&project.project_file).unwrap();
+        // A real edit another writer could make: a different clearance.
+        let newer = original.replacen("\"min_clearance\": 0.0", "\"min_clearance\": 0.15", 1);
+        let newer = if newer == original {
+            format!("{}\n", original.trim_end())
+        } else {
+            newer
+        };
+        assert_ne!(newer, original);
+        let handler = handler_talking_to("").await;
+
+        board_write_hook::set({
+            let newer = newer.clone();
+            move |path| std::fs::write(path, newer).unwrap()
+        });
+        let result = call(&handler, tool, &project.board, &arguments_for(tool)).await;
+
+        assert!(
+            !board_write_hook::armed(),
+            "{tool} bypassed the revision-checked write"
+        );
+        assert!(result.is_error, "{tool} reported success over a newer file");
+        let error = &body_of(&result)["error"];
+        assert_eq!(error["kind"], "conflict", "{tool}: {error}");
+        assert_eq!(
+            error["paths"],
+            json!([project.project_file.display().to_string()]),
+            "{tool}: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&project.project_file).unwrap(),
+            newer,
+            "{tool} must leave the newer project file byte for byte"
+        );
+    }
+}

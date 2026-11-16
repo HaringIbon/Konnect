@@ -432,7 +432,7 @@ fn board_write_outcome(
 /// A test-only seam between a fallback's read and its write, where a test
 /// plays the intervening save.
 #[cfg(test)]
-mod board_write_hook {
+pub(crate) mod board_write_hook {
     use std::cell::RefCell;
     use std::path::Path;
 
@@ -443,16 +443,16 @@ mod board_write_hook {
     }
 
     /// Run `hook` just before the next board write on this thread.
-    pub(super) fn set(hook: impl FnOnce(&Path) + 'static) {
+    pub(crate) fn set(hook: impl FnOnce(&Path) + 'static) {
         HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     }
 
     /// Whether a hook is still waiting for a write.
-    pub(super) fn armed() -> bool {
+    pub(crate) fn armed() -> bool {
         HOOK.with(|slot| slot.borrow().is_some())
     }
 
-    pub(super) fn run(path: &Path) {
+    pub(crate) fn run(path: &Path) {
         if let Some(hook) = HOOK.with(|slot| slot.borrow_mut().take()) {
             hook(path);
         }
@@ -510,6 +510,58 @@ pub(crate) fn refuse_if_project_locked_by_kicad(
     what: &str,
 ) -> Option<CallToolResult> {
     project_lock_refusal_from(project_path, what, live_board::project_lock(project_path))
+}
+
+/// Replace a project file with `content` only while it still holds
+/// `expected`, the text the edit was built from (#964). A project file that
+/// another call, Konnect server or KiCad program rewrote in between is refused
+/// as `conflict` and left as that writer left it, instead of being replaced
+/// with an edit of the older read. Returns `None` once written.
+pub(crate) fn write_project_if_unchanged(
+    project_path: &Path,
+    operation: &str,
+    expected: String,
+    content: String,
+) -> anyhow::Result<Option<CallToolResult>> {
+    #[cfg(test)]
+    board_write_hook::run(project_path);
+    let written = transact_atomic(project_path, move |current| {
+        Ok(if current == expected {
+            (content, true)
+        } else {
+            (current.to_owned(), false)
+        })
+    });
+    let path = project_path.display().to_string();
+    match written {
+        Ok(true) => Ok(None),
+        Ok(false) => Ok(Some(CallToolResult::error_kind(
+            ToolErrorKind::Conflict {
+                paths: vec![path.clone()],
+            },
+            format!(
+                "Project file '{path}' changed after Konnect read it, so {operation} wrote \
+                 nothing. Retry to apply the change on top of the current file."
+            ),
+        ))),
+        // The writer reports a readback that no longer holds the edit as
+        // `Conflict`; by then the file was replaced, so that is uncertain.
+        Err(SexpError::Conflict { .. }) => {
+            let reason = "the project file no longer held the edit when read back after the write";
+            Ok(Some(CallToolResult::error_kind(
+                ToolErrorKind::MutationOutcomeUncertain {
+                    operation: operation.to_string(),
+                    path: path.clone(),
+                    reason: reason.to_string(),
+                },
+                format!(
+                    "{operation} replaced project file '{path}', but {reason}. Another program \
+                     may have saved it. Inspect the file before retrying."
+                ),
+            )))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn project_lock_refusal_from(

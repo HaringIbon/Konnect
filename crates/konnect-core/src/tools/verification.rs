@@ -476,7 +476,14 @@ async fn handle_set_design_rules(
     if !changed.is_empty() {
         let mut content = serde_json::to_string_pretty(&project)?;
         content.push('\n');
-        write_atomic(&project_path, &content)?;
+        if let Some(conflict) = crate::tools::pcb_board::write_project_if_unchanged(
+            &project_path,
+            "set_design_rules",
+            project_content,
+            content,
+        )? {
+            return Ok(conflict);
+        }
     }
 
     Ok(CallToolResult::text(
@@ -541,7 +548,12 @@ fn project_design_settings_mut(
         })
 }
 
-fn load_sibling_project(board: &Path) -> anyhow::Result<Result<(PathBuf, Value), CallToolResult>> {
+/// The sibling project's path, parsed JSON, and the exact text it was parsed
+/// from (the `expected` for a revision-checked write, #964).
+#[allow(clippy::type_complexity)]
+fn load_sibling_project(
+    board: &Path,
+) -> anyhow::Result<Result<(PathBuf, Value, String), CallToolResult>> {
     let project_path = sibling_project_path(board);
     if !project_path.exists() {
         return Ok(Err(CallToolResult::error(format!(
@@ -551,9 +563,10 @@ fn load_sibling_project(board: &Path) -> anyhow::Result<Result<(PathBuf, Value),
             project_path.display()
         ))));
     }
-    let settings: Value = serde_json::from_str(&std::fs::read_to_string(&project_path)?)
+    let text = std::fs::read_to_string(&project_path)?;
+    let settings: Value = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", project_path.display()))?;
-    Ok(Ok((project_path, settings)))
+    Ok(Ok((project_path, settings, text)))
 }
 
 fn finite_positive(value: f64, field: &str) -> Result<f64, CallToolResult> {
@@ -696,7 +709,7 @@ async fn handle_set_predefined_sizes(
         return Ok(refusal);
     }
 
-    let (project_path, mut project) = match load_sibling_project(&board)? {
+    let (project_path, mut project, project_content) = match load_sibling_project(&board)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -724,7 +737,14 @@ async fn handle_set_predefined_sizes(
         settings.insert("via_dimensions".into(), via_dimensions.clone());
         let mut content = serde_json::to_string_pretty(&project)?;
         content.push('\n');
-        write_atomic(&project_path, &content)?;
+        if let Some(conflict) = crate::tools::pcb_board::write_project_if_unchanged(
+            &project_path,
+            "set_predefined_sizes",
+            project_content,
+            content,
+        )? {
+            return Ok(conflict);
+        }
     }
 
     Ok(CallToolResult::json(&json!({
@@ -743,7 +763,7 @@ async fn handle_get_predefined_sizes(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let (project_path, project) = match load_sibling_project(&board)? {
+    let (project_path, project, _) = match load_sibling_project(&board)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
