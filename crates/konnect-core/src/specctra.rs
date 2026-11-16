@@ -17,6 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, Cursor};
 use std::path::Path;
 
+pub(crate) mod native;
+
 const UM_PER_MM: f64 = 1_000.0;
 const DSN_RESOLUTION: f32 = 10.0;
 
@@ -36,6 +38,8 @@ pub(crate) struct ExportBundle {
 enum PadShape {
     Circle,
     Rect,
+    /// A pad whose geometry stays as KiCad's own DSN wrote it (schema 2).
+    Native,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -132,6 +136,9 @@ struct SupportedProfile {
     copper_zones: bool,
     custom_rules: bool,
     outline: String,
+    /// Layers KiCad typed `power`; Freerouting does not route on them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    plane_layers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1434,6 +1441,7 @@ fn padstack(name: &str, key: &PadstackKey) -> dsn::Padstack {
                 x2: key.size_x_um as f64 / 2.0,
                 y2: key.size_y_um as f64 / 2.0,
             }),
+            PadShape::Native => unreachable!("the strict exporter never builds a native pad"),
         })
         .collect();
     dsn::Padstack {
@@ -1545,6 +1553,7 @@ fn build_manifest(
             copper_zones: false,
             custom_rules: false,
             outline: "one closed loop of straight Edge.Cuts lines".to_string(),
+            plane_layers: Vec::new(),
         },
         layers: copper_layers
             .iter()

@@ -2304,3 +2304,16 @@ footprint over IPC with its library `(attr …)` flags, description, keywords an
 3D models, as `update_pcb_from_schematic` has done since #789. A footprint
 whose `(attr …)` or `(model …)` the shared reader cannot represent is now
 refused by these tools too, rather than placed without it.
+
+## Unreleased (fork): `export_specctra_dsn` falls back to KiCad's exporter
+
+`export_specctra_dsn` takes an optional `exporter`:
+- `auto` (default): when the strict Rust exporter refuses a board, or the board has a `.kicad_dru`, the DSN comes from KiCad's own exporter (`pcbnew.ExportSpecctraDSN` on the same IPC snapshot), and the result's `method` is `kicad_native_pcbnew`.
+- `strict`: restores the previous behaviour, including the up-front `.kicad_dru` refusal.
+- `kicad`: always uses KiCad's exporter.
+
+Boards the strict exporter accepted are exported exactly as before.
+
+In KiCad's DSN, zones are removed from the routing job and listed in `removed_planes`. Their nets are routed as ordinary nets. Layers KiCad types `power` are listed in `power_layers_not_routed`. The reverse manifest for such an export is schema 2. `plan_specctra_ses_import` and `apply_specctra_ses` accept schemas 1 and 2.
+
+The SES importer now accepts Freerouting 2.1's repeated via padstacks, and drops exact repeated wires instead of refusing the session. The plan reports how many were dropped as `duplicate_wires_dropped`.

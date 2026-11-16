@@ -254,13 +254,16 @@ pub fn tools() -> Vec<ToolDef> {
              editor revision. Requires the named board to be open with IPC enabled. On KiCad 10, \
              an enabled authenticated ActionPlugin bridge supplies KiCad's native DSN while the \
              IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
-             is used. The first \
-             supported profile is deliberately narrow: two copper layers, front-side SMD or \
-             through-hole footprints, circle/rectangle pads, one straight-line closed outline, \
-             and no existing tracks, vias, or zones. Konnect refuses unsupported geometry or \
-             custom DRC rules, or incomplete effective routing rules instead of approximating \
-             them, and writes a \
-             revision-bound reverse manifest beside the DSN for later SES import.",
+             is used. The strict Rust profile is deliberately narrow: two copper layers, \
+             front-side SMD or through-hole footprints, circle/rectangle pads, one straight-line \
+             closed outline, no zones, no custom DRC rules. With exporter 'auto' (default), a \
+             board outside that profile is exported by KiCad's own Specctra exporter instead \
+             (pcbnew Python on the same IPC snapshot): any layer count, any pad shape, arc \
+             outlines, back-side parts, zones. Zones are removed from the routing job, since \
+             Freerouting cannot route through Specctra planes; zone nets are routed as \
+             ordinary nets on the signal layers, and inner layers KiCad types 'power' are not \
+             routed on. Refill zones after import. Existing tracks and vias must be locked on \
+             either path. Writes a revision-bound reverse manifest beside the DSN for SES import.",
             json!({
                 "type": "object",
                 "properties": {
@@ -281,6 +284,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["prefer", "require", "disable"],
                         "default": "disable",
                         "description": "KiCad 10 native-export policy. Rust-only 'disable' is the default; 'prefer' explicitly opts into the enabled authenticated ActionPlugin bridge with the Rust exporter as fallback; 'require' refuses fallback."
+                    },
+                    "exporter": {
+                        "type": "string",
+                        "enum": ["auto", "strict", "kicad"],
+                        "default": "auto",
+                        "description": "'auto': the strict Rust exporter, or KiCad's own exporter when the board is outside the strict profile. 'strict': refuse instead of falling back. 'kicad': always KiCad's exporter."
                     }
                 },
                 "required": ["board", "output"]
@@ -697,6 +706,97 @@ fn resolve_native_bridge_mode(args: &serde_json::Value) -> &str {
     args["native_bridge_mode"].as_str().unwrap_or("disable")
 }
 
+/// Export through KiCad's own Specctra exporter (see `specctra::native`).
+async fn export_specctra_with_kicad(
+    ctx: &ToolContext,
+    board_path: &Path,
+    output_path: &Path,
+    manifest_output_path: &Path,
+    source_snapshot: &str,
+    strict_reason: &str,
+) -> anyhow::Result<CallToolResult> {
+    let python = crate::specctra::native::kicad_python(&ctx.config.kicad_cli);
+    let native = match crate::specctra::native::export(&python, board_path, source_snapshot).await
+    {
+        Ok(native) => native,
+        Err(error) => {
+            let reason = format!("{error:#}");
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: reason.clone(),
+                },
+                format!(
+                    "Specctra export refused: the strict exporter refused ({strict_reason}) \
+                     and KiCad's exporter failed: {reason}"
+                ),
+            ));
+        }
+    };
+    // The board must not have changed while KiCad's exporter ran on the copy.
+    let board_for_stability = board_path.to_path_buf();
+    let addr = ctx.config.ipc_address.clone();
+    let stable = with_ipc(addr, move |client| {
+        let document = client.find_open_board(&board_for_stability)?;
+        client.save_document_to_string_in(document)
+    })
+    .await?;
+    if stable.as_deref() != Ok(source_snapshot) {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::Conflict {
+                paths: vec![board_path.display().to_string()],
+            },
+            "KiCad board changed during the Specctra export; retry from a stable editor revision",
+        ));
+    }
+
+    let (output, manifest_path) = (output_path.to_path_buf(), manifest_output_path.to_path_buf());
+    let (dsn, manifest) = (native.bundle.dsn.clone(), native.bundle.manifest.clone());
+    task::spawn_blocking(move || write_specctra_export_pair(&output, &dsn, &manifest_path, &manifest))
+        .await
+        .map_err(|error| anyhow::anyhow!("Specctra output writer panicked: {error}"))??;
+
+    let mut warnings = Vec::new();
+    if !native.removed_planes.is_empty() {
+        warnings.push(
+            "Zones were removed from the routing job (Freerouting cannot route through Specctra \
+             planes). Their nets are routed as ordinary nets; refill zones after the SES import."
+                .to_string(),
+        );
+    }
+    if native.custom_rules {
+        warnings.push(
+            "The board's .kicad_dru custom rules are not in the DSN; the router does not see \
+             them. The SES import runs DRC with them."
+                .to_string(),
+        );
+    }
+    Ok(CallToolResult::text(
+        json!({
+            "success": true,
+            "method": "kicad_native_pcbnew",
+            "strict_exporter_refusal": strict_reason,
+            "board": board_path,
+            "output": output_path,
+            "manifest_output_path": manifest_output_path,
+            "source_sha256": native.bundle.source_sha256,
+            "component_count": native.bundle.component_count,
+            "pad_count": native.bundle.pad_count,
+            "net_count": native.bundle.net_count,
+            "routing_class_count": native.bundle.class_count,
+            "copper_layers": native.copper_layers,
+            "power_layers_not_routed": native.power_layers,
+            "removed_planes": native.removed_planes,
+            "warnings": warnings,
+            "capabilities": {
+                "dsn_export_available": true,
+                "source_revision_bound": true,
+                "supported_profile": "kicad_native"
+            }
+        })
+        .to_string(),
+    ))
+}
+
 async fn handle_export_specctra_dsn(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -708,6 +808,13 @@ async fn handle_export_specctra_dsn(
         .map(PathBuf::from)
         .unwrap_or_else(|| default_specctra_manifest_path(&output_path));
     let native_bridge_mode = resolve_native_bridge_mode(args);
+    let exporter = args["exporter"].as_str().unwrap_or("auto");
+    if !matches!(exporter, "auto" | "strict" | "kicad") {
+        return Ok(invalid_export_argument(
+            "exporter",
+            "must be 'auto', 'strict', or 'kicad'",
+        ));
+    }
 
     if !extension_is(&board_path, "kicad_pcb") {
         return Ok(invalid_export_argument(
@@ -749,7 +856,7 @@ async fn handle_export_specctra_dsn(
         .canonicalize()
         .with_context(|| format!("resolve board {}", board_path.display()))?;
     let custom_rules_path = board_path.with_extension("kicad_dru");
-    if custom_rules_path.is_file() {
+    if custom_rules_path.is_file() && exporter == "strict" {
         return Ok(CallToolResult::error_kind(
             ToolErrorKind::HandlerError {
                 reason: format!(
@@ -775,12 +882,11 @@ async fn handle_export_specctra_dsn(
                 "KiCad board changed while routing rules were captured; retry from a stable editor revision"
             );
         }
-        let export = crate::specctra::export_dsn(&board_for_ipc, &before, &rules)?;
-        Ok((export, before))
+        Ok((before, rules))
     })
     .await?;
-    let (baseline, source_snapshot) = match export {
-        Ok(export) => export,
+    let (source_snapshot, rules) = match export {
+        Ok(captured) => captured,
         Err(reason) => {
             return Ok(CallToolResult::error_kind(
                 ToolErrorKind::HandlerError {
@@ -788,6 +894,37 @@ async fn handle_export_specctra_dsn(
                 },
                 format!("Specctra export refused: {reason}"),
             ));
+        }
+    };
+    // The strict exporter first, unless the caller asked for KiCad's or the
+    // board carries custom rules (which only KiCad's exporter can ignore with
+    // a warning; the strict profile refuses them).
+    let strict = if exporter == "kicad" || custom_rules_path.is_file() {
+        Err("custom DRC rules or exporter 'kicad'".to_string())
+    } else {
+        crate::specctra::export_dsn(&board_path, &source_snapshot, &rules)
+            .map_err(|error| format!("{error:#}"))
+    };
+    let baseline = match strict {
+        Ok(baseline) => baseline,
+        Err(reason) if exporter == "strict" => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: reason.clone(),
+                },
+                format!("Specctra export refused: {reason}"),
+            ));
+        }
+        Err(strict_reason) => {
+            return export_specctra_with_kicad(
+                ctx,
+                &board_path,
+                &output_path,
+                &manifest_output_path,
+                &source_snapshot,
+                &strict_reason,
+            )
+            .await;
         }
     };
     // Preserve the method string shipped with the Rust exporter so existing
@@ -1206,7 +1343,7 @@ mod new_export_format_tests {
     }
 
     #[tokio::test]
-    async fn specctra_export_refuses_custom_rule_file_before_ipc() {
+    async fn strict_specctra_export_refuses_custom_rule_file_before_ipc() {
         let dir = tempfile::tempdir().expect("tempdir");
         let board = dir.path().join("board.kicad_pcb");
         let rules = dir.path().join("board.kicad_dru");
@@ -1215,9 +1352,14 @@ mod new_export_format_tests {
         std::fs::write(&rules, "(rule custom)").expect("custom rules fixture");
 
         let result =
-            handle_export_specctra_dsn(&json!({ "board": board, "output": output }), &test_ctx())
-                .await
-                .expect("unsupported profile is an MCP result");
+            // Only the strict exporter refuses custom rules; 'auto' hands the
+            // board to KiCad's exporter, which leaves them to the import's DRC.
+            handle_export_specctra_dsn(
+                &json!({ "board": board, "output": output, "exporter": "strict" }),
+                &test_ctx(),
+            )
+            .await
+            .expect("unsupported profile is an MCP result");
 
         assert!(result.is_error);
         assert!(!output.exists());

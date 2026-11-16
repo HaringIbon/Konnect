@@ -794,6 +794,7 @@ struct ApplyEvidence {
     drc_violations: usize,
     unconnected_items: usize,
     schematic_parity_violations: usize,
+    refill_zones: bool,
 }
 
 fn created_route_item_ids(items: &[prost_types::Any]) -> anyhow::Result<Vec<String>> {
@@ -1015,7 +1016,14 @@ async fn handle_apply_specctra_ses(
             let candidate_source = client.save_document_to_string_in(document.clone())?;
             konnect_sexp::write_new_atomic(&candidate_for_ipc, &candidate_source)
                 .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
-            let drc = runtime.block_on(cli::run_drc(&cli_path, &candidate_for_ipc, false))?;
+            // A board with zones is checked with them refilled: a schema-2
+            // export routes plane nets as ordinary nets, and the planes only
+            // reconnect once the zones are refilled around the new copper.
+            let drc = runtime.block_on(cli::run_drc(
+                &cli_path,
+                &candidate_for_ipc,
+                plan.refill_zones,
+            ))?;
             let parity_count = drc.schematic_parity.as_ref().map_or(0, Vec::len);
             Ok(ApplyEvidence {
                 source_sha256: plan.source_sha256.clone(),
@@ -1029,6 +1037,7 @@ async fn handle_apply_specctra_ses(
                 drc_violations: drc.violations.len(),
                 unconnected_items: drc.unconnected_items.as_ref().map_or(0, Vec::len),
                 schematic_parity_violations: parity_count,
+                refill_zones: plan.refill_zones,
             })
         })();
         match operation {
@@ -1095,7 +1104,13 @@ async fn handle_apply_specctra_ses(
                     && evidence.schematic_parity_violations == 0,
                 "violations": evidence.drc_violations,
                 "unconnected_items": evidence.unconnected_items,
-                "schematic_parity_violations": evidence.schematic_parity_violations
+                "schematic_parity_violations": evidence.schematic_parity_violations,
+                "zones_refilled": evidence.refill_zones
+            },
+            "next_step": if evidence.refill_zones {
+                "The live board's zones were not refilled; call refill_zones, then save."
+            } else {
+                "Save the board."
             }
         }))),
         Err(failure) => {

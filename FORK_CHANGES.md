@@ -1,7 +1,9 @@
 # Fork changes
 
-Two passes so far: the safe-write fixes (below), then the simple tool fixes
-found by the proof-of-concept boards (see [Pass 2](#pass-2-simple-tool-fixes)).
+Three passes so far:
+1. The safe-write fixes (below).
+2. The simple tool fixes found by the proof-of-concept boards ([Pass 2](#pass-2-simple-tool-fixes)).
+3. Freerouting export through KiCad's own exporter, including 4-layer boards with inner planes ([Pass 3](#pass-3-freerouting-export-through-kicads-exporter)).
 
 ## Pass 1: safe-write fixes
 
@@ -168,3 +170,54 @@ item; `place_footprint` now calls it), `builders::build_via_span`
   - `export_manufacturing_package` (jlcpcb) is now `complete: true`.
   - Blind (F.Cu→In1.Cu), buried (In1.Cu→In2.Cu) and micro vias are saved as `(via blind|buried|micro … (layers …))`. A contradicting `via_type` is refused.
   - DRC accepts the new via types. The only errors were hole clearance to H1, from the test's own placement of the via 1.4 mm from the hole.
+
+## Pass 3: Freerouting export through KiCad's exporter
+
+**Problem:**
+- `export_specctra_dsn` refused almost every real board: anything with
+  - more or fewer than 2 copper layers (#449),
+  - zones,
+  - roundrect, oval or NPTH pads (#790),
+  - arc outline corners,
+  - repeated pad numbers,
+  - back-side parts,
+  - or a `.kicad_dru` (#670/#685).
+- The SES importer mirrored the same 2-layer, no-zone profile.
+- The optional native path (ActionPlugin bridge) correlated KiCad's DSN against the strict exporter's output, so it could only ever accept boards the strict exporter already accepted. Its Topola syntax check also rejects KiCad's own `(outline (polygon …))` image outlines.
+
+**Change:** with the new default `exporter: "auto"`, a board the strict exporter refuses (or one with a `.kicad_dru`) is exported by KiCad's own `pcbnew.ExportSpecctraDSN`.
+- It runs on the exact IPC snapshot, written to a private temp dir with the project file, so the live board file is never touched. The board must be unchanged afterwards, or the export returns `conflict`.
+- Python is `KONNECT_KICAD_PYTHON`, else the interpreter beside `kicad-cli`, else `python3`.
+- The DSN is post-processed:
+  - **Zones:** every `(plane …)` form is removed and reported, because Freerouting 2.1 treats Specctra planes as obstacles to every other net. Measured on the 4-layer PoC board: 35 of 41 connections unrouted after 999 passes with the planes in; fully routed in 5 passes without them.
+  - **Power layers:** layers KiCad types `power` stay in the DSN, and Freerouting does not route on them.
+  - **Zone nets:** routed as ordinary nets on the signal layers.
+- The reverse manifest is built from that DSN (**schema 2**): layers, components (bound to board KIIDs by reference), pins, nets and classes. Via padstacks get their size and drill from KiCad's `Via[a-b]_D:d_um` name. Rotations are normalised to [0, 360).
+- Existing routing must still be locked, as on the strict path.
+
+**SES importer:**
+- Accepts schema 2: any copper layer count, zones, custom rules, and front or back parts. The manifest, revision-hash, placement, net, layer and via checks all still apply.
+- Refuses copper on a plane layer.
+- Compares rotations modulo 360.
+- Two changes for Freerouting 2.1's real output, on both schemas:
+  - A via padstack repeated in `library_out` is accepted (each copy is still checked).
+  - An exact repeat of a wire (same net, layer, width and endpoints) is dropped and counted in `duplicate_wires_dropped`, instead of refusing the session.
+- `apply_specctra_ses` runs its DRC with zone refill when the board has zones, and its response says to refill the live zones.
+
+| Tool | Schema |
+|---|---|
+| `export_specctra_dsn` | **new optional `exporter`** (`auto`/`strict`/`kicad`); description changed. `strict` is the old behaviour. The response gains `strict_exporter_refusal`, `copper_layers`, `power_layers_not_routed`, `removed_planes` and `warnings` when KiCad's exporter was used (`method: kicad_native_pcbnew`). |
+| `plan_specctra_ses_import`, `apply_specctra_ses` | unchanged inputs; `apply_specctra_ses` adds `drc.zones_refilled` and `next_step` |
+
+**Verification:**
+- **Fixture:** `tests/fixtures/specctra_native_4layer.*` holds the real KiCad 10.0.8 DSN and Freerouting 2.1.0 SES of the 4-layer board (see its README). `specctra::native::round_trip_tests` lowers it, plans the import (244 segments, 12 vias, all on F.Cu/B.Cu), and checks that a session routing on In1.Cu and one for another revision are both refused.
+- **Live** (`poc/freerouting_check.py`, on `poc/frcheck`: the 4-layer board with all routing removed, zones and `.kicad_dru` kept):
+  - `export_specctra_dsn` used KiCad's exporter (4 layers, In1/In2 not routed, 3 planes stripped, `.kicad_dru` warning).
+  - Freerouting 2.1.0 routed it completely in 3 passes.
+  - `plan_specctra_ses_import`, then `apply_specctra_ses`, created 243 tracks and 6 vias in one undoable commit, with an exact IPC read-back.
+  - After `refill_zones`, DRC shows **0 errors and 0 unconnected items**. The warnings are the board's existing ones, plus 2 dangling track ends from Freerouting.
+- **Not exercised:** `route_specctra_dsn` drives Freerouting's built-in MCP server, which needs Freerouting 2.3.0. Only 2.1.0 is installed here (it has no MCP server), so the routing step ran with Freerouting's own CLI instead.
+
+**Still open:**
+- Unlocked existing routing is refused, and no Konnect tool locks tracks.
+- A Konnect-owned fanout-to-plane step would let plane nets drop straight to their planes instead of being routed as traces.

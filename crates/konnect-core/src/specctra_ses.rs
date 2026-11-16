@@ -20,6 +20,13 @@ pub(crate) struct SesImportPlan {
     pub session_id: String,
     pub locked_track_count: usize,
     pub locked_via_count: usize,
+    /// The board has copper zones; refill them after applying the routes
+    /// (schema-2 exports route plane nets as ordinary nets and drop the planes).
+    pub refill_zones: bool,
+    /// Exact repeats of a segment or arc already in the plan (same net,
+    /// layer, width and endpoints). Freerouting 2.1 writes some wires twice;
+    /// the copper is identical, so the repeat is dropped, not created.
+    pub duplicate_wires_dropped: usize,
     pub tracks: Vec<SesTrack>,
     pub arcs: Vec<SesArc>,
     pub vias: Vec<SesVia>,
@@ -88,6 +95,8 @@ struct SupportedProfile {
     copper_zones: bool,
     custom_rules: bool,
     outline: String,
+    #[serde(default)]
+    plane_layers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,13 +201,23 @@ pub(crate) fn parse_import_plan(
         route_resolution,
         &manifest,
     )?;
-    let (tracks, arcs, vias) = parse_network(
+    let (tracks, arcs, vias, duplicate_wires_dropped) = parse_network(
         one_child(routes, "network_out")?,
         route_resolution,
         &manifest,
     )?;
     if tracks.is_empty() && arcs.is_empty() && vias.is_empty() {
         bail!("SES contains no route primitives");
+    }
+    // A power layer is a plane; a trace on it would cut the plane.
+    let planes = &manifest.supported_profile.plane_layers;
+    if let Some(layer) = tracks
+        .iter()
+        .map(|track| &track.layer)
+        .chain(arcs.iter().map(|arc| &arc.layer))
+        .find(|layer| planes.contains(layer))
+    {
+        bail!("SES routes on '{layer}', which the board uses as a plane layer");
     }
 
     Ok(SesImportPlan {
@@ -207,6 +226,8 @@ pub(crate) fn parse_import_plan(
         session_id,
         locked_track_count: manifest.supported_profile.locked_track_count,
         locked_via_count: manifest.supported_profile.locked_via_count,
+        refill_zones: manifest.supported_profile.copper_zones,
+        duplicate_wires_dropped,
         tracks,
         arcs,
         vias,
@@ -214,7 +235,7 @@ pub(crate) fn parse_import_plan(
 }
 
 fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest) -> Result<()> {
-    if manifest.schema_version != 1 {
+    if !matches!(manifest.schema_version, 1 | 2) {
         bail!(
             "unsupported Specctra manifest schema {}",
             manifest.schema_version
@@ -227,14 +248,22 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
             manifest.resolution
         );
     }
-    if manifest.supported_profile.copper_layers != 2
-        || manifest.supported_profile.component_side != "front"
-        || manifest.supported_profile.copper_zones
-        || manifest.supported_profile.custom_rules
-        || manifest.supported_profile.outline.is_empty()
-        || manifest.supported_profile.pad_shapes.is_empty()
-    {
-        bail!("manifest does not describe the supported first routing profile");
+    let profile = &manifest.supported_profile;
+    let strict_profile = profile.copper_layers == 2
+        && profile.component_side == "front"
+        && !profile.copper_zones
+        && !profile.custom_rules;
+    // Schema 2 comes from KiCad's own exporter, which represents zones, any
+    // layer count and back-side parts; the routes still land only on layers
+    // and nets the manifest names, and every check below still applies.
+    let native_profile = profile.copper_layers >= 2
+        && matches!(profile.component_side.as_str(), "front" | "both");
+    let profile_ok = match manifest.schema_version {
+        1 => strict_profile,
+        _ => native_profile,
+    };
+    if !profile_ok || profile.outline.is_empty() || profile.pad_shapes.is_empty() {
+        bail!("manifest does not describe a supported routing profile");
     }
     let (locked_track_count, locked_via_count) = locked_routing_counts(board_source)?;
     let has_locked_routing = locked_track_count > 0 || locked_via_count > 0;
@@ -296,8 +325,11 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             bail!("manifest contains an invalid or duplicate layer mapping");
         }
     }
-    if layer_names.len() != 2 {
-        bail!("manifest must contain exactly two copper layer mappings");
+    if layer_names.len() != manifest.supported_profile.copper_layers as usize {
+        bail!(
+            "manifest must contain exactly {} copper layer mappings",
+            manifest.supported_profile.copper_layers
+        );
     }
 
     let net_names = manifest
@@ -322,7 +354,8 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             || component.kiid.is_empty()
             || component.image_name.is_empty()
             || !component.rotation_degrees.is_finite()
-            || component.side != "front"
+            || !(component.side == "front"
+                || (manifest.schema_version == 2 && component.side == "back"))
             || !references.insert(component.reference.as_str())
         {
             bail!("manifest contains invalid component placement metadata");
@@ -385,7 +418,11 @@ fn validate_placement(node: &SexpNode, manifest: &Manifest) -> Result<()> {
             if x_um != component.x_um
                 || y_um != component.y_um
                 || side != component.side
-                || (rotation - component.rotation_degrees).abs() > 1e-9
+                || {
+                    // Same angle, either convention: -90 and 270.
+                    let delta = (rotation - component.rotation_degrees).rem_euclid(360.0);
+                    delta > 1e-9 && delta < 360.0 - 1e-9
+                }
             {
                 bail!("SES changes placement of component '{reference}'");
             }
@@ -440,9 +477,10 @@ fn validate_library(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Re
         {
             bail!("manifest via padstack '{name}' is not a supported round through via");
         }
-        if !observed.insert(name.to_string()) {
-            bail!("SES library repeats padstack '{name}'");
-        }
+        // Freerouting 2.1 writes each used via padstack twice in
+        // `library_out`. A repeat is harmless when it is the same padstack:
+        // every copy is checked against the manifest geometry below.
+        observed.insert(name.to_string());
         let mut shape_layers = BTreeSet::new();
         for shape in padstack.find_all("shape") {
             require_direct_shape(shape, 0, &["circle"])?;
@@ -487,11 +525,14 @@ fn validate_library(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Re
     Ok(())
 }
 
+/// Tracks, arcs and vias of a session, plus how many exact wire repeats were dropped.
+type RoutePrimitives = (Vec<SesTrack>, Vec<SesArc>, Vec<SesVia>, usize);
+
 fn parse_network(
     node: &SexpNode,
     resolution: f64,
     manifest: &Manifest,
-) -> Result<(Vec<SesTrack>, Vec<SesArc>, Vec<SesVia>)> {
+) -> Result<RoutePrimitives> {
     require_direct_shape(node, 0, &["net"])?;
     let nets = manifest
         .nets
@@ -515,6 +556,7 @@ fn parse_network(
     let mut seen_tracks = BTreeSet::new();
     let mut seen_arcs = BTreeSet::new();
     let mut seen_vias = BTreeSet::new();
+    let mut duplicate_wires = 0usize;
 
     for net_node in node.find_all("net") {
         require_direct_shape(net_node, 1, &["wire", "via"])?;
@@ -571,7 +613,8 @@ fn parse_network(
                             endpoints,
                         );
                         if !seen_tracks.insert(key) {
-                            bail!("SES repeats a route segment on net '{net_name}'");
+                            duplicate_wires += 1;
+                            continue;
                         }
                         tracks.push(SesTrack {
                             net_name: net_name.to_string(),
@@ -638,7 +681,8 @@ fn parse_network(
                         (ordered_f64(center.0), ordered_f64(center.1)),
                     );
                     if !seen_arcs.insert(key) {
-                        bail!("SES repeats an arc on net '{net_name}'");
+                        duplicate_wires += 1;
+                        continue;
                     }
                     arcs.push(SesArc {
                         net_name: net_name.to_string(),
@@ -696,7 +740,7 @@ fn parse_network(
             });
         }
     }
-    Ok((tracks, arcs, vias))
+    Ok((tracks, arcs, vias, duplicate_wires))
 }
 
 fn parse_resolution(node: &SexpNode) -> Result<f64> {
