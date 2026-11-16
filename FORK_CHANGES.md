@@ -216,7 +216,16 @@ item; `place_footprint` now calls it), `builders::build_via_span`
   - Freerouting 2.1.0 routed it completely in 3 passes.
   - `plan_specctra_ses_import`, then `apply_specctra_ses`, created 243 tracks and 6 vias in one undoable commit, with an exact IPC read-back.
   - After `refill_zones`, DRC shows **0 errors and 0 unconnected items**. The warnings are the board's existing ones, plus 2 dangling track ends from Freerouting.
-- **Not exercised:** `route_specctra_dsn` drives Freerouting's built-in MCP server, which needs Freerouting 2.3.0. Only 2.1.0 is installed here (it has no MCP server), so the routing step ran with Freerouting's own CLI instead.
+- **With Freerouting 2.3.0 (Java 25), entirely through Konnect tools:**
+  - `export_specctra_dsn`, then `route_specctra_dsn` (25 s, local, `cloud_used: false`).
+  - `plan_specctra_ses_import`, then `apply_specctra_ses`: 228 tracks and 7 vias.
+  - After `refill_zones` and save, DRC shows **0 errors and 0 unconnected items**, with the same 13 rule warnings as the hand-routed board.
+  - With the planes left in the DSN, 2.3.0 still stops at 25 unrouted and 12 violations, so stripping them is still required.
+
+**Fixes needed for Freerouting 2.3.0 (build 2026-08-07):**
+- `route_specctra_dsn` failed with MCP "Internal error" on `create_session`. 2.3.0 refuses a plain-HTTP API endpoint unless `api_server.http_allowed` is set, and its MCP tools call that API. Konnect now passes `--api_server.http_allowed=true` and `--mcp_server.http_allowed=true`; both endpoints are loopback, as before.
+- 2.3.0 also reports usage to `api.freerouting.app` by default, which contradicts the tool's "never sends board data to a cloud service" promise. Konnect now passes `--usage_and_diagnostic_data.disable_analytics=true`.
+- 2.3.0 writes KiCad's variant images (`Lib:Name::1`) back under the base name. Schema-2 imports accept a base name for a `::N` variant; placement is still checked by position, side and rotation.
 
 **Still open:**
 - Unlocked existing routing is refused, and no Konnect tool locks tracks.

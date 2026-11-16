@@ -641,6 +641,26 @@ mod round_trip_tests {
         assert!(plan.vias.iter().all(|via| via.drill_mm > 0.0 && via.size_mm > via.drill_mm));
     }
 
+    /// Freerouting 2.3.0 writes KiCad's variant images (`…::1`) under their
+    /// base name.
+    #[test]
+    fn a_session_naming_variants_by_base_image_is_accepted() {
+        let (_dir, path) = board();
+        let export = super::lower(&path, BOARD, DSN).unwrap();
+        let base_named = SES.replace("C_0603_1608Metric::1", "C_0603_1608Metric");
+        let renamed = SES.replace("C_0603_1608Metric::1", "C_0805_2012Metric");
+        assert_ne!(base_named, SES, "the 2.1.0 fixture keeps variant names");
+        crate::specctra_ses::parse_import_plan(&path, BOARD, &export.bundle.manifest, &base_named)
+            .unwrap();
+        assert!(crate::specctra_ses::parse_import_plan(
+            &path,
+            BOARD,
+            &export.bundle.manifest,
+            &renamed
+        )
+        .is_err());
+    }
+
     #[test]
     fn a_session_routing_on_a_plane_layer_is_refused() {
         let (_dir, path) = board();

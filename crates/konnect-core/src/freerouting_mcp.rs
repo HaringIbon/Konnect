@@ -38,6 +38,15 @@ fn server_arguments() -> &'static [&'static str] {
         "--mcp_server.authentication.enabled=false",
         "--mcp_server-endpoints=http://127.0.0.1:37964",
         "--mcp_server.stdio=true",
+        // Freerouting 2.3.0 (build 2026-08-07) refuses a plain-HTTP endpoint
+        // unless allowed ("Can't use the endpoint … because HTTP is not
+        // allowed"); its MCP tools then fail with "Internal error" because
+        // they call that API. Both endpoints are loopback-only (see test).
+        "--api_server.http_allowed=true",
+        "--mcp_server.http_allowed=true",
+        // It also reports usage to api.freerouting.app by default. This tool
+        // promises never to send anything to a cloud service.
+        "--usage_and_diagnostic_data.disable_analytics=true",
         "--gui.enabled=false",
     ]
 }
@@ -842,6 +851,7 @@ mod tests {
         assert!(arguments.contains(&"--api_server-endpoints=http://127.0.0.1:37864"));
         assert!(arguments.contains(&"--mcp_server.authentication.enabled=false"));
         assert!(arguments.contains(&"--mcp_server-endpoints=http://127.0.0.1:37964"));
+        assert!(arguments.contains(&"--usage_and_diagnostic_data.disable_analytics=true"));
         assert!(!arguments
             .iter()
             .any(|argument| argument.contains("0.0.0.0")));

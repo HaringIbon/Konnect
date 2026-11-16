@@ -402,7 +402,16 @@ fn validate_placement(node: &SexpNode, manifest: &Manifest) -> Result<()> {
             let component = expected.get(reference).with_context(|| {
                 format!("SES placement contains unknown component '{reference}'")
             })?;
-            if image_name != component.image_name {
+            // KiCad's exporter names footprint variants `Lib:Name::1`,
+            // `::2`…; Freerouting 2.3.0 writes them back as `Lib:Name`. The
+            // position, side and rotation below still pin the placement.
+            let variant_of_base = manifest.schema_version == 2
+                && component
+                    .image_name
+                    .strip_prefix(image_name)
+                    .and_then(|suffix| suffix.strip_prefix("::"))
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            if image_name != component.image_name && !variant_of_base {
                 bail!(
                     "SES image for '{reference}' changed from '{}' to '{image_name}'",
                     component.image_name
