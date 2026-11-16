@@ -756,6 +756,13 @@ async fn export_specctra_with_kicad(
         .map_err(|error| anyhow::anyhow!("Specctra output writer panicked: {error}"))??;
 
     let mut warnings = Vec::new();
+    if !native.left_to_planes.is_empty() {
+        warnings.push(format!(
+            "Plane nets {:?} are fully fanned out to their planes and were left out of the \
+             routing job; they connect through the planes once zones are refilled.",
+            native.left_to_planes
+        ));
+    }
     if !native.removed_planes.is_empty() {
         warnings.push(
             "Zones were removed from the routing job (Freerouting cannot route through Specctra \
@@ -786,6 +793,7 @@ async fn export_specctra_with_kicad(
             "copper_layers": native.copper_layers,
             "power_layers_not_routed": native.power_layers,
             "removed_planes": native.removed_planes,
+            "left_to_planes": native.left_to_planes,
             "warnings": warnings,
             "capabilities": {
                 "dsn_export_available": true,

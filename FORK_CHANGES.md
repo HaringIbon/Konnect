@@ -19,9 +19,8 @@ after review. Two issues had no PR, so the fixes were written here.
 
 ## Summary by tool
 
-The served MCP surface did not change in that pass: the same 235 tools (228
-plus 7 meta-tools), and every `inputSchema` is byte-identical to upstream
-`main`. Only behaviour on the
+The served MCP surface did not change in that pass: no tool was added or
+removed, and every `inputSchema` is byte-identical to upstream `main`. Only behaviour on the
 unsafe paths changed, plus 4 tool descriptions.
 
 | Tool | Issue(s) | What changed | Path affected |
@@ -230,3 +229,30 @@ item; `place_footprint` now calls it), `builders::build_via_span`
 **Still open:**
 - Unlocked existing routing is refused, and no Konnect tool locks tracks.
 - A Konnect-owned fanout-to-plane step would let plane nets drop straight to their planes instead of being routed as traces.
+
+## Pass 4: lock_routing and fanout_to_plane
+
+Two new tools in `pcb_routing`, both live-only (KiCad IPC), each one undoable commit:
+
+- **`lock_routing`**: locks or unlocks existing tracks, arcs and vias, optionally only on named nets, then reads the board back to verify. It fills the gap left by the Specctra export's "existing routing must be locked" rule: route critical nets (USB pair, power, crystal) by hand, lock them, then autoroute the rest.
+- **`fanout_to_plane`**: gives every surface-mount pad on a plane net a short stub and a through via, so the pad drops straight to its plane.
+  - Plane nets default to nets with a zone on an inner layer.
+  - Via sites are chosen clear of every other net's pads, tracks and vias, of keep-out zones and of the board edge. These are box-model checks, so DRC follows.
+  - Directions pointing away from the part are preferred.
+  - Through-hole pads, and pads already joined to a track or via, are skipped.
+  - Fan-out copper is locked by default. `dry_run` returns the plan without creating anything.
+  - The planner (`tools/fanout.rs`) is pure geometry with unit tests.
+
+**Export change (`specctra::native`):** a plane net whose every SMD pad is already fanned out is left out of the routing job. Its `(net …)` and class membership are removed from the DSN. Its fan-out copper goes back into the structure as keep-outs at the copper's own size, so the router routes around it.
+- Widening the keep-outs by the clearance walled in USB-C pins: 1 connection was left unrouted.
+- Leaving the copper out entirely let the router short +5V through GND vias: 4 shorts and 2 clearance errors.
+- The response lists such nets in `left_to_planes`.
+
+**Live verification** (`poc/fanout_check.py`, on the 4-layer PoC board with all routing removed): 8/8 checks pass.
+- `fanout_to_plane` planned and placed 41 SMD pads (82 items). The 9 through-hole pads were skipped.
+- `lock_routing` unlocked and then relocked exactly the 27 GND vias and 27 GND stubs, with read-back.
+- The export left GND and +3V3 to the planes.
+- `route_specctra_dsn` (Freerouting 2.3.0) routed only the signal nets: 100 tracks and 2 vias.
+- After import and zone refill, DRC shows **0 errors and 0 unconnected items**, with the board's usual 13 warnings.
+
+**Counts:** the tool count is now 230 (237 with meta-tools). The registry, `tool-directory.md`, README, DEV, TROUBLESHOOTING and the plugin/packaging metadata are updated.

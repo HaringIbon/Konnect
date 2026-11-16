@@ -57,6 +57,10 @@ pub(crate) struct RemovedPlane {
 pub(crate) struct NativeExport {
     pub bundle: ExportBundle,
     pub removed_planes: Vec<RemovedPlane>,
+    /// Plane nets whose every SMD pad already drops to the plane (see
+    /// `fanout_to_plane`): left out of the routing job entirely, because the
+    /// refilled planes connect them.
+    pub left_to_planes: Vec<String>,
     pub copper_layers: usize,
     pub power_layers: Vec<String>,
     pub custom_rules: bool,
@@ -143,6 +147,8 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
         bail!("KiCad IPC snapshot root is not 'kicad_pcb'");
     }
     let (dsn, removed_planes) = strip_planes(raw_dsn)?;
+    let left_to_planes = fully_fanned_plane_nets(&board, &removed_planes);
+    let dsn = drop_nets(&dsn, &left_to_planes)?;
     // Not `validate_dsn_syntax`: Topola's reader rejects KiCad's own image
     // outlines (`(outline (polygon …))`, which every stock footprint with a
     // courtyard polygon produces). The structural parse below plus the
@@ -435,6 +441,7 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
             class_count,
         },
         removed_planes,
+        left_to_planes,
         copper_layers,
         power_layers,
         custom_rules,
@@ -467,6 +474,174 @@ fn strip_planes(dsn: &str) -> Result<(String, Vec<RemovedPlane>)> {
     }
     out.push_str(rest);
     Ok((out, removed))
+}
+
+/// Plane nets (a removed plane on an inner layer) whose every surface-mount
+/// pad is already joined to a same-net track or via. Through-hole pads reach
+/// the plane on their own.
+fn fully_fanned_plane_nets(board: &SexpNode, planes: &[RemovedPlane]) -> Vec<String> {
+    let nets = planes
+        .iter()
+        .filter(|plane| plane.layer.starts_with("In"))
+        .map(|plane| plane.net.clone())
+        .collect::<BTreeSet<_>>();
+    nets.into_iter()
+        .filter(|net| {
+            let plan = crate::tools::fanout::plan(
+                board,
+                std::slice::from_ref(net),
+                &crate::tools::fanout::FanoutOptions::default(),
+            );
+            plan.fanouts.is_empty()
+                && plan
+                    .skipped
+                    .iter()
+                    .all(|skip| skip.reason.starts_with("already connected"))
+        })
+        .collect()
+}
+
+/// Remove nets from a DSN: their `(net …)` in the network, their names in
+/// every `(class …)` (a class left with no nets is removed), and every
+/// `(wire …)` / `(via …)` of theirs in the wiring.
+fn drop_nets(dsn: &str, nets: &[String]) -> Result<String> {
+    if nets.is_empty() {
+        return Ok(dsn.to_string());
+    }
+    let mut removed_wiring = Vec::new();
+    let quoted = |name: &str| {
+        if name.chars().any(|c| c.is_whitespace() || "()\"".contains(c)) {
+            format!("\"{name}\"")
+        } else {
+            name.to_string()
+        }
+    };
+    let names: BTreeSet<String> = nets.iter().flat_map(|n| [n.clone(), format!("\"{n}\"")]).collect();
+    let mut out = String::with_capacity(dsn.len());
+    let mut rest = dsn;
+    loop {
+        // The next form that may mention a dropped net.
+        let next = ["(net ", "(class ", "(wire", "(via "]
+            .iter()
+            .filter_map(|tag| rest.find(tag).map(|at| (at, *tag)))
+            .min_by_key(|(at, _)| *at);
+        let Some((start, tag)) = next else {
+            out.push_str(rest);
+            break;
+        };
+        let end = start + balanced_len(&rest[start..]).context("unbalanced DSN form")?;
+        let form = &rest[start..end];
+        let keep_prefix = |out: &mut String| out.push_str(rest[..start].trim_end_matches([' ', '\t']));
+        match tag {
+            "(net " => {
+                let name = form[5..].split(|c: char| c.is_whitespace() || c == ')').next().unwrap_or("");
+                // `(net NAME (pins …))` in the network; `(net NAME)` inside a
+                // wire or via is handled with its parent below.
+                if names.contains(name) && form.contains("(pins") {
+                    keep_prefix(&mut out);
+                    rest = rest[end..].strip_prefix('\n').unwrap_or(&rest[end..]);
+                    continue;
+                }
+            }
+            "(class " => {
+                let body_end = form.find("(circuit").or_else(|| form.find("(rule")).unwrap_or(form.len() - 1);
+                let head = &form[..body_end];
+                let mut tokens = head.split_whitespace();
+                let class_tag = tokens.next().unwrap_or("(class");
+                let class_name = tokens.next().unwrap_or("");
+                let kept = tokens.filter(|token| !names.contains(*token)).collect::<Vec<_>>();
+                if kept.len() != head.split_whitespace().count() - 2 {
+                    if kept.is_empty() {
+                        keep_prefix(&mut out);
+                        rest = rest[end..].strip_prefix('\n').unwrap_or(&rest[end..]);
+                        continue;
+                    }
+                    out.push_str(&rest[..start]);
+                    out.push_str(&format!("{class_tag} {class_name} {}\n      ", kept.join(" ")));
+                    out.push_str(&form[body_end..]);
+                    rest = &rest[end..];
+                    continue;
+                }
+            }
+            _ => {
+                // A wire or via of a dropped net.
+                if nets.iter().any(|n| form.contains(&format!("(net {})", quoted(n)))) {
+                    removed_wiring.push(form.to_string());
+                    keep_prefix(&mut out);
+                    rest = rest[end..].strip_prefix('\n').unwrap_or(&rest[end..]);
+                    continue;
+                }
+            }
+        }
+        // Keep this form; continue scanning inside it.
+        let step = start + tag.len();
+        out.push_str(&rest[..step]);
+        rest = &rest[step..];
+    }
+    keep_copper_as_obstacles(&out, &removed_wiring)
+}
+
+/// The copper of a net left to its plane (its fan-out stubs and vias) is
+/// still on the board. Without it the router routes straight through it, so
+/// it goes back into the structure as keep-outs of the copper's own size:
+/// Freerouting already keeps its clearance from a keep-out. Widening them by
+/// the clearance as well walled in USB-C pins on the PoC board (1 connection
+/// left unrouted); at copper size it routes completely and KiCad's DRC is
+/// clean.
+fn keep_copper_as_obstacles(dsn: &str, wiring: &[String]) -> Result<String> {
+    if wiring.is_empty() {
+        return Ok(dsn.to_string());
+    }
+    let root = parse_dsn_sexp(dsn)?;
+    let structure = root.find("structure").context("DSN has no structure")?;
+    let layers = structure
+        .find_all("layer")
+        .iter()
+        .filter_map(|layer| layer.get(1).and_then(SexpNode::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut keepouts = String::new();
+    for form in wiring {
+        let node = parse_dsn_sexp(form)?;
+        match node.head() {
+            Some("wire") => {
+                let Some(path) = node.find("path") else { continue };
+                let atoms = path
+                    .children()
+                    .unwrap_or_default()
+                    .iter()
+                    .skip(1)
+                    .filter_map(SexpNode::as_str)
+                    .collect::<Vec<_>>();
+                if atoms.len() < 4 {
+                    continue;
+                }
+                let width: f64 = atoms[1].parse().context("DSN wire width")?;
+                keepouts.push_str(&format!(
+                    "    (keepout \"\" (path {} {} {}))\n",
+                    atoms[0],
+                    width,
+                    atoms[2..].join(" ")
+                ));
+            }
+            Some("via") => {
+                let padstack = dsn_atom(&node, 1, "via padstack")?;
+                let (size, _) = via_geometry(padstack)?;
+                let (x, y) = (dsn_atom(&node, 2, "via x")?, dsn_atom(&node, 3, "via y")?);
+                for layer in &layers {
+                    keepouts.push_str(&format!(
+                        "    (keepout \"\" (circle {layer} {} {x} {y}))\n",
+                        size
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    let start = dsn.find("(structure").context("DSN has no structure")?;
+    let close = start + balanced_len(&dsn[start..]).context("unbalanced DSN structure")? - 1;
+    let insert_at = dsn[..close].trim_end_matches([' ', '\t']).len();
+    Ok(format!("{}{}{}", &dsn[..insert_at], keepouts, &dsn[insert_at..]))
 }
 
 /// Length of the parenthesised form at the start of `text`, honouring quotes.
@@ -571,6 +746,32 @@ mod tests {
         assert_eq!(via_geometry("Via[0-1]_800:400_um").unwrap(), (800, 400));
         assert!(via_geometry("Via[0-1]_300:600_um").is_err());
         assert!(via_geometry("MyVia").is_err());
+    }
+
+    #[test]
+    fn dropped_nets_leave_network_classes_and_wiring() {
+        let dsn = "(pcb x\n  (structure\n    (layer F.Cu (type signal))\n  )\n  (network\n    (net GND\n      (pins U1-1 C1-2)\n    )\n    (net SDA\n      (pins U1-2 R1-1)\n    )\n    (class Power GND\n      (circuit (use_via V))\n      (rule (width 300))\n    )\n    (class kicad_default SDA GND\n      (circuit (use_via V))\n    )\n  )\n  (wiring\n    (wire (path F.Cu 300  0 0  1 1)(net GND)(type protect))\n    (via \"Via[0-1]_600:300_um\" 1 1 (net GND)(type protect))\n    (wire (path F.Cu 200  0 0  2 2)(net SDA)(type protect))\n  )\n)\n";
+        let out = drop_nets(dsn, &["GND".to_string()]).unwrap();
+        let root = super::super::parse_dsn_sexp(&out).unwrap();
+        let network = root.find("network").unwrap();
+        assert_eq!(network.find_all("net").len(), 1, "{out}");
+        assert_eq!(network.find_all("class").len(), 1, "a class left empty is removed: {out}");
+        assert!(!out.contains("GND"), "{out}");
+        assert!(out.contains("(class kicad_default SDA"), "{out}");
+        assert_eq!(root.find("wiring").unwrap().find_all("wire").len(), 1, "{out}");
+    }
+
+    #[test]
+    fn dropped_copper_stays_as_keepouts() {
+        let dsn = "(pcb x\n  (structure\n    (layer F.Cu (type signal))\n    (layer B.Cu (type signal))\n    (rule (width 200) (clearance 200) (clearance 50 (type smd_smd)))\n  )\n  (network\n    (net GND\n      (pins U1-1)\n    )\n  )\n  (wiring\n    (wire (path F.Cu 300  0 0  800 0)(net GND)(type protect))\n    (via \"Via[0-1]_600:300_um\" 800 0 (net GND)(type protect))\n  )\n)\n";
+        let out = drop_nets(dsn, &["GND".to_string()]).unwrap();
+        let root = super::super::parse_dsn_sexp(&out).unwrap();
+        let keepouts = root.find("structure").unwrap().find_all("keepout");
+        // One path plus one circle per layer, at the copper's own size.
+        assert_eq!(keepouts.len(), 3, "{out}");
+        assert!(out.contains("(path F.Cu 300 0 0 800 0)"), "{out}");
+        assert!(out.contains("(circle B.Cu 600 800 0)"), "{out}");
+        assert!(!out.contains("(net GND"), "{out}");
     }
 
     #[test]

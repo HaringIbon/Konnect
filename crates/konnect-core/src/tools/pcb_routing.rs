@@ -131,6 +131,51 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
+            "lock_routing",
+            "Lock (or unlock) existing tracks, arcs and vias on the live board, optionally only \
+             on the named nets. Use it to freeze hand-routed critical nets (USB pairs, power, \
+             crystal) before autorouting: export_specctra_dsn requires existing routing to be \
+             locked, and the router keeps locked copper as fixed. One undoable commit; the \
+             result is read back.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":  { "type": "string" },
+                    "locked": { "type": "boolean", "default": true, "description": "false unlocks" },
+                    "nets":   { "type": "array", "items": { "type": "string" }, "description": "Only items on these nets; omit for every track, arc and via" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_lock_routing(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "fanout_to_plane",
+            "Drop every surface-mount pad on a plane net to its plane: a short stub on the pad's \
+             layer and a through via next to the pad, placed clear of every other net's pads, \
+             tracks and vias, keep-outs and the board edge (box-model checks; run DRC after). \
+             Plane nets default to the nets with a zone on an inner layer. Through-hole pads and \
+             pads already joined to a track or via are skipped. Items are locked by default so \
+             the autorouter keeps them. Use dry_run to inspect the plan first.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":       { "type": "string" },
+                    "nets":        { "type": "array", "items": { "type": "string" }, "description": "Plane nets; defaults to nets with an inner-layer zone" },
+                    "via_size":    { "type": "number", "default": 0.6 },
+                    "via_drill":   { "type": "number", "default": 0.3 },
+                    "track_width": { "type": "number", "default": 0.3 },
+                    "clearance":   { "type": "number", "default": 0.2, "description": "Minimum copper clearance used when choosing via sites" },
+                    "max_stub":    { "type": "number", "default": 2.5, "description": "Longest stub from pad centre to via (mm)" },
+                    "lock":        { "type": "boolean", "default": true },
+                    "dry_run":     { "type": "boolean", "default": false }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_fanout_to_plane(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "plan_specctra_ses_import",
             "Validate a Freerouting Specctra SES against its revision-bound Konnect manifest and the exact live KiCad board. Returns every track and via that would be created; never mutates or saves the board.",
             json!({
@@ -556,6 +601,213 @@ fn get_live_pad(
         .find(|p| p.number == pad)
         .map(|p| (p.x, p.y))
         .ok_or_else(|| format!("Pad '{pad}' not found on '{reference}'")))
+}
+
+/// Set the lock state of tracks, arcs and vias, optionally only on `nets`.
+/// Returns the items that need an update and per-type counts.
+fn set_lock_state(
+    items: Vec<prost_types::Any>,
+    locked: bool,
+    nets: Option<&std::collections::BTreeSet<String>>,
+) -> anyhow::Result<(Vec<prost_types::Any>, serde_json::Value)> {
+    use konnect_ipc::gen::kiapi::board::types::{Arc, Track, Via};
+    use konnect_ipc::gen::kiapi::common::types::LockedState;
+    let target = if locked { LockedState::LsLocked } else { LockedState::LsUnlocked } as i32;
+    let wanted = |net: Option<&konnect_ipc::gen::kiapi::board::types::Net>| {
+        nets.is_none_or(|nets| net.is_some_and(|net| nets.contains(&net.name)))
+    };
+    let mut updates = Vec::new();
+    let mut counts = BTreeMap::<&str, [usize; 2]>::new();
+    for item in items {
+        macro_rules! retarget {
+            ($ty:ty, $url:literal, $key:literal) => {{
+                let mut value = <$ty>::decode(item.value.as_slice())?;
+                if !wanted(value.net.as_ref()) {
+                    continue;
+                }
+                let entry = counts.entry($key).or_default();
+                if value.locked == target {
+                    entry[1] += 1;
+                } else {
+                    entry[0] += 1;
+                    value.locked = target;
+                    updates.push(konnect_ipc::builders::pack_any(&value, $url));
+                }
+            }};
+        }
+        if konnect_ipc::builders::any_is(&item, "kiapi.board.types.Track") {
+            retarget!(Track, "kiapi.board.types.Track", "tracks");
+        } else if konnect_ipc::builders::any_is(&item, "kiapi.board.types.Arc") {
+            retarget!(Arc, "kiapi.board.types.Arc", "arcs");
+        } else if konnect_ipc::builders::any_is(&item, "kiapi.board.types.Via") {
+            retarget!(Via, "kiapi.board.types.Via", "vias");
+        }
+    }
+    let summary = counts
+        .into_iter()
+        .map(|(key, [changed, already])| (key.to_string(), json!({ "changed": changed, "already": already })))
+        .collect::<serde_json::Map<_, _>>();
+    Ok((updates, serde_json::Value::Object(summary)))
+}
+
+async fn handle_lock_routing(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as ObjectType;
+    let board = get_path(args, "board")?;
+    let locked = args["locked"].as_bool().unwrap_or(true);
+    let nets = args["nets"].as_array().map(|nets| {
+        nets.iter()
+            .filter_map(|net| net.as_str().map(str::to_string))
+            .collect::<std::collections::BTreeSet<_>>()
+    });
+    let types = [ObjectType::KotPcbTrace, ObjectType::KotPcbArc, ObjectType::KotPcbVia];
+    let result = with_board_ipc_classified(ctx, &board, move |client, document| {
+        let items = client.get_items_of_types_in(document.clone(), &types)?;
+        let (updates, counts) = set_lock_state(items, locked, nets.as_ref())?;
+        let changed = updates.len();
+        if changed > 0 {
+            let label = if locked { "Lock routing" } else { "Unlock routing" };
+            client.run_commit(label, |client| client.update_items_in(document.clone(), updates))?;
+        }
+        // Read back: nothing in scope may still be in the old state.
+        let after = client.get_items_of_types_in(document, &types)?;
+        let (remaining, _) = set_lock_state(after, locked, nets.as_ref())?;
+        if !remaining.is_empty() {
+            anyhow::bail!(
+                "KiCad accepted the update but {} item(s) still read back in the old lock state",
+                remaining.len()
+            );
+        }
+        Ok((changed, counts))
+    })
+    .await?;
+    match result {
+        Ok((changed, counts)) => Ok(CallToolResult::json(&json!({
+            "locked": locked,
+            "changed": changed,
+            "by_type": counts,
+            "readback": "verified"
+        }))),
+        Err(failure) => Ok(CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: failure.message().to_string(),
+            },
+            format!("lock_routing failed: {}", failure.message()),
+        )),
+    }
+}
+
+async fn handle_fanout_to_plane(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use crate::tools::fanout::{plan, plane_nets, FanoutOptions};
+    let board = get_path(args, "board")?;
+    let defaults = FanoutOptions::default();
+    let number = |key: &str, default: f64| args[key].as_f64().unwrap_or(default);
+    let options = FanoutOptions {
+        via_size_mm: number("via_size", defaults.via_size_mm),
+        via_drill_mm: number("via_drill", defaults.via_drill_mm),
+        track_width_mm: number("track_width", defaults.track_width_mm),
+        clearance_mm: number("clearance", defaults.clearance_mm),
+        edge_clearance_mm: defaults.edge_clearance_mm,
+        max_stub_mm: number("max_stub", defaults.max_stub_mm),
+    };
+    if !(options.via_drill_mm > 0.0 && options.via_size_mm > options.via_drill_mm)
+        || options.track_width_mm <= 0.0
+        || options.clearance_mm < 0.0
+        || options.max_stub_mm <= 0.0
+    {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "via_size".to_string(),
+                reason: "need via_size > via_drill > 0, track_width > 0, clearance >= 0, max_stub > 0"
+                    .to_string(),
+            },
+            "invalid fan-out geometry",
+        ));
+    }
+    let requested_nets = args["nets"].as_array().map(|nets| {
+        nets.iter()
+            .filter_map(|net| net.as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+    });
+    let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+    let lock = args["lock"].as_bool().unwrap_or(true);
+
+    let result = with_board_ipc_classified(ctx, &board, move |client, document| {
+        let snapshot = client.save_document_to_string_in(document.clone())?;
+        let tree = konnect_sexp::parse_sexp(&snapshot).context("parse live board snapshot")?;
+        let nets = requested_nets.unwrap_or_else(|| plane_nets(&tree));
+        if nets.is_empty() {
+            anyhow::bail!("no plane nets: the board has no zone on an inner layer; pass `nets`");
+        }
+        let fanout = plan(&tree, &nets, &options);
+        if dry_run || fanout.fanouts.is_empty() {
+            return Ok((fanout, 0usize));
+        }
+        let codes = client
+            .get_nets_in(document.clone())?
+            .into_iter()
+            .map(|net| (net.name, net.netcode))
+            .collect::<BTreeMap<_, _>>();
+        let locked = if lock {
+            konnect_ipc::gen::kiapi::common::types::LockedState::LsLocked
+        } else {
+            konnect_ipc::gen::kiapi::common::types::LockedState::LsUnlocked
+        } as i32;
+        let mut items = Vec::new();
+        for item in &fanout.fanouts {
+            let code = *codes
+                .get(&item.net)
+                .with_context(|| format!("live board has no net '{}'", item.net))?;
+            let mut via = konnect_ipc::builders::build_via(
+                &item.net, code, item.via_x, item.via_y, options.via_drill_mm, options.via_size_mm,
+            );
+            via.locked = locked;
+            let mut stub = konnect_ipc::builders::build_track(
+                &item.net, code, &item.layer, options.track_width_mm,
+                item.pad_x, item.pad_y, item.via_x, item.via_y,
+            );
+            stub.locked = locked;
+            items.push(konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via"));
+            items.push(konnect_ipc::builders::pack_any(&stub, "kiapi.board.types.Track"));
+        }
+        // The plan was made from this exact revision.
+        if client.save_document_to_string_in(document.clone())? != snapshot {
+            anyhow::bail!("the board changed while the fan-out was planned; retry");
+        }
+        let expected = items.len();
+        let created = client.run_commit("Fan out to plane", |client| {
+            client.create_items_in_returning(document.clone(), items)
+        })?;
+        if created.len() != expected {
+            anyhow::bail!("KiCad created {} of {} fan-out items", created.len(), expected);
+        }
+        Ok((fanout, created.len()))
+    })
+    .await?;
+    match result {
+        Ok((fanout, created)) => Ok(CallToolResult::json(&json!({
+            "dry_run": dry_run,
+            "nets": fanout.nets,
+            "planned": fanout.fanouts.len(),
+            "created_items": created,
+            "locked": lock && !dry_run,
+            "through_hole_pads_skipped": fanout.through_hole_pads,
+            "fanouts": fanout.fanouts,
+            "skipped": fanout.skipped,
+            "next_step": "Refill zones and run DRC: site checks are box-model approximations."
+        }))),
+        Err(failure) => Ok(CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: failure.message().to_string(),
+            },
+            format!("fanout_to_plane failed: {}", failure.message()),
+        )),
+    }
 }
 
 async fn handle_add_via(
@@ -3602,5 +3854,57 @@ mod route_pad_to_pad_tests {
             result.content
         );
         assert!(tracks.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod lock_state_tests {
+    use super::set_lock_state;
+    use konnect_ipc::gen::kiapi::board::types::{Track, Via};
+    use konnect_ipc::gen::kiapi::common::types::LockedState;
+    use prost::Message;
+
+    fn track(net: &str, locked: LockedState) -> prost_types::Any {
+        let mut track = konnect_ipc::builders::build_track(net, 1, "F.Cu", 0.2, 0.0, 0.0, 1.0, 0.0);
+        track.locked = locked as i32;
+        konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track")
+    }
+
+    fn via(net: &str) -> prost_types::Any {
+        let via = konnect_ipc::builders::build_via(net, 2, 0.0, 0.0, 0.3, 0.6);
+        konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via")
+    }
+
+    #[test]
+    fn only_items_on_the_named_nets_change_and_already_locked_ones_are_counted() {
+        let items = vec![
+            track("USB_DP", LockedState::LsUnlocked),
+            track("USB_DP", LockedState::LsLocked),
+            track("SDA", LockedState::LsUnlocked),
+            via("USB_DP"),
+        ];
+        let nets = ["USB_DP".to_string()].into_iter().collect();
+        let (updates, counts) = set_lock_state(items, true, Some(&nets)).unwrap();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(counts["tracks"]["changed"], 1);
+        assert_eq!(counts["tracks"]["already"], 1);
+        assert_eq!(counts["vias"]["changed"], 1);
+        for update in &updates {
+            let locked = if konnect_ipc::builders::any_is(update, "kiapi.board.types.Track") {
+                Track::decode(update.value.as_slice()).unwrap().locked
+            } else {
+                Via::decode(update.value.as_slice()).unwrap().locked
+            };
+            assert_eq!(locked, LockedState::LsLocked as i32);
+        }
+    }
+
+    #[test]
+    fn no_net_filter_means_everything() {
+        // The via is already unlocked; only the locked track changes.
+        let items = vec![track("A", LockedState::LsLocked), via("B")];
+        let (updates, counts) = set_lock_state(items, false, None).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(counts["vias"]["already"], 1);
     }
 }
