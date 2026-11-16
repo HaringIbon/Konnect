@@ -137,6 +137,51 @@ pub(crate) fn models(root: &SexpNode) -> Result<Vec<kiapi::board::types::Footpri
         .collect()
 }
 
+/// What a footprint carries besides pads, drawings and fields, read once so
+/// every placement path can put it on the built item. Before this, only
+/// `update_pcb_from_schematic` (#789) applied it; `place_component`,
+/// `add_mounting_hole` and `duplicate_component` placed footprints with no
+/// `(attr …)` flags, so a mounting hole landed in the CPL but not the BOM.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LibraryExtras {
+    attributes: kiapi::board::types::FootprintAttributes,
+    description_and_keywords: kiapi::board::types::FootprintAttributes,
+    models: Vec<kiapi::board::types::Footprint3DModel>,
+}
+
+impl LibraryExtras {
+    /// Read from a footprint's S-expression (a library `.kicad_mod`, or the
+    /// `(footprint …)` Konnect writes for inline geometry).
+    pub(crate) fn from_source(source: &str) -> Result<Self> {
+        let root = konnect_sexp::parse_sexp(source).context("invalid footprint S-expression")?;
+        Ok(Self {
+            attributes: attributes(&root)?,
+            description_and_keywords: description_and_keywords(&root),
+            models: models(&root)?,
+        })
+    }
+
+    /// Put the extras on an item built by `build_footprint_item`.
+    pub(crate) fn apply(&self, item: prost_types::Any) -> Result<prost_types::Any> {
+        use prost::Message;
+        let mut footprint =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+        footprint.attributes = Some(self.attributes.clone());
+        let definition = footprint
+            .definition
+            .as_mut()
+            .context("built footprint has no definition")?;
+        definition.attributes = Some(self.description_and_keywords.clone());
+        definition.items.extend(self.models.iter().map(|model| {
+            konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
+        }));
+        Ok(konnect_ipc::builders::pack_any(
+            &footprint,
+            "kiapi.board.types.FootprintInstance",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +191,52 @@ mod tests {
 
     fn root(source: &str) -> SexpNode {
         konnect_sexp::parse_sexp(source).unwrap()
+    }
+
+    /// The item `place_component`, `add_mounting_hole` and
+    /// `duplicate_component` send carries the library's flags, description
+    /// and model; before, it carried none of them.
+    #[test]
+    fn extras_land_on_the_built_item() {
+        use prost::Message;
+        let hole = C_0603.replace("(attr smd)", "(attr smd exclude_from_pos_files exclude_from_bom)");
+        let extras = LibraryExtras::from_source(&hole).unwrap();
+        let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
+            "Capacitor_SMD:C_0603_1608Metric",
+            "C1",
+            "100n",
+            &[],
+            &[],
+            &konnect_ipc::IpcFieldPlacement::default(),
+            100.0,
+            100.0,
+            0.0,
+            "F.Cu",
+        )
+        .unwrap();
+        let before = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        assert!(before.attributes.is_none_or(|a| !a.exclude_from_bill_of_materials));
+
+        let applied = extras.apply(item).unwrap();
+        let after = kiapi::board::types::FootprintInstance::decode(applied.value.as_slice()).unwrap();
+        let attributes = after.attributes.unwrap();
+        assert!(attributes.exclude_from_bill_of_materials);
+        assert!(attributes.exclude_from_position_files);
+        assert_eq!(attributes.mounting_style, FootprintMountingStyle::FmsSmd as i32);
+        let definition = after.definition.unwrap();
+        assert!(definition
+            .attributes
+            .unwrap()
+            .description
+            .starts_with("Capacitor SMD 0603"));
+        assert_eq!(
+            definition
+                .items
+                .iter()
+                .filter(|item| item.type_url.ends_with("Footprint3DModel"))
+                .count(),
+            1
+        );
     }
 
     /// The KiCad-written 0603 capacitor: `(attr smd)`, its description and

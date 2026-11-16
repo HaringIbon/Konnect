@@ -2874,6 +2874,28 @@ impl KiCadIpcClient {
         Ok(())
     }
 
+    /// Add a via spanning `start`..`end` (see [`crate::builders::build_via_span`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_via_span(
+        &self,
+        net_name: &str,
+        x: f64,
+        y: f64,
+        drill: f64,
+        pad_size: f64,
+        start: kiapi::board::types::BoardLayer,
+        end: kiapi::board::types::BoardLayer,
+        via_type: kiapi::board::types::ViaType,
+    ) -> Result<()> {
+        let net_code = self.resolve_net_code(net_name)?;
+        let via = crate::builders::build_via_span(
+            net_name, net_code, x, y, drill, pad_size, start, end, via_type,
+        );
+        let any = crate::builders::pack_any(&via, "kiapi.board.types.Via");
+        self.create_items(vec![any])?;
+        Ok(())
+    }
+
     /// Add a copper zone to the live board and refill it, returning the KIID
     /// KiCad assigned if it reported one.
     ///
@@ -4207,6 +4229,21 @@ impl KiCadIpcClient {
         rotation: f64,
         layer: &str,
     ) -> Result<IpcFootprint> {
+        let item = Self::build_footprint_item(
+            lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
+        )?;
+        self.place_footprint_item(board, reference, item)
+    }
+
+    /// Place an already-built footprint item (see [`Self::build_footprint_item`])
+    /// and read it back by reference. Callers use this when they add library
+    /// data — attributes, description, 3D models — to the built item first.
+    pub fn place_footprint_item(
+        &self,
+        board: &Path,
+        reference: &str,
+        item: prost_types::Any,
+    ) -> Result<IpcFootprint> {
         // Target the document matching `board`, not whichever board is first
         // in KiCad's open list — with several boards open, first-document
         // targeting mutates the wrong one (caught in live verification).
@@ -4218,9 +4255,6 @@ impl KiCadIpcClient {
         {
             anyhow::bail!("footprint reference '{reference}' already exists on the board");
         }
-        let item = Self::build_footprint_item(
-            lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
-        )?;
         self.create_items_in(document.clone(), vec![item])?;
         let footprints = self.list_footprints_in(document)?;
         footprints

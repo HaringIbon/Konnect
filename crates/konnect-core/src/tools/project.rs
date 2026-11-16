@@ -740,24 +740,27 @@ fn blank_kicad_pcb() -> &'static str {
         "\t)\n",
         "\t(paper \"A4\")\n",
         "\t(layers\n",
+        // KiCad 9+ layer ids, in the order KiCad 10 itself saves them. The
+        // pre-9 ids (B.Cu = 31) under a version-20260206 header made KiCad
+        // renumber the board on its first save.
         "\t\t(0 \"F.Cu\" signal)\n",
-        "\t\t(31 \"B.Cu\" signal)\n",
-        "\t\t(32 \"B.Adhes\" user \"B.Adhesive\")\n",
-        "\t\t(33 \"F.Adhes\" user \"F.Adhesive\")\n",
-        "\t\t(34 \"B.Paste\" user)\n",
-        "\t\t(35 \"F.Paste\" user)\n",
-        "\t\t(36 \"B.SilkS\" user \"B.Silkscreen\")\n",
-        "\t\t(37 \"F.SilkS\" user \"F.Silkscreen\")\n",
-        "\t\t(38 \"B.Mask\" user)\n",
-        "\t\t(39 \"F.Mask\" user)\n",
-        "\t\t(40 \"Dwgs.User\" user \"User.Drawings\")\n",
-        "\t\t(41 \"Cmts.User\" user \"User.Comments\")\n",
-        "\t\t(44 \"Edge.Cuts\" user)\n",
-        "\t\t(45 \"Margin\" user)\n",
-        "\t\t(46 \"B.CrtYd\" user \"B.Courtyard\")\n",
-        "\t\t(47 \"F.CrtYd\" user \"F.Courtyard\")\n",
-        "\t\t(48 \"B.Fab\" user)\n",
-        "\t\t(49 \"F.Fab\" user)\n",
+        "\t\t(2 \"B.Cu\" signal)\n",
+        "\t\t(9 \"F.Adhes\" user \"F.Adhesive\")\n",
+        "\t\t(11 \"B.Adhes\" user \"B.Adhesive\")\n",
+        "\t\t(13 \"F.Paste\" user)\n",
+        "\t\t(15 \"B.Paste\" user)\n",
+        "\t\t(5 \"F.SilkS\" user \"F.Silkscreen\")\n",
+        "\t\t(7 \"B.SilkS\" user \"B.Silkscreen\")\n",
+        "\t\t(1 \"F.Mask\" user)\n",
+        "\t\t(3 \"B.Mask\" user)\n",
+        "\t\t(17 \"Dwgs.User\" user \"User.Drawings\")\n",
+        "\t\t(19 \"Cmts.User\" user \"User.Comments\")\n",
+        "\t\t(25 \"Edge.Cuts\" user)\n",
+        "\t\t(27 \"Margin\" user)\n",
+        "\t\t(31 \"F.CrtYd\" user \"F.Courtyard\")\n",
+        "\t\t(29 \"B.CrtYd\" user \"B.Courtyard\")\n",
+        "\t\t(35 \"F.Fab\" user)\n",
+        "\t\t(33 \"B.Fab\" user)\n",
         "\t)\n",
         "\t(setup\n",
         "\t\t(pad_to_mask_clearance 0.05)\n",
@@ -827,6 +830,21 @@ mod tests {
         assert!(content.contains("\"F.Cu\""));
         assert!(content.contains("\"B.Cu\""));
         assert!(content.contains("\"Edge.Cuts\""));
+    }
+
+    #[test]
+    fn blank_kicad_pcb_uses_kicad_10_layer_ids() {
+        let tree = konnect_sexp::parser::parse_sexp(blank_kicad_pcb()).unwrap();
+        let ids: std::collections::HashMap<String, i32> = konnect_sexp::layers::layers(&tree)
+            .into_iter()
+            .map(|l| (l.name, l.id))
+            .collect();
+        // The ids KiCad 10.0.8 writes when it saves a new board.
+        for (name, id) in [("F.Cu", 0), ("B.Cu", 2), ("F.Mask", 1), ("B.Mask", 3),
+            ("F.SilkS", 5), ("B.SilkS", 7), ("Edge.Cuts", 25), ("F.CrtYd", 31), ("F.Fab", 35)]
+        {
+            assert_eq!(ids.get(name), Some(&id), "{name}");
+        }
     }
 
     #[test]

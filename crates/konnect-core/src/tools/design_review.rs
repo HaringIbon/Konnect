@@ -1656,8 +1656,23 @@ fn power_rails(graph: &mut NetGraph, labels: &[Label]) -> Vec<PowerRail> {
     rails
 }
 
+/// Suffixes that name a signal *about* a rail rather than the rail itself:
+/// `VBUS_SENSE`, `VCC_EN`, `3V3_PG`. Without this every such net matched the
+/// rail prefix and was audited (and failed) as an undecoupled power rail.
+const RAIL_SIGNAL_SUFFIXES: &[&str] = &[
+    "SENSE", "SNS", "DET", "DETECT", "EN", "ENABLE", "PG", "PGOOD", "GOOD", "OK", "FB", "MON",
+    "ADC", "CTRL", "FLT", "FAULT", "ALERT",
+];
+
 fn is_power_net_name(name: &str) -> bool {
     let upper = name.to_uppercase();
+    if upper
+        .split(['_', '-'])
+        .skip(1)
+        .any(|part| RAIL_SIGNAL_SUFFIXES.contains(&part))
+    {
+        return false;
+    }
     upper.starts_with("VCC")
         || upper.starts_with("VDD")
         || upper.starts_with("3V3")
@@ -2387,6 +2402,25 @@ mod review_completion_tests {
 /// undecoupled, `audit_power_rails` reported capped rails as uncapped and did
 /// not see power-symbol rails at all, and `run_design_review` returned
 /// NOT READY on a correct schematic. These sheets are that shape.
+#[cfg(test)]
+mod power_net_name_tests {
+    use super::is_power_net_name;
+
+    #[test]
+    fn rails_are_power_nets() {
+        for name in ["VBUS", "VCC", "VCC_3V3", "VDD_IO", "+3V3", "+5V", "GND", "3V3", "VBUS_IN"] {
+            assert!(is_power_net_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn signals_about_a_rail_are_not_power_nets() {
+        for name in ["VBUS_SENSE", "VCC_EN", "3V3_PG", "+5V_FAULT", "vbus_det", "VDD-OK"] {
+            assert!(!is_power_net_name(name), "{name}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod net_resolution_tests {
     use super::*;

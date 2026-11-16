@@ -109,7 +109,9 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "add_via",
-            "Add a through-hole via at a given position and assign it to a net via KiCAD IPC.",
+            "Add a via at a given position and assign it to a net via KiCAD IPC. Through \
+             (F.Cu → B.Cu) by default; give start_layer/end_layer for a blind (one outer layer) \
+             or buried (both inner) via, and via_type 'micro' for a microvia.",
             json!({
                 "type": "object",
                 "properties": {
@@ -118,7 +120,10 @@ pub fn tools() -> Vec<ToolDef> {
                     "x":         { "type": "number" },
                     "y":         { "type": "number" },
                     "drill":     { "type": "number", "description": "Drill diameter in mm", "default": 0.4 },
-                    "pad_size":  { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 }
+                    "pad_size":  { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 },
+                    "start_layer": { "type": "string", "description": "First copper layer of the span", "default": "F.Cu" },
+                    "end_layer":   { "type": "string", "description": "Last copper layer of the span", "default": "B.Cu" },
+                    "via_type":    { "type": "string", "enum": ["through", "blind", "buried", "micro"], "description": "Inferred from the span when omitted" }
                 },
                 "required": ["board", "net_name", "x", "y"]
             }),
@@ -571,12 +576,106 @@ async fn handle_add_via(
     };
     let drill = args["drill"].as_f64().unwrap_or(0.4);
     let pad_size = args["pad_size"].as_f64().unwrap_or(0.8);
+    let start_layer = args["start_layer"].as_str().unwrap_or("F.Cu").to_string();
+    let end_layer = args["end_layer"].as_str().unwrap_or("B.Cu").to_string();
+    let (start, end, via_type) =
+        match via_span(&start_layer, &end_layer, args["via_type"].as_str()) {
+            Ok(span) => span,
+            Err(reason) => {
+                return Ok(CallToolResult::error_kind(
+                    ToolErrorKind::InvalidArgument {
+                        field: "via_type".to_string(),
+                        reason: reason.clone(),
+                    },
+                    reason,
+                ))
+            }
+        };
 
     let net_ipc = net_name.clone();
-    ipc!(ctx, args, |c| c.add_via(&net_ipc, x, y, drill, pad_size));
-    Ok(CallToolResult::json(
-        &json!({ "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size }),
-    ))
+    ipc!(ctx, args, |c| c.add_via_span(
+        &net_ipc, x, y, drill, pad_size, start, end, via_type
+    ));
+    Ok(CallToolResult::json(&json!({
+        "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size,
+        "start_layer": start_layer, "end_layer": end_layer,
+        "via_type": via_type.as_str_name()
+    })))
+}
+
+/// Resolve and check a via span. Blind touches exactly one outer layer,
+/// buried none, through both; a micro via must touch an outer layer. A type
+/// that contradicts the span is refused rather than sent, because KiCad would
+/// store a via whose type and layers disagree.
+fn via_span(
+    start: &str,
+    end: &str,
+    requested: Option<&str>,
+) -> Result<
+    (
+        konnect_ipc::gen::kiapi::board::types::BoardLayer,
+        konnect_ipc::gen::kiapi::board::types::BoardLayer,
+        konnect_ipc::gen::kiapi::board::types::ViaType,
+    ),
+    String,
+> {
+    use konnect_ipc::gen::kiapi::board::types::ViaType;
+    for name in [start, end] {
+        if !konnect_sexp::layers::is_copper_name(name) {
+            return Err(format!("'{name}' is not a copper layer"));
+        }
+    }
+    if start == end {
+        return Err("start_layer and end_layer must differ".to_string());
+    }
+    let layer = |name: &str| {
+        konnect_ipc::builders::try_layer_from_name(name).map_err(|error| error.to_string())
+    };
+    let outer = |name: &str| name == "F.Cu" || name == "B.Cu";
+    let span_type = match (outer(start), outer(end)) {
+        (true, true) => ViaType::VtThrough,
+        (false, false) => ViaType::VtBuried,
+        _ => ViaType::VtBlind,
+    };
+    let via_type = match requested {
+        None => span_type,
+        Some("micro") if span_type == ViaType::VtBlind => ViaType::VtMicro,
+        Some("through") if span_type == ViaType::VtThrough => span_type,
+        Some("blind") if span_type == ViaType::VtBlind => span_type,
+        Some("buried") if span_type == ViaType::VtBuried => span_type,
+        Some(other) => {
+            return Err(format!(
+                "via_type '{other}' does not match a {start} → {end} span (that span is {})",
+                span_type.as_str_name()
+            ))
+        }
+    };
+    Ok((layer(start)?, layer(end)?, via_type))
+}
+
+#[cfg(test)]
+mod via_span_tests {
+    use super::via_span;
+    use konnect_ipc::gen::kiapi::board::types::{BoardLayer, ViaType};
+
+    #[test]
+    fn spans_infer_their_type() {
+        assert_eq!(
+            via_span("F.Cu", "B.Cu", None).unwrap(),
+            (BoardLayer::BlFCu, BoardLayer::BlBCu, ViaType::VtThrough)
+        );
+        assert_eq!(via_span("F.Cu", "In1.Cu", None).unwrap().2, ViaType::VtBlind);
+        assert_eq!(via_span("In1.Cu", "In2.Cu", None).unwrap().2, ViaType::VtBuried);
+        assert_eq!(via_span("B.Cu", "In2.Cu", Some("micro")).unwrap().2, ViaType::VtMicro);
+    }
+
+    #[test]
+    fn contradictions_are_refused() {
+        assert!(via_span("F.Cu", "B.Cu", Some("blind")).is_err());
+        assert!(via_span("In1.Cu", "In2.Cu", Some("micro")).is_err());
+        assert!(via_span("F.Cu", "F.Cu", None).is_err());
+        assert!(via_span("F.Cu", "F.SilkS", None).is_err());
+    }
 }
 
 fn extension_is(path: &Path, expected: &str) -> bool {

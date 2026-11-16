@@ -259,9 +259,38 @@ pub fn build_via(
     drill_mm: f64,
     size_mm: f64,
 ) -> kiapi::board::types::Via {
+    use kiapi::board::types::{BoardLayer, ViaType};
+    build_via_span(
+        net_name,
+        net_code,
+        x,
+        y,
+        drill_mm,
+        size_mm,
+        BoardLayer::BlFCu,
+        BoardLayer::BlBCu,
+        ViaType::VtThrough,
+    )
+}
+
+/// A via spanning `start`..`end` with the given type. KiCad's Via message
+/// carries blind, buried and micro vias as the drill's start/end layers plus
+/// the type; `build_via` is the F.Cu → B.Cu through case.
+#[allow(clippy::too_many_arguments)]
+pub fn build_via_span(
+    net_name: &str,
+    net_code: i32,
+    x: f64,
+    y: f64,
+    drill_mm: f64,
+    size_mm: f64,
+    start: kiapi::board::types::BoardLayer,
+    end: kiapi::board::types::BoardLayer,
+    via_type: kiapi::board::types::ViaType,
+) -> kiapi::board::types::Via {
     use kiapi::board::types::{
         BoardLayer, DrillProperties, DrillShape, PadStack, PadStackLayer, PadStackShape,
-        PadStackType, ViaType,
+        PadStackType,
     };
 
     // A PST_NORMAL padstack carries exactly ONE copper-layer entry, keyed to
@@ -280,10 +309,10 @@ pub fn build_via(
 
     let pad_stack = PadStack {
         r#type: PadStackType::PstNormal as i32,
-        layers: vec![BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32],
+        layers: vec![start as i32, end as i32],
         drill: Some(DrillProperties {
-            start_layer: BoardLayer::BlFCu as i32,
-            end_layer: BoardLayer::BlBCu as i32,
+            start_layer: start as i32,
+            end_layer: end as i32,
             diameter: Some(vec2(drill_mm, drill_mm)),
             shape: DrillShape::DsCircle as i32,
             ..DrillProperties::default()
@@ -298,7 +327,7 @@ pub fn build_via(
         pad_stack: Some(pad_stack),
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
         net: Some(net(net_name, net_code)),
-        r#type: ViaType::VtThrough as i32,
+        r#type: via_type as i32,
         parent: None,
     }
 }

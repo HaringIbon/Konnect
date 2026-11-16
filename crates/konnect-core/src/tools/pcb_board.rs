@@ -2169,14 +2169,40 @@ async fn handle_add_layer(
         .iter()
         .map(|l| l.id)
         .collect();
-    let new_id = match (1..=30).find(|id| !used_ids.contains(id)) {
-        Some(id) => id,
-        None => {
-            return Ok(CallToolResult::error(
-                "No free inner copper layer id: 1-30 are all in use",
-            ))
+    // An inner copper layer's id is fixed by its name, and the formula depends
+    // on the file's numbering: KiCad 9+ puts B.Cu at 2 and In<n>.Cu at 2n+2;
+    // older files put B.Cu at 31 and In<n>.Cu at n. "First free id" only
+    // matched the legacy scheme, and on a KiCad 10 board handed In1.Cu id 1,
+    // which is F.Mask.
+    let inner_n = layer_name
+        .strip_prefix("In")
+        .and_then(|rest| rest.strip_suffix(".Cu"))
+        .and_then(|n| n.parse::<i32>().ok());
+    let legacy_numbering = konnect_sexp::layers::layers(&tree)
+        .iter()
+        .any(|l| l.name == "B.Cu" && l.id == 31);
+    let new_id = match inner_n {
+        _ if konnect_sexp::layers::layers(&tree).iter().any(|l| l.name == layer_name) => {
+            return Ok(CallToolResult::error(format!(
+                "The board already has a {layer_name} layer"
+            )))
         }
+        Some(n) if legacy_numbering => n,
+        Some(n) => 2 * n + 2,
+        None => match (1..=30).find(|id| !used_ids.contains(id)) {
+            Some(id) => id,
+            None => {
+                return Ok(CallToolResult::error(
+                    "No free inner copper layer id: 1-30 are all in use",
+                ))
+            }
+        },
     };
+    if used_ids.contains(&new_id) {
+        return Ok(CallToolResult::error(format!(
+            "{layer_name} belongs at layer id {new_id}, which the board already uses"
+        )));
+    }
 
     // Close of the layers block, by paren balance. The previous probe looked for
     // a literal "\n  )", which a tab-indented KiCad 10 file never contains; the
@@ -2637,14 +2663,11 @@ async fn handle_add_mounting_hole(
     let reference_ipc = spec.reference.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board_path, "mounting hole", move |c| {
-        c.place_footprint(
+        prepared_ipc.place_live(
+            c,
             &requested_board,
             &lib_id_ipc,
             &reference_ipc,
-            &prepared_ipc.value,
-            &prepared_ipc.pads,
-            &prepared_ipc.graphics,
-            &prepared_ipc.fields,
             x,
             y,
             0.0,
@@ -6247,5 +6270,48 @@ mod board_revision_tests {
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_conflict("add_board_text", &text["error"], &board);
         assert_eq!(std::fs::read_to_string(&board).unwrap(), newer());
+    }
+}
+
+#[cfg(test)]
+mod add_layer_id_tests {
+    use super::board_mock::ctx_talking_to;
+    use super::mounting_hole_tests::result_text;
+    use super::*;
+
+    const KICAD_10: &str = "(kicad_pcb\n\t(version 20260206)\n\t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(2 \"B.Cu\" signal)\n\t\t(1 \"F.Mask\" user)\n\t\t(25 \"Edge.Cuts\" user)\n\t)\n)\n";
+    const LEGACY: &str = "(kicad_pcb\n\t(version 20240108)\n\t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(31 \"B.Cu\" signal)\n\t\t(44 \"Edge.Cuts\" user)\n\t)\n)\n";
+
+    async fn add(board: &str, layer: &str) -> (CallToolResult, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.kicad_pcb");
+        std::fs::write(&path, board).unwrap();
+        let args = json!({"board": path.display().to_string(), "layer_name": layer});
+        let ctx = ctx_talking_to(String::new());
+        let result = handle_add_layer(&args, &ctx).await.unwrap();
+        (result, std::fs::read_to_string(&path).unwrap())
+    }
+
+    #[tokio::test]
+    async fn kicad_10_inner_layers_take_their_canonical_ids() {
+        let (_, after) = add(KICAD_10, "In1.Cu").await;
+        assert!(after.contains("(4 \"In1.Cu\" signal)"), "{after}");
+        assert!(!after.contains("(1 \"In1.Cu\""), "In1.Cu must not take F.Mask's id");
+        let (_, after) = add(KICAD_10, "In2.Cu").await;
+        assert!(after.contains("(6 \"In2.Cu\" signal)"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn legacy_boards_keep_legacy_ids() {
+        let (_, after) = add(LEGACY, "In2.Cu").await;
+        assert!(after.contains("(2 \"In2.Cu\" signal)"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn an_existing_layer_is_refused_and_the_file_kept() {
+        let board = KICAD_10.replace("\t)\n)", "\t\t(4 \"In1.Cu\" signal)\n\t)\n)");
+        let (result, after) = add(&board, "In1.Cu").await;
+        assert!(result.is_error, "{}", result_text(&result));
+        assert_eq!(after, board);
     }
 }

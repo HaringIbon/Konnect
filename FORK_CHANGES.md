@@ -1,4 +1,9 @@
-# Fork changes: safe-write fixes
+# Fork changes
+
+Two passes so far: the safe-write fixes (below), then the simple tool fixes
+found by the proof-of-concept boards (see [Pass 2](#pass-2-simple-tool-fixes)).
+
+## Pass 1: safe-write fixes
 
 This fork (`HaringIbon/Konnect`, branch `safe-writes`) is based on the final
 upstream `mixelpixx/Konnect` `main` (`676efce`, v0.13.0 + 62 commits). Upstream
@@ -12,8 +17,9 @@ after review. Two issues had no PR, so the fixes were written here.
 
 ## Summary by tool
 
-The served MCP surface did not change: the same 236 tools, and every
-`inputSchema` is byte-identical to upstream `main`. Only behaviour on the
+The served MCP surface did not change in that pass: the same 235 tools (228
+plus 7 meta-tools), and every `inputSchema` is byte-identical to upstream
+`main`. Only behaviour on the
 unsafe paths changed, plus 4 tool descriptions.
 
 | Tool | Issue(s) | What changed | Path affected |
@@ -100,3 +106,65 @@ These are out of scope for the minimal-change goal. None of them loses data.
   stock 0805 footprints use, so the proof of concept routes with
   `route_pad_to_pad` / `route_trace`.
 - #747: schematic tool responses report float noise (`78.74000000000001`).
+
+## Pass 2: simple tool fixes
+
+Found while building the 4-layer proof-of-concept board (`poc/mcu_board`) and
+confirmed by an independent review. Each one is small and local. None of them
+was on the upstream tracker except #784.
+
+| Tool | What was wrong | What changed | Schema |
+|---|---|---|---|
+| `estimate_cost` | Every KiCad-saved board measured 0 × 0 mm. The text scan cut each `(gr_line` block at its first `)\n`, which comes before the `(layer "Edge.Cuts")` line. | Uses the parsed tree and the existing `board_outline_bbox` (lines, arcs, rects, polys), rounded to the micron. | unchanged |
+| `audit_power_rails` | Any net starting with `VBUS`/`VCC`/`3V3`/… was audited as a rail, so `VBUS_SENSE` failed with "no decoupling". | A name with a signal suffix (`_SENSE`, `_EN`, `_PG`, `_DET`, `_FB`, `_OK`, `_FAULT`, …) is not a rail. | unchanged |
+| `create_project` | The new board used pre-KiCad-9 layer ids (B.Cu = 31) under a KiCad 10 header; KiCad renumbered it on first save. | Writes the KiCad 10 ids, in the order KiCad 10 saves them. | unchanged |
+| `add_layer` | Picked the first free id, which only matched legacy numbering: on a KiCad 10 board, adding `In2.Cu` alone took In1's id, and ids past In4 landed on technical-layer ids. Adding an existing layer duplicated it. | `In<n>.Cu` gets its canonical id (`2n+2`, or `n` on a legacy board). An existing layer, or an occupied id, is refused. | unchanged |
+| `update_footprints_from_library` | Refused `(unlocked yes)` on a property or user text. Stock KiCad 10 libraries put it on Datasheet/Description: it was the refusal reason for 2,787 stock footprints, including SOT-223. | Accepted. On a property, it maps to the `BoardText` lock state (`yes` → `LS_UNLOCKED`, `no` → `LS_LOCKED`). On user text, `yes` is what the rebuild already sends, and `no` is still refused. | unchanged |
+| `place_component`, `add_mounting_hole`, `duplicate_component` | Over IPC, the placed footprint got none of the library's `(attr …)` flags, description or 3D model (only the sync applied them, #789). Mounting holes landed in the CPL but not the BOM, so `export_manufacturing_package` reported INCOMPLETE. | Same library readers as the sync (`library_footprint::LibraryExtras`), applied to the built item before it is sent. The file fallback already copied the library text and is unchanged. | unchanged |
+| `apply_template` | The description said it wires components; it only places them. Its `connections_to_wire` named template parts (`R1.2`, `D1.A`, `U.VIN`) instead of the references placed (R8, D8) (#784). | Description corrected. `from`/`to`/`via` are rewritten to the placed references. | **description changed** |
+| `add_via` | Through vias only (F.Cu → B.Cu hardcoded), although KiCad 10's API takes blind, buried and micro vias. | Optional `start_layer`, `end_layer` and `via_type` (`through`/`blind`/`buried`/`micro`, inferred from the span when omitted). A type that contradicts the span is refused. The default call is unchanged. | **3 optional properties added** |
+
+New internal API: `KiCadIpcClient::place_footprint_item` (place a pre-built
+item; `place_footprint` now calls it), `builders::build_via_span`
+(`build_via` calls it), and `library_footprint::LibraryExtras`.
+
+### Measurements
+
+- `update_footprints_from_library` parser over all 15,468 footprints in
+  KiCad 10.0.8's library: 9,666 accepted before, 12,387 after. The remaining
+  3,081 refusals are other clauses: pad `property` (fab properties, 1,069),
+  `point` (617), custom pad shapes (459), footprint `solder_mask_margin`
+  (252), `zone_connect`, zones, `justify`. Those need real mapping work and
+  are not in this pass.
+- The review's figure of 22% refused "for the `(unlocked)` clause" was about
+  right for the total (37.5% before), but `(unlocked)` was the first refusal
+  reason for only 2,787 of the 5,802. Fixing it accepted 2,721 of them; the
+  other 66 hit a second unsupported clause.
+
+### Verification
+
+**Automated:**
+- `cargo clippy --workspace --all-targets -D warnings` is clean.
+- New tests:
+  - `manufacturing::board_dimension_tests`
+  - `design_review::power_net_name_tests`
+  - `project::tests::blank_kicad_pcb_uses_kicad_10_layer_ids`
+  - `pcb_board::add_layer_id_tests`
+  - `pcb_footprint_update::tests::parser_accepts_the_unlocked_clause_as_the_field_lock_state`
+  - `library_footprint::tests::extras_land_on_the_built_item`
+  - `pcb_routing::via_span_tests`
+  - the `apply_template` remapping assertions in `templates::tests`
+- Three upstream tests used `(unlocked yes)` as their example of an unsupported clause. They now use the malformed `(unlocked maybe)`, so they still exercise the refusal path.
+
+**Live, against KiCad 10.0.8** (`poc/simple_fixes_check.py`, on `poc/fixcheck`, a fresh copy of the 4-layer board): 21/21 checks pass.
+- KiCad closed:
+  - `create_project` + `add_layer` give ids 2/4/6, and pcbnew loads the board as 4 copper layers.
+  - `apply_template` returns R8/D8.
+  - `estimate_cost` measures 50 × 40 mm.
+  - `audit_power_rails` no longer flags `VBUS_SENSE`.
+- pcbnew live:
+  - `update_footprints_from_library` plans U10 (SOT-223).
+  - H1–H4 re-placed with `add_mounting_hole` are saved with `(attr exclude_from_pos_files exclude_from_bom)`, and so are TP90/TP91 from `place_component`/`duplicate_component`.
+  - `export_manufacturing_package` (jlcpcb) is now `complete: true`.
+  - Blind (F.Cu→In1.Cu), buried (In1.Cu→In2.Cu) and micro vias are saved as `(via blind|buried|micro … (layers …))`. A contradicting `via_type` is refused.
+  - DRC accepts the new via types. The only errors were hole clearance to H1, from the test's own placement of the via 1.4 mm from the hole.

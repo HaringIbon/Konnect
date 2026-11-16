@@ -2281,3 +2281,26 @@ open, falling back to the saved file otherwise. Scoring policy and every existin
 field are unchanged; the response adds `source`, either `"ipc"` or `"saved_file"`
 (matching `run_drc`'s own source-disclosure convention), so a caller can tell
 which board state was judged.
+
+## Unreleased (fork): `add_via` accepts blind, buried and micro vias
+
+`add_via` takes three optional properties: `start_layer` (default `F.Cu`),
+`end_layer` (default `B.Cu`) and `via_type` (`through`, `blind`, `buried` or
+`micro`, inferred from the span when omitted). A call without them still
+creates the same through via. A `via_type` that contradicts the span (for
+example `blind` on F.Cu → B.Cu) is refused with `invalid_argument` and nothing
+is sent. The response adds `start_layer`, `end_layer` and `via_type`.
+
+## Unreleased (fork): `apply_template` names placed references
+
+`connections_to_wire` entries now name the parts the call placed (`R8.2`)
+instead of the template's own names (`R1.2`, or a bare `U` for the first U)
+(#784). The description no longer claims the tool wires the circuit.
+
+## Unreleased (fork): placement tools keep library attributes
+
+`place_component`, `add_mounting_hole` and `duplicate_component` now place a
+footprint over IPC with its library `(attr …)` flags, description, keywords and
+3D models, as `update_pcb_from_schematic` has done since #789. A footprint
+whose `(attr …)` or `(model …)` the shared reader cannot represent is now
+refused by these tools too, rather than placed without it.

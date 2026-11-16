@@ -241,8 +241,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "apply_template",
             "Instantiate a reference circuit template into the current schematic. Places all \
-             components and wires them according to the template's connection map. Use net_mappings \
-             to connect template nets to your project's existing nets.",
+             components in a column; it does NOT draw wires. The result lists the template's \
+             connections rewritten to the placed references (template R1 → the R it placed) — \
+             wire them with connect_to_net / connect_pins. Use net_mappings to rename template \
+             nets to your project's nets in that list.",
             json!({
                 "type": "object",
                 "properties": {
@@ -445,6 +447,12 @@ async fn handle_apply_template(
     let mut placed_targets = Vec::new();
     let mut ref_counters: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    // Template connections name parts by template position — `R1`, `R2`, or a
+    // bare `U` for the first U — not by the reference placed (#784).
+    let mut template_refs: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut prefix_seen: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     // Place components in a column layout
     let spacing_y = 15.0; // mm between components
@@ -461,6 +469,12 @@ async fn handle_apply_template(
                 .or_insert(ref_start);
             let reference = format!("{}{}", ref_prefix, counter);
             *counter += 1;
+            let nth = prefix_seen.entry(ref_prefix.to_string()).or_insert(0);
+            *nth += 1;
+            template_refs.insert(format!("{ref_prefix}{nth}"), reference.clone());
+            if *nth == 1 {
+                template_refs.insert(ref_prefix.to_string(), reference.clone());
+            }
 
             let x = base_x;
             let y = base_y + (placed.len() as f64) * spacing_y;
@@ -551,6 +565,20 @@ async fn handle_apply_template(
         .iter()
         .map(|conn| {
             let mut c = conn.clone();
+            for key in ["from", "to", "via"] {
+                if let Some(end) = c[key].as_str() {
+                    let (part, pin) = match end.split_once('.') {
+                        Some((part, pin)) => (part, Some(pin)),
+                        None => (end, None),
+                    };
+                    if let Some(placed) = template_refs.get(part) {
+                        c[key] = json!(match pin {
+                            Some(pin) => format!("{placed}.{pin}"),
+                            None => placed.clone(),
+                        });
+                    }
+                }
+            }
             let original_net = c["to_net"].as_str().map(String::from);
             if let Some(net) = original_net {
                 if let Some(mapped) = net_mappings.get(&net) {
@@ -697,7 +725,10 @@ mod tests {
                 "components": [
                     {"ref_prefix": "R", "lib_id": "Device:R", "value": "4.7k"}
                 ],
-                "connections": [],
+                "connections": [
+                    {"from": "GPIO", "to": "R1.1"},
+                    {"from": "R.2", "via": "R1", "to_net": "GND"}
+                ],
                 "design_notes": "test"
             }))
             .unwrap(),
@@ -756,6 +787,18 @@ mod tests {
         )
         .await;
         assert!(!applied.is_error, "{applied:?}");
+        // The template names its resistor R1 / R; the part placed is R3 (#784).
+        let body: serde_json::Value = serde_json::from_str(
+            match applied.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+                other => panic!("expected text content, got {other:?}"),
+            },
+        )
+        .unwrap();
+        assert_eq!(body["connections_to_wire"][0]["to"], "R3.1", "{body}");
+        assert_eq!(body["connections_to_wire"][0]["from"], "GPIO", "{body}");
+        assert_eq!(body["connections_to_wire"][1]["from"], "R3.2", "{body}");
+        assert_eq!(body["connections_to_wire"][1]["via"], "R3", "{body}");
 
         let saved = konnect_schematic_editor::Schematic::load(&schematic).unwrap();
         let placed = saved

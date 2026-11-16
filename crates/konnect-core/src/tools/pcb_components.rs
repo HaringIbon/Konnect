@@ -892,6 +892,7 @@ pub(crate) struct PreparedFootprintPlacement {
     pub(crate) graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     pub(crate) fields: konnect_ipc::IpcFieldPlacement,
     board_sexp: String,
+    extras: super::library_footprint::LibraryExtras,
 }
 
 impl PreparedFootprintPlacement {
@@ -912,6 +913,7 @@ impl PreparedFootprintPlacement {
         let pads = extract_pad_definitions(&prepared)?;
         let graphics = extract_graphic_definitions(&prepared)?;
         let fields = extract_field_placement(&prepared);
+        let extras = super::library_footprint::LibraryExtras::from_source(source)?;
         let board_sexp =
             board_footprint_sexp(lib_id, x, y, rotation, layer, Some(reference), project_dir)
                 .map_err(anyhow::Error::msg)?;
@@ -927,6 +929,7 @@ impl PreparedFootprintPlacement {
             graphics,
             fields,
             board_sexp,
+            extras,
         })
     }
 
@@ -937,13 +940,47 @@ impl PreparedFootprintPlacement {
         fields: konnect_ipc::IpcFieldPlacement,
         board_sexp: String,
     ) -> Self {
+        // The inline footprint's own `(attr …)` is what the file path writes,
+        // so the live path reads its flags from the same text.
+        let extras = super::library_footprint::LibraryExtras::from_source(&board_sexp)
+            .unwrap_or_default();
         Self {
             value,
             pads,
             graphics,
             fields,
             board_sexp,
+            extras,
         }
+    }
+
+    /// Build the IPC item for this placement, library data included, and
+    /// place it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn place_live(
+        &self,
+        client: &KiCadIpcClient,
+        board: &Path,
+        lib_id: &str,
+        reference: &str,
+        x: f64,
+        y: f64,
+        rotation: f64,
+        layer: &str,
+    ) -> anyhow::Result<konnect_ipc::IpcFootprint> {
+        let item = KiCadIpcClient::build_footprint_item(
+            lib_id,
+            reference,
+            &self.value,
+            &self.pads,
+            &self.graphics,
+            &self.fields,
+            x,
+            y,
+            rotation,
+            layer,
+        )?;
+        client.place_footprint_item(board, reference, self.extras.apply(item)?)
     }
 
     /// Insert exactly this footprint through the same atomic, duplicate-safe
@@ -2237,14 +2274,11 @@ async fn handle_place_component(
     let requested_board = board.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board, "placement", move |c| {
-        c.place_footprint(
+        prepared_ipc.place_live(
+            c,
             &requested_board,
             &footprint_ipc,
             &reference_ipc,
-            &prepared_ipc.value,
-            &prepared_ipc.pads,
-            &prepared_ipc.graphics,
-            &prepared_ipc.fields,
             x,
             y,
             rotation,
@@ -3900,20 +3934,26 @@ async fn handle_duplicate_component(
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
     let fields = extract_field_placement(&prepared);
+    let extras = match super::library_footprint::LibraryExtras::from_source(&source) {
+        Ok(extras) => extras,
+        Err(error) => return Ok(CallToolResult::error(format!("{error:#}"))),
+    };
     let dup_board = board.clone();
-    let fp = ipc!(ctx, args, |c| c.place_footprint(
-        &dup_board,
-        &fp_id,
-        &ipc_reference,
-        &fp_value,
-        &pads,
-        &graphics,
-        &fields,
-        x,
-        y,
-        fp_rotation,
-        &fp_layer
-    ));
+    let fp = ipc!(ctx, args, |c| {
+        let item = KiCadIpcClient::build_footprint_item(
+            &fp_id,
+            &ipc_reference,
+            &fp_value,
+            &pads,
+            &graphics,
+            &fields,
+            x,
+            y,
+            fp_rotation,
+            &fp_layer,
+        )?;
+        c.place_footprint_item(&dup_board, &ipc_reference, extras.apply(item)?)
+    });
     Ok(CallToolResult::json(&json!({
         "duplicated_from": reference,
         "new_reference": fp.reference,

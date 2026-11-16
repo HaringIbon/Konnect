@@ -833,6 +833,7 @@ fn parse_library_property(
     let mut layer = None;
     let mut hidden = None;
     let mut knockout = None;
+    let mut unlocked = None;
     let mut attributes = None;
     let mut identifier = None;
 
@@ -891,6 +892,16 @@ fn parse_library_property(
                 }
                 knockout = Some(property_yes_no(clause, name, "knockout")?);
             }
+            // KiCad 10's stock libraries write `(unlocked yes)` on Datasheet and
+            // Description (3,357 of 15,468 footprints). It is the field's
+            // BoardText lock state: a field placed over IPC as LsUnlocked is
+            // saved by KiCad with exactly this clause.
+            "unlocked" => {
+                if unlocked.is_some() {
+                    bail!("property '{name}' contains duplicate 'unlocked' clauses");
+                }
+                unlocked = Some(property_yes_no(clause, name, "unlocked")?);
+            }
             "uuid" | "tstamp" => {
                 if let Some(previous) = identifier {
                     bail!(
@@ -947,7 +958,11 @@ fn parse_library_property(
             }),
             layer,
             knockout: knockout.unwrap_or(false),
-            locked: LockedState::LsUnlocked as i32,
+            locked: if unlocked == Some(false) {
+                LockedState::LsLocked as i32
+            } else {
+                LockedState::LsUnlocked as i32
+            },
             parent: None,
         }),
         visible: !hidden.unwrap_or(false),
@@ -1196,6 +1211,7 @@ fn validate_user_text(text: &konnect_sexp::SexpNode) -> Result<()> {
     let mut saw_at = false;
     let mut saw_layer = false;
     let mut saw_effects = false;
+    let mut saw_unlocked = false;
     let mut identifier = None;
     for clause in text.children().unwrap_or_default().iter().skip(3) {
         let tag = clause
@@ -1248,6 +1264,18 @@ fn validate_user_text(text: &konnect_sexp::SexpNode) -> Result<()> {
                         .is_none_or(str::is_empty)
                 {
                     bail!("fp_text user '{tag}' must contain exactly one identifier");
+                }
+            }
+            // User text is rebuilt with `board_text_with_stroke_width`, which
+            // always sends LsUnlocked — exactly what `(unlocked yes)` records.
+            // `(unlocked no)` cannot be reproduced, so it is still refused.
+            "unlocked" => {
+                if saw_unlocked {
+                    bail!("fp_text user contains duplicate 'unlocked' clauses");
+                }
+                saw_unlocked = true;
+                if !property_yes_no(clause, "fp_text user", "unlocked")? {
+                    bail!("fp_text user clause 'unlocked no' is not supported losslessly");
                 }
             }
             "effects" => {
@@ -2793,11 +2821,47 @@ mod tests {
         assert!(error.to_string().contains("zone"), "{error:#}");
     }
 
+    /// KiCad 10's stock libraries write `(unlocked yes)` on Datasheet and
+    /// Description (e.g. Package_TO_SOT_SMD:SOT-223-3_TabPin2); refusing it
+    /// refused about 22% of the stock footprints.
+    #[test]
+    fn parser_accepts_the_unlocked_clause_as_the_field_lock_state() {
+        let datasheet = KICAD_LIBRARY_FOOTPRINT.replace(
+            "\t(property \"Datasheet\" \"new-datasheet.pdf\"\n\t\t(at",
+            "\t(property \"Datasheet\" \"new-datasheet.pdf\"\n\t\t(unlocked yes)\n\t\t(at",
+        );
+        assert_ne!(datasheet, KICAD_LIBRARY_FOOTPRINT);
+        parse_library_footprint("Test:Socket", &datasheet).expect("stock (unlocked yes) parses");
+
+        for (clause, expected) in [
+            ("yes", kiapi::common::types::LockedState::LsUnlocked),
+            ("no", kiapi::common::types::LockedState::LsLocked),
+        ] {
+            let source = KICAD_LIBRARY_FOOTPRINT.replace(
+                "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
+                &format!(
+                    "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked {clause})\n\t\t(at"
+                ),
+            );
+            let parsed = parse_library_footprint("Test:Socket", &source).unwrap();
+            let field = parsed
+                .properties
+                .iter()
+                .find(|field| field.name == "AssemblyVendor")
+                .expect("custom property kept");
+            assert_eq!(
+                field.text.as_ref().unwrap().locked,
+                expected as i32,
+                "(unlocked {clause})"
+            );
+        }
+    }
+
     #[test]
     fn parser_names_unrepresentable_or_ambiguous_custom_properties() {
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked maybe)\n\t\t(at",
         );
         assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
         let error = parse_library_footprint("Test:Socket", &unsupported).unwrap_err();
@@ -2828,7 +2892,7 @@ mod tests {
             let authored = format!("\t(property \"{name}\" \"{value}\"\n\t\t(at");
             let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
                 &authored,
-                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(unlocked yes)\n\t\t(at"),
+                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(unlocked maybe)\n\t\t(at"),
             );
             assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
             match parse_library_footprint("Test:Socket", &unsupported) {
@@ -2958,7 +3022,7 @@ mod tests {
         for (from, to, expected) in [
             (
                 "(at 0 1.5 0) (layer \"F.Fab\")",
-                "(at 0 1.5 0) (unlocked yes) (layer \"F.Fab\")",
+                "(at 0 1.5 0) (unlocked no) (layer \"F.Fab\")",
                 "unlocked",
             ),
             (
@@ -3194,7 +3258,7 @@ mod tests {
         let (temp, board, items) = plan_fixture();
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked maybe)\n\t\t(at",
         );
         std::fs::write(
             temp.path().join("Test.pretty/Socket.kicad_mod"),

@@ -1215,7 +1215,7 @@ async fn handle_estimate_cost(
     }
 
     // Estimate board dimensions from Edge.Cuts
-    let (width_mm, height_mm) = estimate_board_dimensions(&content);
+    let (width_mm, height_mm) = estimate_board_dimensions(&tree);
 
     // Rough cost estimation based on fab house pricing models
     let (pcb_cost, assembly_cost, component_est) = match fab_house {
@@ -1848,74 +1848,48 @@ fn find_setup_value(content: &str, key: &str) -> Option<f64> {
     after[..end].trim().parse().ok()
 }
 
-fn estimate_board_dimensions(content: &str) -> (f64, f64) {
-    let mut min_x = f64::MAX;
-    let mut max_x = f64::MIN;
-    let mut min_y = f64::MAX;
-    let mut max_y = f64::MIN;
-    let mut found = false;
-
-    // Scan gr_line on Edge.Cuts for board outline coordinates
-    let mut pos = 0;
-    while let Some(line_pos) = content[pos..].find("(gr_line") {
-        let abs = pos + line_pos;
-        let block_end = content[abs..].find(")\n").unwrap_or(300) + abs;
-        let block = &content[abs..block_end.min(content.len())];
-
-        if block.contains("Edge.Cuts") {
-            // Extract start and end coordinates
-            if let (Some(sx), Some(sy)) = (
-                extract_coord(block, "start", 0),
-                extract_coord(block, "start", 1),
-            ) {
-                if sx < min_x {
-                    min_x = sx;
-                }
-                if sx > max_x {
-                    max_x = sx;
-                }
-                if sy < min_y {
-                    min_y = sy;
-                }
-                if sy > max_y {
-                    max_y = sy;
-                }
-                found = true;
-            }
-            if let (Some(ex), Some(ey)) = (
-                extract_coord(block, "end", 0),
-                extract_coord(block, "end", 1),
-            ) {
-                if ex < min_x {
-                    min_x = ex;
-                }
-                if ex > max_x {
-                    max_x = ex;
-                }
-                if ey < min_y {
-                    min_y = ey;
-                }
-                if ey > max_y {
-                    max_y = ey;
-                }
-            }
-        }
-        pos = abs + 1;
-    }
-
-    if found {
-        ((max_x - min_x).abs(), (max_y - min_y).abs())
-    } else {
-        (0.0, 0.0) // Unknown
+/// Width and height of the Edge.Cuts outline, or (0, 0) when the board has
+/// no readable outline. Uses the parsed tree: the old substring scan cut each
+/// `(gr_line` block at its first `)\n`, which on a KiCad-saved board falls
+/// before the `(layer "Edge.Cuts")` line, so every saved board measured 0 × 0.
+fn estimate_board_dimensions(tree: &konnect_sexp::parser::SexpNode) -> (f64, f64) {
+    match konnect_sexp::board::board_outline_bbox(tree) {
+        // Rounded to the micron: arc extrema leave float noise (50.000000000003).
+        Some((x0, y0, x1, y1)) => (
+            ((x1 - x0) * 1000.0).round() / 1000.0,
+            ((y1 - y0) * 1000.0).round() / 1000.0,
+        ),
+        None => (0.0, 0.0), // Unknown
     }
 }
 
-fn extract_coord(block: &str, keyword: &str, index: usize) -> Option<f64> {
-    let pat = format!("({} ", keyword);
-    let pos = block.find(&pat)? + pat.len();
-    let rest = &block[pos..];
-    let parts: Vec<&str> = rest.split([' ', ')']).collect();
-    parts.get(index)?.parse().ok()
+#[cfg(test)]
+mod board_dimension_tests {
+    use super::*;
+    use konnect_sexp::parser::parse_sexp;
+
+    /// KiCad 10 writes each `gr_line` over several lines, with `(layer
+    /// "Edge.Cuts")` after the `(stroke …)` block. The old scan stopped at the
+    /// first `)\n` and never saw the layer, so this board measured 0 × 0.
+    #[test]
+    fn kicad_saved_outline_is_measured() {
+        let board = "(kicad_pcb\n\t(version 20260206)\n\
+            \t(gr_line\n\t\t(start 100 100)\n\t\t(end 150 100)\n\t\t(stroke\n\t\t\t(width 0.05)\n\t\t\t(type default)\n\t\t)\n\t\t(layer \"Edge.Cuts\")\n\t)\n\
+            \t(gr_line\n\t\t(start 150 100)\n\t\t(end 150 140)\n\t\t(stroke\n\t\t\t(width 0.05)\n\t\t\t(type default)\n\t\t)\n\t\t(layer \"Edge.Cuts\")\n\t)\n\
+            \t(gr_line\n\t\t(start 150 140)\n\t\t(end 100 140)\n\t\t(stroke\n\t\t\t(width 0.05)\n\t\t\t(type default)\n\t\t)\n\t\t(layer \"Edge.Cuts\")\n\t)\n\
+            \t(gr_line\n\t\t(start 100 140)\n\t\t(end 100 100)\n\t\t(stroke\n\t\t\t(width 0.05)\n\t\t\t(type default)\n\t\t)\n\t\t(layer \"Edge.Cuts\")\n\t)\n\
+            \t(gr_line\n\t\t(start 0 0)\n\t\t(end 400 300)\n\t\t(stroke\n\t\t\t(width 0.1)\n\t\t\t(type default)\n\t\t)\n\t\t(layer \"F.SilkS\")\n\t)\n\
+            )\n";
+        let tree = parse_sexp(board).unwrap();
+        let (w, h) = estimate_board_dimensions(&tree);
+        assert!((w - 50.0).abs() < 1e-9 && (h - 40.0).abs() < 1e-9, "{w} x {h}");
+    }
+
+    #[test]
+    fn board_without_outline_is_unknown() {
+        let tree = parse_sexp("(kicad_pcb (version 20260206))").unwrap();
+        assert_eq!(estimate_board_dimensions(&tree), (0.0, 0.0));
+    }
 }
 
 #[cfg(test)]
