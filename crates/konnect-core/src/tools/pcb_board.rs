@@ -2700,21 +2700,55 @@ fn board_layer_arg(
         Some(default) if args["layer"].is_null() => default,
         _ => require_str(args, "layer")?,
     };
-    if builders::try_layer_from_name(layer).is_err() {
-        return Err(invalid_arg(
+    // Return KiCad's canonical name, not the caller's spelling: the file
+    // fallbacks write this string into `(layer "...")`, and KiCad 10 refuses
+    // to load a board whose item names a layer by an alias such as
+    // `F.Silkscreen` or `In01.Cu` (#849). Over IPC both map to the same layer.
+    match builders::try_layer_from_name(layer)
+        .ok()
+        .and_then(builders::layer_name)
+    {
+        Some(canonical) => Ok(canonical.to_string()),
+        None => Err(invalid_arg(
             "layer",
             &format!(
                 "'{layer}' is not a KiCad board layer; use one such as F.Cu, B.Cu, \
                  In1.Cu..In30.Cu, F.SilkS, B.SilkS, Edge.Cuts or User.1..User.45"
             ),
-        ));
+        )),
     }
-    Ok(layer.to_string())
 }
 
 #[cfg(test)]
 mod board_layer_arg_tests {
     use super::*;
+
+    /// An alias KiCad accepts in its UI but refuses in a board file is
+    /// written under its canonical name (#849); canonical names pass as-is.
+    #[test]
+    fn an_alias_is_returned_as_kicads_canonical_name() {
+        for (given, canonical) in [
+            ("F.Silkscreen", "F.SilkS"),
+            ("B.Silkscreen", "B.SilkS"),
+            ("F.Courtyard", "F.CrtYd"),
+            ("F.Adhesive", "F.Adhes"),
+            ("User.Drawings", "Dwgs.User"),
+            ("User.Comments", "Cmts.User"),
+            ("User.Eco1", "Eco1.User"),
+            ("In01.Cu", "In1.Cu"),
+            ("In+1.Cu", "In1.Cu"),
+            ("F.SilkS", "F.SilkS"),
+            ("In2.Cu", "In2.Cu"),
+            ("Edge.Cuts", "Edge.Cuts"),
+            ("User.12", "User.12"),
+        ] {
+            assert_eq!(
+                board_layer_arg(&json!({ "layer": given }), None).unwrap(),
+                canonical,
+                "{given}"
+            );
+        }
+    }
 
     // A direct handler call skips the schema gate, so the helper itself must
     // refuse a non-string `layer` rather than substitute the default.

@@ -3,6 +3,16 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: board text, logo and zone writers write a layer alias under its canonical name (patch release)
+
+`add_board_text`, `import_svg_logo`, `add_zone` and `add_copper_pour` still
+accept KiCad's long display names and other spellings `layer_from_name` maps
+(`F.Silkscreen`, `F.Courtyard`, `User.Drawings`, `In01.Cu`, ...), but now
+write and report KiCad's canonical name (`F.SilkS`, `F.CrtYd`, `Dwgs.User`,
+`In1.Cu`). Before, the board-file fallbacks wrote the alias verbatim and
+KiCad 10 refused to load the board ("items were found on undefined layers").
+The response's `layer` field now echoes the canonical name (#849).
+
 ## Unreleased: project-file writers refuse a .kicad_pro that changed mid-edit (patch release)
 
 `set_design_rules`, `set_predefined_sizes`, `create_netclass` and
