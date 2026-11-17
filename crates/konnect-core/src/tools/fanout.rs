@@ -1130,4 +1130,30 @@ impl BoardOutline {
     pub(crate) fn contains(&self, p: (f64, f64), margin: f64) -> bool {
         self.0.inside_board(p, margin)
     }
+
+    /// The outline has readable Edge.Cuts geometry.
+    pub(crate) fn has_edges(&self) -> bool {
+        !self.0.edges.is_empty()
+    }
+
+    /// An axis-aligned rectangle lies wholly inside the outline: its corners
+    /// are inside and no outline edge enters it (a notch or concave corner
+    /// can cut into a rectangle whose four corners are all on the board).
+    pub(crate) fn contains_rect(&self, (x0, y0, x1, y1): Bbox) -> bool {
+        let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+        if !corners.iter().all(|c| self.0.inside_board(*c, 0.0)) {
+            return false;
+        }
+        let inside = |p: Point| p.0 > x0 && p.0 < x1 && p.1 > y0 && p.1 < y1;
+        !self.0.edges.iter().any(|&(a, b)| {
+            inside(a)
+                || inside(b)
+                || (0..4).any(|i| segments_intersect(a, b, corners[i], corners[(i + 1) % 4]))
+        })
+    }
+
+    /// Distance from `p` to the nearest outline edge.
+    pub(crate) fn edge_distance(&self, p: Point) -> f64 {
+        self.0.edges.iter().map(|&(a, b)| point_segment_distance(p, a, b)).fold(f64::INFINITY, f64::min)
+    }
 }

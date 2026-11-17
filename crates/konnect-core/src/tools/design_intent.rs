@@ -763,15 +763,15 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
 // ─── Placement for ties ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
-struct TiePlacement {
-    reference: String,
-    x: f64,
-    y: f64,
-    rotation: f64,
-    tie: String,
-    distance_mm: f64,
-    max_mm: f64,
-    meets: bool,
+pub(crate) struct TiePlacement {
+    pub reference: String,
+    pub x: f64,
+    pub y: f64,
+    pub rotation: f64,
+    pub tie: String,
+    pub distance_mm: f64,
+    pub max_mm: f64,
+    pub meets: bool,
 }
 
 type Rect = (f64, f64, f64, f64);
@@ -799,7 +799,7 @@ fn to_board(p: (f64, f64), at: (f64, f64), rot: f64) -> (f64, f64) {
 /// the part's pad on the pin's net closest to the pin, with its courtyard
 /// clear of every other courtyard on that side and inside the outline.
 /// A plan only: apply with `set_component_placements`.
-fn plan_ties(tree: &SexpNode, intent: &DesignIntent, clearance: f64) -> (Vec<TiePlacement>, Vec<Value>) {
+pub(crate) fn plan_ties(tree: &SexpNode, intent: &DesignIntent, clearance: f64) -> (Vec<TiePlacement>, Vec<Value>) {
     let pads = copper_pads(tree);
     let outline = BoardOutline::read(tree);
     let mut courtyards: Vec<Courtyard> = konnect_sexp::board::footprint_courtyards(tree)

@@ -65,11 +65,13 @@ pub fn tools() -> Vec<ToolDef> {
          naming the components behind each one. Hard failures (courtyard overlaps, parts \
          outside the outline) decide the verdict regardless of the numeric score, and a \
          board without an Edge.Cuts outline can never pass — its verdict is \
-         'outline_missing'. Outside-outline and connector-edge evidence only applies against \
-         a provably axis-aligned rectangular outline; a concave, notched, rounded, rotated, \
-         or multi-boundary outline cannot prove containment from its bbox, so those checks \
-         are skipped and the verdict is 'outline_unproven' (see 'outline_shape' in the \
-         response) rather than a silent pass.",
+         'outline_missing'. Containment and connector-edge distance use a rectangular outline \
+         directly and any other outline (rounded, notched, L-shaped, arcs) through its real \
+         Edge.Cuts geometry ('outline_checks': rectangle | real_outline); only an unreadable \
+         outline gives 'outline_unproven'. An edge-mount connector (J*) whose courtyard \
+         overhangs the edge with its centre on the board is listed in 'edge_overhangs', not \
+         failed. Decoupling caps are measured pad edge to pad edge, from the cap's pad on a \
+         shared supply net to the nearest IC pin on that net.",
             json!({
                 "type": "object",
                 "properties": {
@@ -81,8 +83,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "place_decoupling_caps",
-            "Plan (and optionally apply) a row of decoupling capacitors beside an IC, from \
-         capacitor references YOU supply — this tool never infers which caps decouple which \
+            "Plan (and optionally apply) decoupling capacitor positions beside an IC, from \
+         capacitor references YOU supply. Each cap sharing a supply net with the IC is assigned \
+         the nearest IC pin on that net and placed beside it (courtyard- and real-outline-aware); \
+         caps already within their limit stay put and are listed in 'unplaced'; caps sharing no \
+         supply net with the IC fall back to a row on 'side'. Capacitor references come from you — this tool never infers which caps decouple which \
          IC (a shared net, GND above all, is not evidence of that pairing). Every reference \
          must already name a footprint on the board with usable courtyard geometry; an \
          unknown or unplaceable reference is refused before anything is planned. The response's \
@@ -283,6 +288,12 @@ async fn handle_score_placement(
         OutlineShape::Rectangular { bbox } => Some(bbox),
         OutlineShape::Unproven { .. } | OutlineShape::Missing => None,
     };
+    // Any other readable outline (rounded, notched, L-shaped, arcs) is checked
+    // against its real Edge.Cuts geometry: a courtyard must lie wholly inside,
+    // with no outline edge cutting into it.
+    let real_outline = matches!(outline_shape, OutlineShape::Unproven { .. })
+        .then(|| crate::tools::fanout::BoardOutline::read(&tree))
+        .filter(|o| o.has_edges());
     let index = PcbConnectivityIndex::build(&tree);
     let values = footprint_values(&tree);
 
@@ -325,10 +336,22 @@ async fn handle_score_placement(
     // No outline means this check is blocked, not passed: the response carries
     // `outline_missing: true` and the verdict can never be "pass".
     let mut outside_refs: Vec<String> = Vec::new();
+    // Edge-mount connectors (USB-C, barrel jacks) overhang the edge by
+    // design: a J* whose courtyard crosses the outline while its centre is
+    // on the board is reported as an overhang, not a hard failure.
+    let mut edge_overhangs: Vec<serde_json::Value> = Vec::new();
+    let is_edge_connector = |c: &FootprintCourtyard, centre_inside: bool| {
+        c.reference.as_deref().is_some_and(|r| ref_prefix(r) == "J") && centre_inside
+    };
     if let Some((ox0, oy0, ox1, oy1)) = outline {
         for c in &scan.items {
             let (x0, y0, x1, y1) = c.bbox;
             if x0 < ox0 || y0 < oy0 || x1 > ox1 || y1 > oy1 {
+                let (cx, cy) = bbox_center(c.bbox);
+                if is_edge_connector(c, cx > ox0 && cx < ox1 && cy > oy0 && cy < oy1) {
+                    edge_overhangs.push(json!({"reference": courtyard_reference(c)}));
+                    continue;
+                }
                 let reference = courtyard_reference(c);
                 outside_refs.push(reference.to_string());
                 hard_failures.push(json!({
@@ -341,6 +364,28 @@ async fn handle_score_placement(
                     ),
                 }));
             }
+        }
+    } else if let Some(real) = &real_outline {
+        for c in &scan.items {
+            if c.bbox_source == CourtyardSource::AnchorOnly || real.contains_rect(c.bbox) {
+                continue;
+            }
+            if is_edge_connector(c, real.contains(bbox_center(c.bbox), 0.0)) {
+                edge_overhangs.push(json!({"reference": courtyard_reference(c)}));
+                continue;
+            }
+            let (x0, y0, x1, y1) = c.bbox;
+            let reference = courtyard_reference(c);
+            outside_refs.push(reference.to_string());
+            hard_failures.push(json!({
+                "kind": "outside_outline",
+                "references": [reference],
+                "detail": format!(
+                    "{reference} courtyard bbox ({}, {})..({}, {}) is not wholly inside the \
+                     board outline (checked against the real Edge.Cuts geometry)",
+                    round3(x0), round3(y0), round3(x1), round3(y1),
+                ),
+            }));
         }
     }
 
@@ -368,6 +413,23 @@ async fn handle_score_placement(
                 connector_violations.push((reference.to_string(), edge_distance));
             }
         }
+    } else if let Some(real) = &real_outline {
+        for c in &scan.items {
+            let Some(reference) = c.reference.as_deref() else {
+                continue;
+            };
+            if ref_prefix(reference) != "J" {
+                continue;
+            }
+            let edge_distance = real.edge_distance(bbox_center(c.bbox));
+            connector_edges.push(json!({
+                "reference": reference,
+                "edge_distance_mm": round3(edge_distance),
+            }));
+            if edge_distance > CONNECTOR_EDGE_LIMIT_MM {
+                connector_violations.push((reference.to_string(), edge_distance));
+            }
+        }
     }
 
     // ── Decoupling check (C* near a shared-net U*) ──────────────────────────
@@ -377,7 +439,12 @@ async fn handle_score_placement(
         interface_filter_caps,
         associations: decoupling_associations,
         unproven_caps: unproven_decoupling_caps,
-    } = decoupling_check(&scan.items, &index, &values);
+    } = decoupling_check(
+        &scan.items,
+        &index,
+        &values,
+        &crate::tools::fanout::copper_pads(&tree),
+    );
 
     // ── Soft score (ported weight table — see the module docs) ──────────────
     let overlap_deduction = (overlap_pairs as i64 * OVERLAP_POINTS).min(OVERLAP_CAP);
@@ -456,7 +523,7 @@ async fn handle_score_placement(
         "hard_fail"
     } else if matches!(outline_shape, OutlineShape::Missing) {
         "outline_missing"
-    } else if matches!(outline_shape, OutlineShape::Unproven { .. }) {
+    } else if matches!(outline_shape, OutlineShape::Unproven { .. }) && real_outline.is_none() {
         "outline_unproven"
     } else {
         "pass"
@@ -466,7 +533,14 @@ async fn handle_score_placement(
         "verdict": verdict,
         "score": score,
         "outline_missing": matches!(outline_shape, OutlineShape::Missing),
-        "outline_unproven": matches!(outline_shape, OutlineShape::Unproven { .. }),
+        "outline_unproven": matches!(outline_shape, OutlineShape::Unproven { .. }) && real_outline.is_none(),
+        "outline_checks": if outline.is_some() {
+            "rectangle"
+        } else if real_outline.is_some() {
+            "real_outline"
+        } else {
+            "none"
+        },
         "outline_shape": match outline_shape {
             OutlineShape::Rectangular { .. } => "rectangular",
             OutlineShape::Unproven { .. } => "unproven",
@@ -475,6 +549,7 @@ async fn handle_score_placement(
         "hard_failures": hard_failures,
         "deductions": deductions,
         "connector_edges": connector_edges,
+        "edge_overhangs": edge_overhangs,
         "uncoupled_caps": uncoupled_caps,
         "unproven_decoupling_caps": unproven_decoupling_caps
             .iter()
@@ -703,6 +778,67 @@ async fn handle_place_decoupling(
     // references in.
     caps.sort_by_key(|c| c.reference.clone());
 
+    // Pin-driven first: each cap that shares a non-ground net with the IC is
+    // assigned the nearest unclaimed IC pad on that net and placed beside it
+    // by the design-intent tie planner (courtyard- and real-outline-aware).
+    // A row along one courtyard edge can leave a cap far from the pin it
+    // serves, which the pin-level decoupling score now sees. Caps that share
+    // no supply net with the IC keep the row below.
+    let pads = crate::tools::fanout::copper_pads(&tree);
+    let cap_values = footprint_values(&tree);
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
+    let mut ties = Vec::new();
+    let mut tie_pins: HashMap<String, String> = HashMap::new();
+    let mut row_caps: Vec<&FootprintCourtyard> = Vec::new();
+    for cap in &caps {
+        let reference = cap.reference.clone().unwrap_or_default();
+        let mine: Vec<_> = pads
+            .iter()
+            .filter(|p| p.reference == reference && p.net.as_deref().is_some_and(|n| !is_ground_like_net(n)))
+            .collect();
+        // Nearest same-net IC pad, preferring one no other cap has taken;
+        // when every such pin is taken, caps share one (an IC with a single
+        // VDD pin and two caps).
+        let nearest = |allow_claimed: bool| {
+            pads.iter()
+                .filter(|p| p.reference == ic_reference && (allow_claimed || !claimed.contains(&p.number)))
+                .filter_map(|p| {
+                    let d = mine
+                        .iter()
+                        .filter(|m| m.net == p.net)
+                        .map(|m| crate::tools::fanout::polygon_distance(&m.corners, &p.corners))
+                        .min_by(f64::total_cmp)?;
+                    Some((p.number.clone(), d))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+        };
+        let pin = nearest(false).or_else(|| nearest(true));
+        match pin {
+            Some((number, _)) => {
+                claimed.insert(number.clone());
+                tie_pins.insert(reference.clone(), number.clone());
+                ties.push(crate::tools::design_intent::Tie {
+                    part: reference.clone(),
+                    to: ic_reference.clone(),
+                    pin: Some(number),
+                    max_mm: cap_values.get(&reference).and_then(|v| decoupling_limit_mm(v)).unwrap_or(2.5),
+                    why: Some("decoupling".into()),
+                });
+            }
+            None => row_caps.push(cap),
+        }
+    }
+    let (tie_plans, tie_notes) = if ties.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let intent = crate::tools::design_intent::DesignIntent { ties, ..Default::default() };
+        crate::tools::design_intent::plan_ties(&tree, &intent, spacing.min(0.2))
+    };
+    // Caps the pin planner left where they are, and why: already within
+    // their limit, or no clear site inside the outline.
+    let unplaced: Vec<serde_json::Value> = tie_notes;
+    let caps = row_caps;
+
     // The row: below the IC unless a side is given ("auto" picks bottom —
     // deterministic beats clever until a placer judge says otherwise).
     let resolved_side = if side == "auto" { "bottom" } else { side };
@@ -718,13 +854,34 @@ async fn handle_place_decoupling(
         OutlineShape::Rectangular { bbox } => Some(bbox),
         OutlineShape::Unproven { .. } | OutlineShape::Missing => None,
     };
+    let real_outline = matches!(outline_shape, OutlineShape::Unproven { .. })
+        .then(|| crate::tools::fanout::BoardOutline::read(&tree))
+        .filter(|o| o.has_edges());
     let mut applicability = PlanApplicability::new();
-    if matches!(outline_shape, OutlineShape::Unproven { .. }) {
-        applicability.block("the board outline is unproven; bounding-box containment cannot authorize capacitor placement; use small explicit moves and KiCad validation");
+    if matches!(outline_shape, OutlineShape::Unproven { .. }) && real_outline.is_none() {
+        applicability.block("the board outline is unreadable; containment cannot authorize capacitor placement; use small explicit moves and KiCad validation");
     }
 
     let mut placements = Vec::new();
     let mut planned_moves = Vec::new();
+    for plan in &tie_plans {
+        let from = scan.items.iter().find(|c| c.reference.as_deref() == Some(plan.reference.as_str())).map(|c| c.at).unwrap_or((plan.x, plan.y));
+        placements.push(konnect_ipc::types::IpcFootprintPlacement {
+            reference: plan.reference.clone(),
+            x: plan.x,
+            y: plan.y,
+            rotation: plan.rotation,
+        });
+        planned_moves.push(json!({
+            "reference": plan.reference,
+            "from": { "x": round3(from.0), "y": round3(from.1) },
+            "to": { "x": plan.x, "y": plan.y },
+            "rotation": plan.rotation,
+            "pin": tie_pins.get(&plan.reference),
+            "pin_distance_mm": plan.distance_mm,
+            "within_limit": plan.meets,
+        }));
+    }
     let mut cursor = -row_span / 2.0;
     for (cap, (w, h)) in caps.iter().zip(&widths) {
         let center_along = cursor + w / 2.0;
@@ -751,6 +908,15 @@ async fn handle_place_decoupling(
                 applicability.block(format!(
                     "{reference} plans to ({}, {}), outside the board outline \
                      ({ox0}, {oy0})..({ox1}, {oy1})",
+                    round3(tx),
+                    round3(ty),
+                ));
+            }
+        } else if let Some(real) = &real_outline {
+            let planned = (tx - w / 2.0, ty - h / 2.0, tx + w / 2.0, ty + h / 2.0);
+            if !real.contains_rect(planned) {
+                applicability.block(format!(
+                    "{reference} plans to ({}, {}), not wholly inside the board outline",
                     round3(tx),
                     round3(ty),
                 ));
@@ -803,6 +969,7 @@ async fn handle_place_decoupling(
             "plan_status": plan_status,
             "blocking_reasons": blocking_reasons,
             "planned_moves": planned_moves,
+            "unplaced": unplaced,
             "score_before": score_before["score"],
             "score_after_plan": score_after["score"],
             "verdict_after_plan": score_after["verdict"],
@@ -1858,6 +2025,7 @@ fn decoupling_check(
     items: &[FootprintCourtyard],
     index: &PcbConnectivityIndex,
     values: &HashMap<String, String>,
+    pads: &[crate::tools::fanout::CopperPad],
 ) -> DecouplingCheck {
     // Net set per reference, from the connectivity index — keyed by name, so
     // both file formats resolve identically.
@@ -1920,6 +2088,8 @@ fn decoupling_check(
             &nets_by_ref,
             &references_by_net,
             center,
+            reference,
+            pads,
         ) {
             None => {
                 uncoupled.push(reference.to_string());
@@ -2059,21 +2229,49 @@ fn is_ground_like_net(net: &str) -> bool {
 /// Find the nearest IC with evidence stronger than a board-wide rail: at
 /// least one shared, non-ground net whose distinct-reference fanout remains
 /// small enough to identify a local functional relationship.
+/// The IC a decoupling capacitor serves: the one whose pad on a shared
+/// non-ground net is nearest the capacitor's own pad on that net, measured
+/// pad edge to pad edge. Measuring to the supply pin (not the IC's courtyard)
+/// is what makes this meaningful on a shared rail, so a rail feeding many
+/// parts no longer leaves its capacitors unassociated; without pad geometry
+/// the old courtyard distance and fanout limit still apply.
+#[allow(clippy::too_many_arguments)]
 fn nearest_decoupling_association<'n>(
     candidates: &[(&str, Bbox)],
     cap_nets: Option<&BTreeSet<&'n str>>,
     nets_by_ref: &HashMap<&str, BTreeSet<&'n str>>,
     references_by_net: &HashMap<&'n str, BTreeSet<&str>>,
     center: (f64, f64),
+    cap: &str,
+    pads: &[crate::tools::fanout::CopperPad],
 ) -> Option<DecouplingMatch> {
     let cap_nets = cap_nets?;
+    let pin_distance = |ic: &str, net: &str| -> Option<f64> {
+        let mine: Vec<_> = pads.iter().filter(|p| p.reference == cap && p.net.as_deref() == Some(net)).collect();
+        let theirs: Vec<_> = pads.iter().filter(|p| p.reference == ic && p.net.as_deref() == Some(net)).collect();
+        mine.iter()
+            .flat_map(|a| theirs.iter().map(move |b| crate::tools::fanout::polygon_distance(&a.corners, &b.corners)))
+            .min_by(f64::total_cmp)
+    };
     candidates
         .iter()
         .filter_map(|(reference, bbox)| {
             let ic_nets = nets_by_ref.get(*reference)?;
-            let (qualifying_net, net_reference_count) = cap_nets
-                .intersection(ic_nets)
-                .filter(|net| !is_ground_like_net(net))
+            let shared = cap_nets.intersection(ic_nets).filter(|net| !is_ground_like_net(net));
+            // Pin-level: the nearest same-net pad pair, on any shared rail.
+            let pin_level = shared
+                .clone()
+                .filter_map(|net| Some((*net, pin_distance(reference, net)?, references_by_net.get(net)?.len())))
+                .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+            if let Some((net, distance_mm, fanout)) = pin_level {
+                return Some(DecouplingMatch {
+                    ic: (*reference).to_string(),
+                    qualifying_net: net.to_string(),
+                    net_reference_count: fanout,
+                    distance_mm,
+                });
+            }
+            let (qualifying_net, net_reference_count) = shared
                 .filter_map(|net| {
                     let fanout = references_by_net.get(net)?.len();
                     (fanout <= MAX_DECOUPLING_NET_REFERENCES).then_some((*net, fanout))
@@ -2354,34 +2552,32 @@ mod tests {
     ///
     /// Score: 100 − 30 (decoupling) = 70, verdict "pass".
     #[tokio::test]
-    async fn kicad_fixture_passes_at_70_with_only_the_decoupling_deduction() {
+    async fn kicad_fixture_passes_at_85_with_only_c1_far_from_the_vcc_pin() {
         let response = score(std::path::Path::new(FIXTURE)).await;
 
         assert_eq!(response["verdict"], "pass", "{response}");
-        assert_eq!(response["score"], 70);
+        assert_eq!(response["score"], 85);
         assert_eq!(response["outline_missing"], false);
         assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
         assert_eq!(response["footprints_scored"], 8);
         assert_eq!(response["footprints_skipped"], 0);
         assert_eq!(response["uncoupled_caps"].as_array().unwrap().len(), 0);
 
-        // Exactly one deduction: decoupling, 30 points, naming both caps.
+        // Exactly one deduction: decoupling, 15 points, C1 alone. Decoupling
+        // is measured pad edge to pad edge, from the cap's VCC pad to U1's VCC
+        // pin (pin 8, top right: x 26.5..28.45, y 17.795..18.395). C2's VCC
+        // pad at (29.69..30.31, 15.2..15.76) is dx 1.24, dy 2.035 → 2.383 mm,
+        // inside 2.5 mm. C1 sits beside pins 1–4 (none of them VCC): its VCC
+        // pad (19.24..19.8, 14.69..15.31) is dx 6.7, dy 2.485 → 7.146 mm.
+        // (The courtyard-edge metric read 2.642 mm for both, which said
+        // nothing about which pin either cap serves.)
         let deductions = response["deductions"].as_array().unwrap();
         assert_eq!(deductions.len(), 1, "{response}");
         assert_eq!(deductions[0]["kind"], "decoupling");
-        assert_eq!(deductions[0]["points"], 30);
-        let refs = deductions[0]["references"].as_array().unwrap();
-        assert!(refs.contains(&json!("C1")) && refs.contains(&json!("C2")));
+        assert_eq!(deductions[0]["points"], 15);
+        assert_eq!(deductions[0]["references"], json!(["C1"]));
         let detail = deductions[0]["detail"].as_str().unwrap();
-        // Hand arithmetic under the courtyard-EDGE metric: C1 center (20, 15)
-        // to U1 bbox (21.3, 17.3)..(28.7, 22.7) → dx 1.3, dy 2.3 →
-        // √(1.69 + 5.29) ≈ 2.642 mm, just over the 2.5 mm rule. C2 mirrors it.
-        // (Center-to-center read 7.071 mm — physically meaningless against a
-        // large IC, which is why the metric changed.)
-        assert!(
-            detail.contains("2.642"),
-            "hand-computed edge distance: {detail}"
-        );
+        assert!(detail.contains("7.146"), "hand-computed pin distance: {detail}");
         assert!(detail.contains("U1"), "must name the IC: {detail}");
 
         let associations = response["decoupling_associations"].as_array().unwrap();
@@ -2390,7 +2586,8 @@ mod tests {
             assert_eq!(association["ic"], "U1", "{association}");
             assert_eq!(association["qualifying_net"], "VCC", "{association}");
             assert_eq!(association["net_reference_count"], 4, "{association}");
-            assert_eq!(association["status"], "too_far", "{association}");
+            let expected = if association["reference"] == "C1" { "too_far" } else { "within_limit" };
+            assert_eq!(association["status"], expected, "{association}");
         }
         assert_eq!(
             response["unproven_decoupling_caps"]
@@ -2456,11 +2653,12 @@ mod tests {
             serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
 
         assert_eq!(response["isError"], json!(false), "{body}");
-        assert_eq!(body["score"], 85, "only C2 may deduct: {body}");
-        assert_eq!(body["deductions"][0]["references"], json!(["C2"]));
+        assert_eq!(body["score"], 100, "C2 is within limit and C1 is not scored: {body}");
+        assert_eq!(body["deductions"], json!([]), "{body}");
         assert_eq!(body["uncoupled_caps"], json!(["C1"]), "{body}");
         assert_eq!(body["decoupling_associations"].as_array().unwrap().len(), 1);
         assert_eq!(body["decoupling_associations"][0]["reference"], "C2");
+        assert_eq!(body["decoupling_associations"][0]["status"], "within_limit");
         let unproven = body["unproven_decoupling_caps"].as_array().unwrap();
         assert_eq!(unproven.len(), 1, "{body}");
         assert_eq!(unproven[0]["reference"], "C1");
@@ -2519,7 +2717,7 @@ mod tests {
 
         assert_eq!(response["source"], "ipc");
         assert_eq!(response["footprints_scored"], 8, "{response}");
-        assert_eq!(response["score"], 70, "{response}");
+        assert_eq!(response["score"], 85, "{response}");
     }
 
     /// #690: the binding step already resolved the board, so serializing it
@@ -2590,7 +2788,7 @@ mod tests {
         };
         let response: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(response["source"], "ipc", "{response}");
-        assert_eq!(response["score"], 70, "{response}");
+        assert_eq!(response["score"], 85, "{response}");
 
         assert_eq!(
             lookups.load(Ordering::Relaxed),
@@ -2788,7 +2986,8 @@ mod tests {
     /// the four Edge.Cuts lines removes the outline. The outside and
     /// connector-edge checks are blocked (not passed), the response says so,
     /// and the verdict can never be "pass" — only the decoupling deduction
-    /// still fires, so the score is 70 while the verdict is not.
+    /// (C1, far from the VCC pin) still fires, so the score is 85 while the
+    /// verdict is not.
     #[tokio::test]
     async fn a_board_without_an_outline_never_passes() {
         let fixture = std::fs::read_to_string(FIXTURE).unwrap();
@@ -2802,7 +3001,7 @@ mod tests {
         assert_eq!(response["verdict"], "outline_missing", "{response}");
         assert_ne!(response["verdict"], "pass");
         assert_eq!(response["outline_missing"], true);
-        assert_eq!(response["score"], 70);
+        assert_eq!(response["score"], 85);
         // Edge distances cannot be computed without an outline.
         assert_eq!(response["connector_edges"].as_array().unwrap().len(), 0);
         assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
@@ -2824,14 +3023,17 @@ mod tests {
     );
 
     #[tokio::test]
-    async fn gr_poly_outline_is_recognized_but_unproven_through_the_public_scoring_path() {
+    async fn gr_poly_outline_is_checked_against_its_real_geometry_through_the_public_scoring_path() {
         let response = score(std::path::Path::new(GR_POLY_FIXTURE)).await;
 
+        // Not a proven rectangle, so the bbox proves nothing — but the real
+        // Edge.Cuts polygon is readable, so containment and edge distance are
+        // checked against it and the verdict can pass.
         assert_eq!(response["outline_missing"], false, "{response}");
-        assert_eq!(response["outline_unproven"], true, "{response}");
         assert_eq!(response["outline_shape"], "unproven", "{response}");
-        assert_eq!(response["verdict"], "outline_unproven", "{response}");
-        assert_ne!(response["verdict"], "pass");
+        assert_eq!(response["outline_checks"], "real_outline", "{response}");
+        assert_eq!(response["outline_unproven"], false, "{response}");
+        assert_eq!(response["verdict"], "pass", "{response}");
         assert_eq!(response["score"], 100);
         assert_eq!(response["footprints_scored"], 0);
         assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
@@ -2851,7 +3053,7 @@ mod tests {
     /// `outline_unproven` verdict, over the same real-KiCad concave `gr_poly`
     /// fixture used above.
     #[tokio::test]
-    async fn served_score_placement_reports_outline_unproven_for_a_non_rectangular_board() {
+    async fn served_score_placement_checks_a_non_rectangular_board_against_its_real_outline() {
         let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
             kicad_cli: String::new(),
             kicad_binary: String::new(),
@@ -2883,10 +3085,10 @@ mod tests {
 
         assert_eq!(response["isError"], json!(false), "{body}");
         assert_eq!(body["outline_missing"], false, "{body}");
-        assert_eq!(body["outline_unproven"], true, "{body}");
         assert_eq!(body["outline_shape"], "unproven", "{body}");
-        assert_eq!(body["verdict"], "outline_unproven", "{body}");
-        assert_ne!(body["verdict"], "pass");
+        assert_eq!(body["outline_checks"], "real_outline", "{body}");
+        assert_eq!(body["outline_unproven"], false, "{body}");
+        assert_eq!(body["verdict"], "pass", "{body}");
     }
 
     /// Move ONE footprint's root anchor by string surgery on the
@@ -3077,18 +3279,11 @@ mod tests {
         let response = score(&board).await;
         assert_eq!(response["verdict"], "pass", "{response}");
         assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
-        assert_eq!(response["score"], 85, "only C2 still deducts: {response}");
-
-        // The surviving deduction names C2 alone — C1 is gone from it.
-        let deductions = response["deductions"].as_array().unwrap();
-        assert_eq!(deductions.len(), 1, "{response}");
-        assert_eq!(deductions[0]["kind"], "decoupling");
-        assert_eq!(deductions[0]["points"], 15);
-        assert_eq!(deductions[0]["references"], json!(["C2"]));
-        assert!(
-            !deductions[0]["detail"].as_str().unwrap().contains("C1"),
-            "{response}"
-        );
+        // C1 is waived (on J1's pins) and C2 is within limit of the VCC pin,
+        // so nothing deducts; C1's 10.778 mm to the VCC pin is the deduction
+        // the waiver suppresses.
+        assert_eq!(response["score"], 100, "{response}");
+        assert_eq!(response["deductions"], json!([]), "{response}");
 
         // The waiver is reported, not silent: a check that ran and was
         // exempted must be distinguishable from a check that never fired.
@@ -3119,21 +3314,15 @@ mod tests {
         );
 
         let response = score(&board).await;
-        assert_eq!(response["score"], 70, "{response}");
+        // C2 is within limit of the VCC pin; C1 deducts alone, 8.796 mm from it.
+        assert_eq!(response["score"], 85, "{response}");
         let deductions = response["deductions"].as_array().unwrap();
         assert_eq!(deductions.len(), 1, "{response}");
         assert_eq!(deductions[0]["kind"], "decoupling");
-        assert_eq!(deductions[0]["points"], 30);
-        let refs = deductions[0]["references"].as_array().unwrap();
-        assert!(
-            refs.contains(&json!("C1")) && refs.contains(&json!("C2")),
-            "{response}"
-        );
+        assert_eq!(deductions[0]["points"], 15);
+        assert_eq!(deductions[0]["references"], json!(["C1"]), "{response}");
         let detail = deductions[0]["detail"].as_str().unwrap();
-        assert!(
-            detail.contains("3.3"),
-            "hand-computed C1 distance: {detail}"
-        );
+        assert!(detail.contains("8.796"), "C1 pad to the VCC pin: {detail}");
         assert_eq!(
             response["interface_filter_caps"].as_array().unwrap().len(),
             0
@@ -3158,17 +3347,18 @@ mod tests {
         let board = write_variant(&dir, "cap_beside_foreign_connector.kicad_pcb", retagged);
 
         let response = score(&board).await;
-        assert_eq!(response["score"], 70, "{response}");
+        // C2 is within limit of the VCC pin, so C1 deducts alone.
+        assert_eq!(response["score"], 85, "{response}");
         let deductions = response["deductions"].as_array().unwrap();
         assert_eq!(deductions.len(), 1, "{response}");
-        assert_eq!(deductions[0]["points"], 30);
+        assert_eq!(deductions[0]["points"], 15);
         let refs = deductions[0]["references"].as_array().unwrap();
         assert!(
-            refs.contains(&json!("C1")) && refs.contains(&json!("C2")),
+            refs == &vec![json!("C1")],
             "{response}"
         );
         assert!(
-            deductions[0]["detail"].as_str().unwrap().contains("5.3"),
+            deductions[0]["detail"].as_str().unwrap().contains("10.778"),
             "{response}"
         );
         assert_eq!(
@@ -3192,10 +3382,8 @@ mod tests {
         let board = write_variant(&dir, "cap_under_tht_connector.kicad_pcb", flipped);
 
         let response = score(&board).await;
-        assert_eq!(response["score"], 85, "{response}");
-        let deductions = response["deductions"].as_array().unwrap();
-        assert_eq!(deductions.len(), 1, "{response}");
-        assert_eq!(deductions[0]["references"], json!(["C2"]));
+        assert_eq!(response["score"], 100, "{response}");
+        assert_eq!(response["deductions"], json!([]), "{response}");
 
         let filters = response["interface_filter_caps"].as_array().unwrap();
         assert_eq!(filters.len(), 1, "{response}");
@@ -3218,17 +3406,18 @@ mod tests {
         let board = write_variant(&dir, "cap_under_smd_connector.kicad_pcb", smd_header);
 
         let response = score(&board).await;
-        assert_eq!(response["score"], 70, "{response}");
+        // C2 is within limit of the VCC pin, so C1 deducts alone.
+        assert_eq!(response["score"], 85, "{response}");
         let deductions = response["deductions"].as_array().unwrap();
         assert_eq!(deductions.len(), 1, "{response}");
-        assert_eq!(deductions[0]["points"], 30);
+        assert_eq!(deductions[0]["points"], 15);
         let refs = deductions[0]["references"].as_array().unwrap();
         assert!(
-            refs.contains(&json!("C1")) && refs.contains(&json!("C2")),
+            refs == &vec![json!("C1")],
             "{response}"
         );
         assert!(
-            deductions[0]["detail"].as_str().unwrap().contains("5.3"),
+            deductions[0]["detail"].as_str().unwrap().contains("10.778"),
             "{response}"
         );
         assert_eq!(
@@ -3252,17 +3441,18 @@ mod tests {
         let board = write_variant(&dir, "cap_sharing_only_ground.kicad_pcb", ground_only);
 
         let response = score(&board).await;
-        assert_eq!(response["score"], 70, "{response}");
+        // C2 is within limit of the VCC pin, so C1 deducts alone.
+        assert_eq!(response["score"], 85, "{response}");
         let deductions = response["deductions"].as_array().unwrap();
         assert_eq!(deductions.len(), 1, "{response}");
-        assert_eq!(deductions[0]["points"], 30);
+        assert_eq!(deductions[0]["points"], 15);
         let refs = deductions[0]["references"].as_array().unwrap();
         assert!(
-            refs.contains(&json!("C1")) && refs.contains(&json!("C2")),
+            refs == &vec![json!("C1")],
             "{response}"
         );
         assert!(
-            deductions[0]["detail"].as_str().unwrap().contains("5.3"),
+            deductions[0]["detail"].as_str().unwrap().contains("10.778"),
             "{response}"
         );
         assert_eq!(
@@ -3293,8 +3483,8 @@ mod tests {
             response["interface_filter_caps"].as_array().unwrap().len(),
             0
         );
-        assert_eq!(response["score"], 85, "{response}");
-        assert_eq!(response["deductions"][0]["references"], json!(["C2"]));
+        assert_eq!(response["score"], 100, "{response}");
+        assert_eq!(response["deductions"], json!([]), "{response}");
     }
 
     /// `interface_filter_caps` means "a deduction was waived", not "a cap is
@@ -3312,32 +3502,28 @@ mod tests {
     /// → 85.
     #[tokio::test]
     async fn a_cap_within_both_limits_is_neither_a_violation_nor_a_reported_waiver() {
-        let dir = tempfile::tempdir().unwrap();
-        let moved_ic = fixture_with_moved_root("(at 25 20)", "(at 19 20)");
-        assert_eq!(moved_ic.matches("(at 20 15)").count(), 1);
-        let board = write_variant(
-            &dir,
-            "cap_within_both_limits.kicad_pcb",
-            moved_ic.replace("(at 20 15)", "(at 14 16)"),
-        );
-
-        let response = score(&board).await;
+        // The stock fixture's C2 is 2.383 mm from U1's VCC pin (inside 2.5 mm)
+        // and nowhere near J1: it broke no rule, so it is neither deducted nor
+        // reported as waived, only listed as a within-limit association.
+        let response = score(std::path::Path::new(FIXTURE)).await;
         assert_eq!(response["verdict"], "pass", "{response}");
-        assert_eq!(response["score"], 85, "{response}");
-        assert_eq!(response["deductions"][0]["references"], json!(["C2"]));
         assert!(
-            response["deductions"][0]["detail"]
-                .as_str()
-                .unwrap()
-                .contains("7.654"),
+            !response["deductions"][0]["references"].as_array().unwrap().contains(&json!("C2")),
             "{response}"
         );
-        // C1 broke no rule, so nothing was waived on its behalf.
-        assert_eq!(
-            response["interface_filter_caps"].as_array().unwrap().len(),
-            0,
+        assert!(
+            !response["interface_filter_caps"].as_array().unwrap().iter().any(|f| f["reference"] == "C2"),
             "{response}"
         );
+        let c2 = response["decoupling_associations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["reference"] == "C2")
+            .cloned()
+            .unwrap();
+        assert_eq!(c2["status"], "within_limit", "{c2}");
+        assert_eq!(c2["distance_mm"], 2.383, "{c2}");
         assert_eq!(response["uncoupled_caps"].as_array().unwrap().len(), 0);
     }
 
@@ -3378,8 +3564,8 @@ mod tests {
         assert_eq!(response["verdict"], "pass", "{response}");
         assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
         assert_eq!(
-            response["score"], 85,
-            "C1 is 3.609 mm from J1, inside its own 5.0 mm limit: {response}"
+            response["score"], 100,
+            "C1 is 3.609 mm from J1, inside its own 5.0 mm limit; C2 is within limit: {response}"
         );
 
         let filters = response["interface_filter_caps"].as_array().unwrap();
@@ -3392,9 +3578,8 @@ mod tests {
         assert_eq!(filters[0]["connector_distance_mm"], 3.609);
         assert_eq!(filters[0]["limit_mm"], 5.0);
 
-        // C2 is untouched 100nF and still deducts — the families do not bleed.
-        assert_eq!(response["deductions"][0]["references"], json!(["C2"]));
-        assert_eq!(response["deductions"][0]["points"], 15);
+        // C2 is untouched 100nF, judged against its own 2.5 mm: within limit.
+        assert_eq!(response["deductions"], json!([]), "{response}");
         assert_eq!(response["uncoupled_caps"].as_array().unwrap().len(), 0);
     }
 
@@ -3427,6 +3612,18 @@ mod tests {
         text
     }
 
+    /// The stock fixture with C1 dropped onto R1 at (15.5, 25): a same-side
+    /// courtyard overlap (a hard failure). The spring embedder's repulsion
+    /// pushes C1 clear, which genuinely improves the score. (It pulls a part
+    /// toward its nets' centroid and knows nothing of pins, so on this board
+    /// it can no longer improve a decoupling distance measured to the VCC pin.)
+    fn c1_on_r1(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let content = fixture_with_moved_root("(at 20 15)", "(at 15.5 25)");
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
     fn fixture_copy(dir: &tempfile::TempDir) -> std::path::PathBuf {
         let path = dir.path().join("board.kicad_pcb");
         std::fs::copy(FIXTURE, &path).unwrap();
@@ -3434,7 +3631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn served_decoupling_blocks_unproven_containment_without_writing() {
+    async fn served_decoupling_on_a_board_whose_parts_are_off_its_concave_outline_is_blocked_without_writing() {
         // Combine footprints and the concave outline from two KiCad-written
         // fixtures. Retag the original rectangular edges so only the real
         // concave polygon defines the outline.
@@ -3476,15 +3673,23 @@ mod tests {
             let body: serde_json::Value =
                 serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
             if dry_run {
+                // The fixture's parts lie outside the concave polygon (a
+                // hard failure before and after), and the pin planner finds
+                // no site for C1 inside it, so nothing improves and the plan
+                // is blocked; the unplaced cap is reported, not dropped.
                 assert_eq!(response["isError"], false, "{body}");
-                assert_eq!(body["verdict_after_plan"], "outline_unproven", "{body}");
+                assert_eq!(body["verdict_after_plan"], "hard_fail", "{body}");
                 assert_eq!(body["plan_status"], "blocked", "{body}");
                 assert!(
                     body["blocking_reasons"]
                         .as_array()
                         .unwrap()
                         .iter()
-                        .any(|reason| reason.as_str().unwrap().contains("outline is unproven")),
+                        .any(|reason| reason.as_str().unwrap().contains("does not improve")),
+                    "{body}"
+                );
+                assert!(
+                    body["unplaced"].as_array().unwrap().iter().any(|n| n["tie"].as_str().unwrap().starts_with("C1")),
                     "{body}"
                 );
             } else {
@@ -3539,18 +3744,19 @@ mod tests {
             0,
             "{response}"
         );
+        // Pin-driven: C1 moves beside U1's VCC pin 8; C2 is already within
+        // 2.5 mm of that pin and stays put (reported, not moved).
         let moves = response["planned_moves"].as_array().unwrap();
-        assert_eq!(moves.len(), 2, "C1 and C2: {response}");
-        for mv in moves {
-            let y = mv["to"]["y"].as_f64().unwrap();
-            assert!(
-                (23.0..25.0).contains(&y),
-                "cap lands just below U1's courtyard (y_max 22.7): {mv}"
-            );
-            let x = mv["to"]["x"].as_f64().unwrap();
-            assert!((23.0..27.0).contains(&x), "row centered on U1 x=25: {mv}");
-        }
-        assert_eq!(response["score_before"], 70);
+        assert_eq!(moves.len(), 1, "{response}");
+        assert_eq!(moves[0]["reference"], "C1");
+        assert_eq!(moves[0]["pin"], "8");
+        assert_eq!(moves[0]["within_limit"], true, "{response}");
+        assert!(moves[0]["pin_distance_mm"].as_f64().unwrap() <= 2.5, "{response}");
+        assert!(
+            response["unplaced"].as_array().unwrap().iter().any(|n| n["status"] == "already_met"),
+            "{response}"
+        );
+        assert_eq!(response["score_before"], 85);
         assert_eq!(response["score_after_plan"], 100, "{response}");
         assert_eq!(response["verdict_after_plan"], "pass");
     }
@@ -3796,11 +4002,15 @@ mod tests {
     #[tokio::test]
     async fn decoupling_blocks_a_plan_landing_outside_the_board_outline() {
         let dir = tempfile::tempdir().unwrap();
-        let board = write_variant(
-            &dir,
-            "u1_near_bottom_edge.kicad_pcb",
-            fixture_with_moved_root("(at 25 20)", "(at 25 42)"),
+        // Both caps' VCC pads retagged to /SIG_IN: they share no supply net
+        // with U1, so they take the row fallback, which lands below the board.
+        let moved = fixture_with_moved_root("(at 25 20)", "(at 25 42)");
+        let off_rail = rewrite_footprint_nets(
+            &rewrite_footprint_nets(&moved, "C1", &[("VCC", "/SIG_IN")]),
+            "C2",
+            &[("VCC", "/SIG_IN")],
         );
+        let board = write_variant(&dir, "u1_near_bottom_edge.kicad_pcb", off_rail);
         let result = handle_place_decoupling(
             &json!({
                 "board": board.to_string_lossy(),
@@ -3828,11 +4038,15 @@ mod tests {
     #[tokio::test]
     async fn served_decoupling_block_is_structured_and_does_not_write() {
         let dir = tempfile::tempdir().unwrap();
-        let board = write_variant(
-            &dir,
-            "u1_near_bottom_edge.kicad_pcb",
-            fixture_with_moved_root("(at 25 20)", "(at 25 42)"),
+        // Both caps' VCC pads retagged to /SIG_IN: they share no supply net
+        // with U1, so they take the row fallback, which lands below the board.
+        let moved = fixture_with_moved_root("(at 25 20)", "(at 25 42)");
+        let off_rail = rewrite_footprint_nets(
+            &rewrite_footprint_nets(&moved, "C1", &[("VCC", "/SIG_IN")]),
+            "C2",
+            &[("VCC", "/SIG_IN")],
         );
+        let board = write_variant(&dir, "u1_near_bottom_edge.kicad_pcb", off_rail);
         let before = std::fs::read(&board).unwrap();
         let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
             kicad_cli: String::new(),
@@ -4303,7 +4517,7 @@ mod tests {
     #[tokio::test]
     async fn force_directed_apply_proceeds_when_a_different_board_is_open() {
         let dir = tempfile::tempdir().unwrap();
-        let board = fixture_copy(&dir);
+        let board = c1_on_r1(&dir);
         let other = dir.path().join("other.kicad_pcb");
         std::fs::write(&other, "").unwrap();
         let before = std::fs::read(&board).unwrap();
@@ -4630,7 +4844,7 @@ mod tests {
     #[tokio::test]
     async fn force_directed_applicable_plan_still_applies() {
         let dir = tempfile::tempdir().unwrap();
-        let board = fixture_copy(&dir);
+        let board = c1_on_r1(&dir);
         let dry_args = json!({
             "board": board.to_string_lossy(),
             "references": ["C1"],
@@ -4669,5 +4883,58 @@ mod tests {
         .await
         .unwrap();
         assert!(result.is_error);
+    }
+}
+
+#[cfg(test)]
+mod real_outline_tests {
+    use super::*;
+
+    async fn score_text(content: &str) -> serde_json::Value {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, content).unwrap();
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(String::new());
+        let result = handle_score_placement(&json!({ "board": path.to_string_lossy() }), &ctx).await.unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else { panic!("text") };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn part(reference: &str, x: f64, y: f64, half: (f64, f64)) -> String {
+        format!(
+            "(footprint \"P\" (layer \"F.Cu\") (at {x} {y}) (property \"Reference\" \"{reference}\")
+               (fp_rect (start {} {}) (end {} {}) (layer \"F.CrtYd\")))",
+            -half.0, -half.1, half.0, half.1
+        )
+    }
+
+    /// L-shaped board: the notch's inner corner sits inside the part's
+    /// courtyard while all four of its corners are on the board. A
+    /// corners-only test passes it; the real-outline check must not.
+    #[tokio::test]
+    async fn a_part_cut_by_a_notch_is_outside_the_real_outline() {
+        let outline = "(gr_line (start 0 0) (end 20 0) (layer \"Edge.Cuts\")) (gr_line (start 20 0) (end 20 10) (layer \"Edge.Cuts\")) (gr_line (start 20 10) (end 30 10) (layer \"Edge.Cuts\")) (gr_line (start 30 10) (end 30 30) (layer \"Edge.Cuts\")) (gr_line (start 30 30) (end 0 30) (layer \"Edge.Cuts\")) (gr_line (start 0 30) (end 0 0) (layer \"Edge.Cuts\"))";
+        // A 6 × 1 mm bar from (17, 10.5) to (23, 11.5) lies just below the
+        // notch: wholly on the board.
+        let inside = score_text(&format!("(kicad_pcb {outline} {})", part("R1", 20.0, 11.0, (3.0, 0.5)))).await;
+        assert_eq!(inside["outline_checks"], "real_outline", "{inside}");
+        assert_eq!(inside["hard_failures"].as_array().unwrap().len(), 0, "{inside}");
+        let cut = score_text(&format!("(kicad_pcb {outline} {})", part("R2", 19.0, 11.0, (2.0, 2.0)))).await;
+        // Corners (17,9) (21,9) (21,13) (17,13): (21,9) is in the notch.
+        assert_eq!(cut["verdict"], "hard_fail", "{cut}");
+        assert_eq!(cut["hard_failures"][0]["kind"], "outside_outline", "{cut}");
+    }
+
+    #[tokio::test]
+    async fn an_edge_mount_connector_overhanging_the_edge_is_a_note_not_a_failure() {
+        let outline = "(gr_rect (start 0 0) (end 30 20) (layer \"Edge.Cuts\"))";
+        // J1's courtyard runs 1 mm past the bottom edge; its centre is on the board.
+        let board = format!("(kicad_pcb {outline} {})", part("J1", 15.0, 18.0, (4.0, 3.0)));
+        let body = score_text(&board).await;
+        assert_eq!(body["hard_failures"].as_array().unwrap().len(), 0, "{body}");
+        assert_eq!(body["edge_overhangs"], json!([{"reference": "J1"}]), "{body}");
+        // The same overhang on a non-connector is still a hard failure.
+        let body = score_text(&format!("(kicad_pcb {outline} {})", part("U1", 15.0, 18.0, (4.0, 3.0)))).await;
+        assert_eq!(body["verdict"], "hard_fail", "{body}");
     }
 }
