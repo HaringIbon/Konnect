@@ -397,10 +397,32 @@ fn dru_rules(intent: &DesignIntent, reqs: &[NetRequirement]) -> BTreeMap<String,
 /// Rewrite a `.kicad_dru` so its `intent: …` rules are exactly `rules`,
 /// leaving every other rule and comment as it was.
 fn merge_dru(existing: Option<&str>, rules: &BTreeMap<String, String>) -> String {
+    merge_managed_rules(existing, rules, RULE_PREFIX)
+}
+
+/// Fab limits are floors: KiCad lets a later rule override an earlier one
+/// for the same constraint, so they go first in the file, where any user or
+/// intent rule (an 0.8 mm power width, say) takes precedence over them.
+fn merge_fab_rules(existing: Option<&str>, rules: &BTreeMap<String, String>) -> String {
+    let none = BTreeMap::new();
+    let content = merge_managed_rules(existing, &none, FAB_PREFIX);
+    let block: String = rules.values().map(|rule| format!("{rule}\n")).collect();
+    let insert_at = match content.find("(version") {
+        Some(at) => content[at..].find('\n').map_or(content.len(), |end| at + end + 1),
+        None => 0,
+    };
+    let mut out = content;
+    out.insert_str(insert_at, &block);
+    out
+}
+
+/// Rewrite a `.kicad_dru` so the rules whose names start with `prefix` are
+/// exactly `rules`, leaving every other rule and comment as it was.
+fn merge_managed_rules(existing: Option<&str>, rules: &BTreeMap<String, String>, prefix: &str) -> String {
     let mut content = existing.map(str::to_string).unwrap_or_else(|| "(version 1)\n".to_string());
-    // Remove stale intent rules.
+    // Remove stale managed rules.
     loop {
-        let names = intent_rule_names(&content);
+        let names = managed_rule_names(&content, prefix);
         let Some(stale) = names.into_iter().find(|name| !rules.contains_key(name)) else { break };
         let Some((start, end)) = crate::tools::verification::named_rule_range(&content, &stale) else { break };
         let end = if content[end..].starts_with('\n') { end + 1 } else { end };
@@ -415,8 +437,8 @@ fn merge_dru(existing: Option<&str>, rules: &BTreeMap<String, String>) -> String
     content
 }
 
-fn intent_rule_names(content: &str) -> Vec<String> {
-    let needle = format!("(rule \"{RULE_PREFIX}");
+fn managed_rule_names(content: &str, prefix: &str) -> Vec<String> {
+    let needle = format!("(rule \"{prefix}");
     let mut names = Vec::new();
     let mut rest = content;
     while let Some(at) = rest.find(&needle) {
@@ -760,6 +782,87 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
     checks
 }
 
+// ─── Fab rules ──────────────────────────────────────────────────────────────
+
+const FAB_PREFIX: &str = "fab: ";
+
+/// JLCPCB standard-process limits as KiCad DRC rules. Values from the
+/// community rule set annotated against jlcpcb.com/capabilities (document
+/// database: `labtroll-jlcpcb-kicad-dru`; JLCPCB's page itself was not
+/// reachable to cross-check). Outer layers use the 1–2-layer 0.127 mm
+/// track/space; inner layers JLCPCB's multilayer 0.09 mm.
+fn jlcpcb_rules() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("track width, outer", "(layer outer)\n  (condition \"A.Type == 'track'\")\n  (constraint track_width (min 0.127mm))"),
+        ("track spacing, outer", "(layer outer)\n  (condition \"A.Type == 'track' && B.Type == A.Type\")\n  (constraint clearance (min 0.127mm))"),
+        ("track width, inner", "(layer inner)\n  (condition \"A.Type == 'track'\")\n  (constraint track_width (min 0.09mm))"),
+        ("track spacing, inner", "(layer inner)\n  (condition \"A.Type == 'track' && B.Type == A.Type\")\n  (constraint clearance (min 0.09mm))"),
+        ("silkscreen text", "(layer \"?.Silkscreen\")\n  (condition \"A.Type == 'Text' || A.Type == 'Text Box'\")\n  (constraint text_thickness (min 0.15mm))\n  (constraint text_height (min 1mm))"),
+        ("pad to silkscreen", "(layer outer)\n  (condition \"A.Type == 'pad' && B.Layer == '?.Silkscreen'\")\n  (constraint silk_clearance (min 0.15mm))"),
+        ("routed edge to track", "(condition \"A.Type == 'track'\")\n  (constraint edge_clearance (min 0.3mm))"),
+        ("hole diameter", "(constraint hole_size (min 0.2mm) (max 6.3mm))"),
+        ("NPTH diameter", "(layer outer)\n  (condition \"!A.isPlated()\")\n  (constraint hole_size (min 0.5mm))"),
+        ("annular ring, via and PTH", "(layer outer)\n  (condition \"A.isPlated()\")\n  (constraint annular_width (min 0.075mm))"),
+        ("hole to hole, different nets", "(layer outer)\n  (condition \"A.Net != B.Net\")\n  (constraint hole_to_hole (min 0.5mm))"),
+        ("hole to hole, same net", "(layer outer)\n  (condition \"A.Net == B.Net\")\n  (constraint hole_to_hole (min 0.254mm))"),
+        ("track to NPTH", "(condition \"!A.isPlated() && B.Type == 'track' && A.Net != B.Net\")\n  (constraint hole_clearance (min 0.254mm))"),
+        ("track to PTH hole", "(condition \"A.isPlated() && B.Type == 'track' && A.Net != B.Net\")\n  (constraint hole_clearance (min 0.33mm))"),
+        ("track to pad", "(condition \"A.Type == 'pad' && B.Type == 'track' && A.Net != B.Net\")\n  (constraint clearance (min 0.2mm))"),
+        ("pad/via to pad/via", "(layer outer)\n  (condition \"A.isPlated() && B.isPlated() && A.Net != B.Net\")\n  (constraint clearance (min 0.127mm))"),
+    ]
+}
+
+fn fab_rules(fab: &str) -> Option<BTreeMap<String, String>> {
+    let table = match fab {
+        "jlcpcb" => jlcpcb_rules(),
+        _ => return None,
+    };
+    Some(
+        table
+            .into_iter()
+            .map(|(name, body)| {
+                let full = format!("{FAB_PREFIX}{fab} {name}");
+                (full.clone(), format!("(rule \"{full}\"\n  {body})"))
+            })
+            .collect(),
+    )
+}
+
+fn handle_apply_fab_rules(args: &Value) -> anyhow::Result<CallToolResult> {
+    let stem = match project_arg(args) {
+        Ok(s) => s,
+        Err(e) => return Ok(e),
+    };
+    let fab = args["fab"].as_str().unwrap_or("jlcpcb");
+    let Some(rules) = fab_rules(fab) else {
+        return Ok(invalid("fab", "supported: jlcpcb"));
+    };
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let dru_path = stem.with_extension("kicad_dru");
+    let existing = std::fs::read_to_string(&dru_path).ok();
+    let merged = merge_fab_rules(existing.as_deref(), &rules);
+    let plan = json!({
+        "fab": fab,
+        "dry_run": dry_run,
+        "rules": rules.keys().collect::<Vec<_>>(),
+        "source": "document database: labtroll-jlcpcb-kicad-dru (community rules annotated against jlcpcb.com/capabilities); standard process, 1 oz outer",
+        "path": dru_path,
+        "dru_text": if dry_run { Value::String(merged.clone()) } else { Value::Null },
+    });
+    if dry_run {
+        return Ok(CallToolResult::json(&plan));
+    }
+    if let Some(refusal) = crate::tools::pcb_board::refuse_if_project_locked_by_kicad(&stem.with_extension("kicad_pro"), "fab rules") {
+        return Ok(refusal);
+    }
+    if let Some(refusal) = write_checked(&dru_path, existing.as_deref(), &merged, "apply_fab_rules")? {
+        return Ok(refusal);
+    }
+    let mut done = plan;
+    done["written"] = json!(dru_path);
+    Ok(CallToolResult::json(&done))
+}
+
 // ─── Placement for ties ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -1046,6 +1149,24 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["project"]
             }),
             |args, _ctx| async move { handle_apply_design_intent(args) }
+        ),
+        tool!(
+            "apply_fab_rules",
+            "Write a fab house's manufacturing limits into the project's .kicad_dru as named \
+             'fab: <fab> …' rules (track width/space outer and inner, edge clearance, hole sizes, \
+             annular ring, hole-to-hole, hole and pad clearances, silkscreen) so KiCad's DRC \
+             checks them. Other rules are kept. Dry run by default; refused while KiCad holds \
+             the project.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string" },
+                    "fab": { "type": "string", "enum": ["jlcpcb"], "default": "jlcpcb" },
+                    "dry_run": { "type": "boolean", "default": true }
+                },
+                "required": ["project"]
+            }),
+            |args, _ctx| async move { handle_apply_fab_rules(args) }
         ),
         tool!(
             "plan_tie_placement",
@@ -1429,6 +1550,33 @@ mod tests {
         assert!(merged.contains("diff_pair_gap"));
         // Re-applying is idempotent.
         assert_eq!(merge_dru(Some(&merged), &rules), merged);
+    }
+
+    #[test]
+    fn fab_rules_coexist_with_intent_and_user_rules() {
+        let user = "(version 1)\n(rule \"mine\"\n  (constraint clearance (min 0.3mm)))\n";
+        let intent = usb_intent();
+        let with_intent = merge_dru(Some(user), &dru_rules(&intent, &requirements(&intent)));
+        let fab = fab_rules("jlcpcb").unwrap();
+        let both = merge_fab_rules(Some(&with_intent), &fab);
+        assert!(both.contains("(rule \"mine\""));
+        assert!(both.contains("(rule \"intent: width +5V\""), "intent rules untouched by the fab merge");
+        assert_eq!(managed_rule_names(&both, FAB_PREFIX).len(), fab.len());
+        // Fab floors come before every other rule, whichever was applied first,
+        // so KiCad's later-rule-wins order lets intent and user rules override them.
+        let fab_first = |text: &str| {
+            let last_fab = text.rfind("(rule \"fab: ").unwrap();
+            let first_other = ["(rule \"mine\"", "(rule \"intent: "].iter().filter_map(|n| text.find(n)).min().unwrap();
+            last_fab < first_other
+        };
+        assert!(fab_first(&both));
+        // Re-applying is idempotent, and re-merging intent keeps the fab rules first.
+        assert_eq!(merge_fab_rules(Some(&both), &fab), both);
+        let again = merge_dru(Some(&both), &dru_rules(&intent, &requirements(&intent)));
+        assert_eq!(managed_rule_names(&again, FAB_PREFIX).len(), fab.len());
+        assert!(fab_first(&again));
+        let reversed = merge_dru(Some(&merge_fab_rules(Some(user), &fab)), &dru_rules(&intent, &requirements(&intent)));
+        assert!(fab_first(&reversed));
     }
 
     #[test]

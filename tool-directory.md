@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 10 categories
-- **241 registered tools** + **7 always-visible meta-tools** = **248 total**
+- **243 registered tools** + **7 always-visible meta-tools** = **250 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -307,7 +307,7 @@ and Windows servers do not.
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
-### `design_intent` · 6 tools
+### `design_intent` · 7 tools
 **Purpose:** What the design must do, kept per project in `<project>.intent.json`: net roles (diff pair, power, clock, sensitive, plane), priorities, current/impedance/length/skew targets, part ties; engineering calculators for decisions; intent turned into KiCad net classes and `.kicad_dru` rules; checks and placement plans against the board.
 **Source:** [`crates/konnect-core/src/tools/design_intent.rs`](crates/konnect-core/src/tools/design_intent.rs), [`eecalc.rs`](crates/konnect-core/src/tools/eecalc.rs)
 
@@ -317,6 +317,7 @@ and Windows servers do not.
 | `get_design_intent` | Read the intent and what it works out to per net (track width, pair gap, with the calculation behind each), sorted by routing priority. |
 | `set_design_intent` | Merge nets, ties, stackup and notes into the intent; validated (roles, reciprocal pairs, positive values, `REF.PAD` sources); revision-checked write. |
 | `apply_design_intent` | Write `intent_<net>` net classes into the `.kicad_pro` and `intent: …` rules into the `.kicad_dru` (track width, diff-pair gap, skew, length, clearance) so KiCad's DRC enforces them; user classes and rules kept; dry run by default; refused while KiCad holds the project. |
+| `apply_fab_rules` | Write a fab house's limits (JLCPCB: track/space outer and inner, edge, holes, annular ring, hole-to-hole, hole and pad clearances, silkscreen) into the project's `.kicad_dru` as `fab: …` rules. They go first in the file so intent and user rules, which KiCad lets later rules override, take precedence. Dry run by default. |
 | `plan_tie_placement` | For each failing tie, a position and rotation that puts the part's pad on the pin's net closest to the pin, courtyard clear and inside the real outline. A plan to apply with `set_component_placements`. |
 | `check_design_intent` | Measure the live or saved board against the intent: tie distances, routed length, pair skew, track width against current/impedance, voltage drop from the source pad, impedance estimate, plane zones. pass / fail / unverified with measured and required values. |
 
@@ -388,7 +389,7 @@ and Windows servers do not.
 
 ## Integration
 
-### `integration` · 9 tools
+### `integration` · 10 tools
 **Purpose:** JLCPCB parts database, local Freerouting MCP routing, datasheet URLs.
 **Source:** [`crates/konnect-core/src/tools/integration.rs`](crates/konnect-core/src/tools/integration.rs)
 
@@ -398,6 +399,7 @@ and Windows servers do not.
 | `search_jlcpcb_parts` | Search the local JLCPCB database by keyword, value, or category. The query is split on whitespace; a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description (case-insensitive, `%` and `_` literal). |
 | `get_jlcpcb_part` | Retrieve full details for a single JLCPCB part by LCSC part number. |
 | `suggest_jlcpcb_alternatives` | Suggest JLCPCB-stocked parts with the same value in the package a KiCad footprint maps to. Excludes parts below a stock floor and ranks Basic, then Preferred, then Extended parts, then known price and stock; the response states the LCSC package names matched, the ranking and what was excluded. |
+| `assign_lcsc_parts` | Give every in-BOM, non-DNP symbol (root and sub-sheets) an LCSC number from the local JLCPCB database, and check existing ones for existence, stock × boards and package. Passive values are normalised (`100n` → `100nF`, `4k7` → `4.7kΩ`), ratings written in the value (`16V`, `X7R`, `1%`, `1/10W`) are enforced, and other parts match by MPN. Reports unchecked ratings and the Extended-part count. Dry run by default. |
 | `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, last updated, file size. |
 | `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |
 | `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID — from the local JLCPCB catalog first, falling back to the LCSC API. |
@@ -493,7 +495,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `export_manufacturing_package` | Generate Gerbers, drill, fab-house BOM, and pick-and-place. JLCPCB assembly requires the exact board open with IPC enabled: native pad-box midpoints and board exports share a stable live snapshot, then versioned CPL corrections apply. Geometry and correction evidence remain separate; Component Placements preview is required. |
+| `export_manufacturing_package` | Generate Gerbers, drill, fab-house BOM, and pick-and-place. JLCPCB assembly requires the exact board open with IPC enabled: native pad-box midpoints and board exports share a stable live snapshot, then versioned CPL corrections apply. Geometry and correction evidence remain separate; Component Placements preview is required. For JLCPCB the BOM defaults to JLCPCB's columns (Comment, Designator, Footprint, LCSC Part #) grouped by LCSC number; any row without a valid LCSC number makes the package incomplete unless its references are in `allow_unsourced`; the Gerbers and drills are also zipped for upload. |
 | `validate_for_manufacturing` | Board pre-flight before ordering: checks outline, design rules, footprints, routing evidence, and complete DRC results. |
 | `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. |
 

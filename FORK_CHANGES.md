@@ -404,4 +404,49 @@ New toolset **`design_intent`** (6 tools, making 22 toolsets). The calculators e
   - DRC summary 1,120 bytes;
   - `diff_board` showed the new XTAL1 segment.
 
-**Counts:** 241 tools (248 with meta-tools). `pcb_board` has 16, `pcb_routing` 18 and `pcb_export` 15.
+**Counts:** `pcb_board` has 16 tools, `pcb_routing` 18 and `pcb_export` 15.
+
+## Pass 8: ordering loop (fab rules, LCSC assignment, JLCPCB package gate)
+
+- **`apply_fab_rules`** (`design_intent`): writes 16 JLCPCB standard-process limits into `.kicad_dru` as `fab: jlcpcb …` rules.
+  - Limits: track width and space (outer 0.127 mm, inner 0.09 mm), routed-edge clearance, hole size, NPTH size, annular ring, hole-to-hole, track to PTH and NPTH, track to pad, pad and via to pad and via, silkscreen.
+  - Values come from the community labtroll/KiCad-DesignRules file (document database `labtroll-jlcpcb-kicad-dru`). JLCPCB's own page could not be reached to cross-check them.
+  - **Ordering:** KiCad lets a later rule override an earlier one for the same constraint. The fab rules are floors, so they are written at the top of the file, and intent and user rules override them.
+    - The fable review predicted that appending them would mask intent rules. KiCad's DRC confirmed it on the PoC board: with fab rules last, one of three `intent: clearance /XTAL2` violations disappeared.
+  - The intent merge was generalised to `merge_managed_rules(prefix)`, so the two rule families never touch each other.
+- **`assign_lcsc_parts`** (`integration`, new `lcsc_assign.rs`) covers every in-BOM, non-DNP symbol in the root sheet and each sub-sheet file placed once.
+  - **Existing numbers** are checked: existence, stock against quantity × `boards`, and package against the footprint.
+  - **Missing numbers** are searched:
+    - Passive values are parsed to SI and respelled the way LCSC descriptions are written: `100n`/`0.1u` → `100nF`, `4k7` → `4.7kΩ`, `2R2`, `1nF`/`1000pF`.
+    - Candidates must be the right kind, so a "10kΩ" capacitor array is not a resistor.
+    - Ratings written in the value (`16V`, `X7R`, `1%`, `1/10W`) must be stated in the description; an unstated rating fails closed.
+    - Other parts match by an `MPN` field or the value as an exact MPN.
+  - Ranking reuses `rank_alternatives`: Basic, then price, then stock, with a stock floor of max(100, quantity × boards).
+  - **Each line reports:**
+    - the search evidence and the ratings it could not check (capacitor voltage and dielectric, resistor power, inductor saturation);
+    - the alternatives considered;
+    - the number of distinct Extended parts, each of which carries a JLCPCB loading fee.
+  - `parts` gives explicit choices, which are checked, not searched.
+  - Dry run by default. Writing is one atomic batch edit per sheet file, through `batch_edit_schematic_components`.
+- **`export_manufacturing_package` for JLCPCB:**
+  - Without `bom_fields`, the BOM uses JLCPCB's template columns (Comment, Designator, Footprint, LCSC Part #), grouped by Value, Footprint and LCSC so different parts never share a row.
+  - A row without a valid `C`+digits number makes the package incomplete. `allow_unsourced` lists consigned or hand-fitted parts.
+  - The verified Gerber and drill files are also zipped (`gerbers-<board>.zip`).
+
+**Live check** (`poc/step4_check.py`, copy of the 4-layer board, non-zero exit on failure): 13/13.
+- **Fab rules:**
+  - KiCad parses the merged rules.
+  - The same intent-rule violations are reported before and after the fab rules are added.
+  - Moving the fab rules last changes them, which demonstrates the ordering bug.
+  - The fab rules themselves flag 32 silkscreen texts under 1 mm, 3 pad–silk and 1 track–pad violation on this board.
+- **LCSC assignment:**
+  - 8 lines assigned, all Basic: 100nF → C14663 (50 V X7R), 10uF → C15850, 22pF → C1653 (C0G), 5.1k/10k/4.7k/680 Ω, AMS1117-3.3 → C6186.
+  - 2 existing numbers verified.
+  - 6 unresolved with reasons: an LED valued "RED", the USB-C and pin-header connectors, and the button.
+  - Both sheet files were written, and a re-run reports everything as ok.
+- **Package:**
+  - It is refused while those 6 parts are unsourced, and passes the LCSC gate with them in `allow_unsourced`.
+  - The BOM header matches JLCPCB's template, and the zip holds 12 Gerber and drill files.
+  - The one remaining warning is real: the board's 4 mounting holes predate the pass-2 attribute fix and lack `exclude_from_pos_files`, so they are in the CPL but not the BOM.
+
+**Review:** a fable review of passes 1–7 and the test design ran alongside this pass. Its other findings are listed for the next pass: impedance enforcement and real stackup, inner-layer width check, voltage-drop reachability, SES gate by violation identity, in-pad via obstacles, diff and restore coverage, and calculator input validation. So are its test methods: KiCad-DRC oracles with seeded violations, negative gate tests, proptest geometry and metamorphic tests, published impedance tables, and CI for the live checks.

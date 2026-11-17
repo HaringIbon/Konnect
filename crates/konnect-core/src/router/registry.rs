@@ -96,7 +96,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "design_intent",
         description: "Design intent (net roles, current and impedance targets, part ties), engineering calculators, intent-to-rules and checks against the board",
         category: "pcb",
-        tool_count: 6,
+        tool_count: 7,
     },
     ToolsetMeta {
         name: "placement",
@@ -120,7 +120,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "integration",
         description: "JLCPCB parts database, local Freerouting MCP routing, datasheet URLs",
         category: "integration",
-        tool_count: 9,
+        tool_count: 10,
     },
     ToolsetMeta {
         name: "verification",

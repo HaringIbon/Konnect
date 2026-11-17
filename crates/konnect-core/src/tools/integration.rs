@@ -40,7 +40,7 @@ const JLCPCB_MAX_DATABASE_BYTES: u64 = 8_589_934_592;
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "download_jlcpcb_database",
             "Download or update the local JLCPCB component parts database cache (SQLite).",
@@ -165,7 +165,9 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_route_specctra_dsn(args, ctx).await }
         ),
-    ]
+    ];
+    tools.extend(super::lcsc_assign::tools());
+    tools
 }
 
 // ─── JLCPCB database path helper ─────────────────────────────────────────────
@@ -183,7 +185,7 @@ fn default_jlcpcb_db_path() -> PathBuf {
     }
 }
 
-fn resolve_db_path(args: &serde_json::Value, ctx: &ToolContext) -> PathBuf {
+pub(super) fn resolve_db_path(args: &serde_json::Value, ctx: &ToolContext) -> PathBuf {
     if let Some(p) = args["output_path"].as_str() {
         return PathBuf::from(p);
     }
@@ -765,7 +767,7 @@ async fn handle_search_jlcpcb_parts(
     Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
-fn row_to_part_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
+pub(super) fn row_to_part_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
     // The exact LCSC PDF URL for most parts. Omitted here once made a caller
     // unable to get a datasheet the table already held (#255); an empty cell
     // reads as null rather than "" so callers can test presence directly.
@@ -844,12 +846,12 @@ const SUGGEST_DEFAULT_MIN_STOCK_COUNT: u64 = 100;
 /// A part that matched both the value and the package, with the columns the
 /// stock floor, price limit and ranking read.
 #[derive(Debug, Clone)]
-struct AlternativeCandidate {
-    part: serde_json::Value,
-    lcsc_id: String,
-    library_type: String,
-    price: f64,
-    stock_count: i64,
+pub(super) struct AlternativeCandidate {
+    pub(super) part: serde_json::Value,
+    pub(super) lcsc_id: String,
+    pub(super) library_type: String,
+    pub(super) price: f64,
+    pub(super) stock_count: i64,
 }
 
 impl AlternativeCandidate {
@@ -868,11 +870,11 @@ impl AlternativeCandidate {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct AlternativePolicy {
-    min_stock_count: u64,
-    prefer_basic: bool,
-    max_price: Option<f64>,
-    limit: usize,
+pub(super) struct AlternativePolicy {
+    pub(super) min_stock_count: u64,
+    pub(super) prefer_basic: bool,
+    pub(super) max_price: Option<f64>,
+    pub(super) limit: usize,
 }
 
 impl AlternativePolicy {
@@ -894,9 +896,9 @@ impl AlternativePolicy {
 /// What filtering removed and what was returned, so an empty or short result
 /// says why.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct AlternativeCounts {
-    matched: usize,
-    below_min_stock: usize,
+pub(super) struct AlternativeCounts {
+    pub(super) matched: usize,
+    pub(super) below_min_stock: usize,
     unknown_price: usize,
     above_max_price: usize,
     returned: usize,
@@ -905,7 +907,7 @@ struct AlternativeCounts {
 /// Apply the stock floor and price limit, then rank. Ranking by price alone
 /// put Extended parts with a dozen units in stock, and parts whose price was
 /// unknown, ahead of the Basic part with millions (#785).
-fn rank_alternatives(
+pub(super) fn rank_alternatives(
     candidates: Vec<AlternativeCandidate>,
     policy: &AlternativePolicy,
 ) -> (Vec<AlternativeCandidate>, AlternativeCounts) {
@@ -954,7 +956,7 @@ fn rank_alternatives(
 /// Read every part in one of `packages` whose description or part number
 /// contains `value` as a whole value. SQL narrows by substring; the
 /// whole-value test, which SQLite's LIKE cannot express, runs here.
-fn query_alternative_candidates(
+pub(super) fn query_alternative_candidates(
     db_path: &Path,
     value: &str,
     packages: &[String],

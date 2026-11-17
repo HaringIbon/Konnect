@@ -48,6 +48,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Ordered, comma-separated BOM column headings matching 'bom_fields'. Omit to label each column with its field name."
                     },
+                    "allow_unsourced": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "JLCPCB assembly: references that may lack an LCSC number (consigned or hand-soldered parts). Every other BOM row without a valid LCSC number makes the package incomplete."
+                    },
                     "bom_group_by": {
                         "type": "string",
                         "description": "Comma-separated fields whose matching references collapse into one BOM row, e.g. 'Value,Footprint'."
@@ -276,6 +281,26 @@ async fn handle_export_manufacturing_package(
         }
     }
 
+    // JLCPCB's PCB order takes one zip of the Gerber and drill files. Built
+    // only from this run's verified files, so a stale file in the directory
+    // cannot ride along.
+    if is_jlcpcb && warnings.is_empty() {
+        let stem = board.file_stem().and_then(|s| s.to_str()).unwrap_or("board");
+        let zip_path = output_dir.join(format!("gerbers-{stem}.zip"));
+        let members: Vec<PathBuf> = verified_paths.iter().filter(|p| p.starts_with(&gerber_dir)).cloned().collect();
+        match write_zip(&zip_path, &members) {
+            Ok(()) => {
+                verified_paths.push(zip_path.clone());
+                files_generated.push(json!({
+                    "type": "gerber_zip",
+                    "path": zip_path.to_str().unwrap_or(""),
+                    "members": members.len()
+                }));
+            }
+            Err(e) => warnings.push(format!("Gerber zip failed: {e:#}")),
+        }
+    }
+
     // 3. Assembly files (BOM + pick-and-place)
     if include_assembly {
         // Pick-and-place (position file). KiCad's native CSV is retained for
@@ -352,10 +377,19 @@ async fn handle_export_manufacturing_package(
             // Without bom_fields the package gets kicad-cli's fixed
             // Reference,Value,Footprint,QUANTITY,DNP set — no MPN, no supplier
             // part number, nothing a fab can source a part from.
+            // JLCPCB's template columns by default, grouped so two parts with
+            // different LCSC numbers never share a row.
+            let jlc_default = is_jlcpcb && args["bom_fields"].as_str().is_none();
             let bom_options = cli::BomOptions {
-                fields: args["bom_fields"].as_str(),
-                labels: args["bom_labels"].as_str(),
-                group_by: args["bom_group_by"].as_str(),
+                fields: args["bom_fields"]
+                    .as_str()
+                    .or(jlc_default.then_some("Value,Reference,Footprint,LCSC")),
+                labels: args["bom_labels"]
+                    .as_str()
+                    .or(jlc_default.then_some("Comment,Designator,Footprint,LCSC Part #")),
+                group_by: args["bom_group_by"]
+                    .as_str()
+                    .or(jlc_default.then_some("Value,Footprint,LCSC")),
                 exclude_dnp: is_jlcpcb,
             };
             let bom_result = if is_jlcpcb {
@@ -368,6 +402,14 @@ async fn handle_export_manufacturing_package(
                 Ok(()) => {
                     let parsed = if is_jlcpcb {
                         let source = tokio::fs::read_to_string(&bom_path).await?;
+                        let allowed: BTreeSet<String> = args["allow_unsourced"]
+                            .as_array()
+                            .map(|refs| refs.iter().filter_map(|r| r.as_str().map(str::to_string)).collect())
+                            .unwrap_or_default();
+                        match jlcpcb_bom_sourcing(&source, &allowed) {
+                            Ok(problems) => warnings.extend(problems),
+                            Err(e) => warnings.push(format!("JLCPCB BOM sourcing check failed: {e:#}")),
+                        }
                         jlcpcb_bom_designators(&source).map(Some)
                     } else {
                         Ok(None)
@@ -972,6 +1014,80 @@ fn jlcpcb_bom_designators(source: &str) -> anyhow::Result<BTreeSet<String>> {
         bail!("JLCPCB BOM contains no designators");
     }
     Ok(designators)
+}
+
+fn write_zip(zip_path: &Path, members: &[PathBuf]) -> anyhow::Result<()> {
+    use std::io::Write;
+    if members.is_empty() {
+        bail!("no Gerber or drill files to zip");
+    }
+    let tmp = zip_path.with_extension("zip.tmp");
+    let mut archive = zip::ZipWriter::new(std::fs::File::create(&tmp)?);
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for member in members {
+        let name = member.file_name().and_then(|n| n.to_str()).context("non-UTF-8 file name")?;
+        archive.start_file(name, options)?;
+        archive.write_all(&std::fs::read(member)?)?;
+    }
+    archive.finish()?;
+    std::fs::rename(&tmp, zip_path)?;
+    Ok(())
+}
+
+/// Every JLCPCB BOM row must carry an LCSC number (`C` and digits), unless
+/// all its designators are allowed to be unsourced. One warning per kind of
+/// problem, listing the designators, so the package fails closed.
+fn jlcpcb_bom_sourcing(source: &str, allowed: &BTreeSet<String>) -> anyhow::Result<Vec<String>> {
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .from_reader(source.as_bytes());
+    let headers = reader.headers()?.clone();
+    let reference = headers
+        .iter()
+        .position(|h| matches!(h, "Designator" | "Reference" | "Refs"))
+        .context("JLCPCB BOM has no Designator/Reference/Refs column")?;
+    let Some(lcsc) = headers.iter().position(|h| {
+        let h = h.to_ascii_lowercase();
+        h.starts_with("lcsc") || h.starts_with("jlcpcb part")
+    }) else {
+        return Ok(vec![
+            "JLCPCB BOM has no LCSC column: omit bom_fields for JLCPCB's template, or include the LCSC field; run assign_lcsc_parts to fill it".to_string(),
+        ]);
+    };
+    let (mut missing, mut malformed) = (Vec::new(), Vec::new());
+    for row in reader.records() {
+        let row = row?;
+        let refs: Vec<String> = row
+            .get(reference)
+            .unwrap_or("")
+            .split(',')
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect();
+        if !refs.is_empty() && refs.iter().all(|r| allowed.contains(r)) {
+            continue;
+        }
+        let number = row.get(lcsc).unwrap_or("").trim();
+        if number.is_empty() || number == "~" {
+            missing.extend(refs);
+        } else if !(number.len() > 1
+            && number.starts_with(['C', 'c'])
+            && number[1..].chars().all(|c| c.is_ascii_digit()))
+        {
+            malformed.push(format!("{} ('{number}')", refs.join(",")));
+        }
+    }
+    let mut problems = Vec::new();
+    if !missing.is_empty() {
+        problems.push(format!(
+            "JLCPCB BOM rows without an LCSC number: {} — run assign_lcsc_parts, or list consigned parts in allow_unsourced",
+            missing.join(", ")
+        ));
+    }
+    if !malformed.is_empty() {
+        problems.push(format!("JLCPCB BOM LCSC numbers that are not 'C' and digits: {}", malformed.join("; ")));
+    }
+    Ok(problems)
 }
 
 fn jlcpcb_designator_mismatch(cpl: &BTreeSet<String>, bom: &BTreeSet<String>) -> Option<String> {
@@ -2263,5 +2379,36 @@ mod copper_layer_count_tests {
 
         let control = validate(TWO_LAYER).await;
         assert_eq!(control["board_info"]["copper_layers"], 2);
+    }
+}
+
+#[cfg(test)]
+mod jlcpcb_sourcing_tests {
+    use super::jlcpcb_bom_sourcing;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn rows_without_lcsc_fail_closed_unless_allowed() {
+        let bom = "\"Comment\",\"Designator\",\"Footprint\",\"LCSC Part #\"\n\
+                   \"100nF\",\"C1,C2\",\"C_0603\",\"C14663\"\n\
+                   \"10k\",\"R1\",\"R_0603\",\"\"\n\
+                   \"Feather\",\"J5\",\"Socket\",\"\"\n\
+                   \"LED\",\"D1\",\"LED_0603\",\"LED-RED\"\n";
+        let none = BTreeSet::new();
+        let problems = jlcpcb_bom_sourcing(bom, &none).unwrap();
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("R1, J5"));
+        assert!(problems[1].contains("D1 ('LED-RED')"));
+        let allowed: BTreeSet<String> = ["J5".to_string()].into();
+        let problems = jlcpcb_bom_sourcing(bom, &allowed).unwrap();
+        assert!(problems[0].contains("R1") && !problems[0].contains("J5"));
+    }
+
+    #[test]
+    fn a_bom_without_an_lcsc_column_is_one_problem() {
+        let bom = "\"Reference\",\"Value\",\"Footprint\"\n\"C1\",\"100nF\",\"C_0603\"\n";
+        let problems = jlcpcb_bom_sourcing(bom, &BTreeSet::new()).unwrap();
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("no LCSC column"));
     }
 }

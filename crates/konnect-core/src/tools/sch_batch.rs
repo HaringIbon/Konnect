@@ -1143,7 +1143,7 @@ async fn handle_bulk_move(
     })))
 }
 
-async fn handle_batch_edit(
+pub(crate) async fn handle_batch_edit(
     args: &serde_json::Value,
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {

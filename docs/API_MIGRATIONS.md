@@ -2339,3 +2339,11 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
 - **New tools:** `route_path`, `render_board_png` (returns a text block plus an image block), `checkpoint_board`, `diff_board`, `restore_checkpoint`.
 - **`run_drc`:** takes `detail: "summary"`, and every response includes `by_rule`.
 - **Errors:** an error caused by KiCad's `AS_NOT_READY` now has kind `editor_not_ready`, with `retry_after_s` and `original_kind`.
+
+## Unreleased (fork): ordering loop
+
+- **New tools:** `apply_fab_rules` (`design_intent`), `assign_lcsc_parts` (`integration`).
+- **`export_manufacturing_package` with `fab_house: jlcpcb`:**
+  - Without `bom_fields`, the BOM now has columns Comment, Designator, Footprint and LCSC Part #, grouped by Value, Footprint and LCSC. Before, it had KiCad's default columns.
+  - BOM rows without a valid LCSC number make the package `complete: false`; list exempt references in `allow_unsourced`.
+  - A `gerbers-<board>.zip` entry (`type: gerber_zip`) is added.

@@ -202,7 +202,8 @@ mod tests {
                         "batch_edit_schematic_components/properties/edits/items/properties/fields" |
                         "copy_routing_pattern/properties/net_map" |
                         "apply_template/properties/net_mappings" |
-                        "set_design_intent/properties/nets"
+                        "set_design_intent/properties/nets" |
+                        "assign_lcsc_parts/properties/parts"
                     ),
                         "unreviewed open input record: {path}"
                     );
