@@ -2364,3 +2364,12 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
 - **`restore_checkpoint`:** also restores the project, rules and intent files saved with the checkpoint. It refuses ids that are not plain names, and checkpoints whose stored sha256 does not match.
 - **`engineering_calc`:** refuses non-physical inputs with `invalid_argument`.
 - **`apply_fab_rules` (JLCPCB):** the NPTH rules now match on the pad type, and the rules are written in authored order.
+
+## Unreleased (fork): STM32 demo fixes
+
+- **`route_path`:** takes `routes` (several nets in one call). The response always has `routes`, and keeps the flat `net`/`segments`/`vias`/`routed_length_mm` fields for a single route.
+- **`set_design_intent`:** gains `plane_layers` and `remove_nets`.
+- **`check_design_intent`:** new check kind `net_on_board`. Pair coupling now ignores partners further than 3 dielectric heights away and combines several partner segments.
+- **`export_specctra_dsn`:** adds edge-clearance keep-outs, so routes keep the `.kicad_dru` edge clearance.
+- **`export_manufacturing_package` (JLCPCB):** the CPL leaves out footprints marked `exclude_from_bom`.
+- **`assign_lcsc_parts`:** an explicit `parts` choice already present on the symbol reports `ok`, not `assign`.

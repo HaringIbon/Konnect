@@ -85,8 +85,14 @@ fn list(board: &Path) -> Vec<(String, Value)> {
                 .map(|e| e.path())
                 .filter(|p| p.extension().is_some_and(|e| e == "json"))
                 .filter_map(|p| {
+                    // Only `<id>.json` is metadata: ids have no dots, and the
+                    // saved `<id>.intent.json` sidecar is not a checkpoint.
+                    let id = p.file_stem()?.to_string_lossy().to_string();
+                    if !valid_id(&id) {
+                        return None;
+                    }
                     let meta: Value = serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?;
-                    Some((p.file_stem()?.to_string_lossy().to_string(), meta))
+                    (meta["id"].as_str() == Some(id.as_str())).then_some((id, meta))
                 })
                 .collect()
         })
@@ -499,14 +505,29 @@ async fn handle_restore(args: &Value, ctx: &ToolContext) -> anyhow::Result<CallT
     }
     let current = konnect_sexp::writer::read_consistent(&board)?;
     let safety = write_checkpoint(&board, &current, "pre-restore", "saved file")?;
-    let mut transitions = vec![konnect_sexp::transaction::FileTransition::replace(&board, current, restored)];
-    let mut restored_files = vec![board.display().to_string()];
+    // Files already equal to the checkpoint are left alone: the journal
+    // refuses a no-op transition, and there is nothing to write.
+    let mut transitions = Vec::new();
+    let mut restored_files = Vec::new();
+    if current != restored {
+        transitions.push(konnect_sexp::transaction::FileTransition::replace(&board, current, restored));
+        restored_files.push(board.display().to_string());
+    }
     for (path, text) in sidecars {
-        transitions.push(match std::fs::read_to_string(&path) {
-            Ok(now) => konnect_sexp::transaction::FileTransition::replace(&path, now, text),
-            Err(_) => konnect_sexp::transaction::FileTransition::create(&path, text),
-        });
+        match std::fs::read_to_string(&path) {
+            Ok(now) if now == text => continue,
+            Ok(now) => transitions.push(konnect_sexp::transaction::FileTransition::replace(&path, now, text)),
+            Err(_) => transitions.push(konnect_sexp::transaction::FileTransition::create(&path, text)),
+        }
         restored_files.push(path.display().to_string());
+    }
+    if transitions.is_empty() {
+        return Ok(CallToolResult::json(&json!({
+            "restored": id,
+            "files": [],
+            "previous_state_checkpoint": safety,
+            "note": "the board and its project files already match this checkpoint",
+        })));
     }
     let journal_dir = board.parent().unwrap_or(Path::new("."));
     match konnect_sexp::transaction::try_commit_file_transaction(journal_dir, transitions) {
@@ -625,14 +646,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("b.kicad_pcb");
         let dru = dir.path().join("b.kicad_dru");
+        let intent = dir.path().join("b.intent.json");
         std::fs::write(&board, "(kicad_pcb (version 1))\n").unwrap();
         std::fs::write(&dru, "(version 1)\n").unwrap();
+        std::fs::write(&intent, "{\"schema\": 1}\n").unwrap();
         let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(String::new());
         let made = handle_checkpoint(&json!({ "board": board, "label": "x" }), &ctx).await.unwrap();
         let crate::mcp::protocol::ToolContent::Text { text } = &made.content[0] else { panic!() };
         let id = serde_json::from_str::<Value>(text).unwrap()["checkpoint"].as_str().unwrap().to_string();
         std::fs::write(&dru, "(version 1)\n(rule \"later\" (constraint clearance (min 1mm)))\n").unwrap();
         std::fs::write(&board, "(kicad_pcb (version 2))\n").unwrap();
+        // The intent sidecar must not be mistaken for a checkpoint.
+        assert_eq!(list(&board).len(), 1);
+        let diff = handle_diff(&json!({ "board": board }), &ctx).await.unwrap();
+        assert!(!diff.is_error, "{diff:?}");
 
         for bad in ["../../etc/passwd", "a/b", ""] {
             let r = handle_restore(&json!({ "board": board, "checkpoint": bad }), &ctx).await.unwrap();

@@ -569,12 +569,54 @@ pub(super) async fn export_jlcpcb_cpl(
     let native = staging.path().join("kicad-positions.csv");
     cli::export_position_file_excluding_dnp(cli_path, board, &native, "csv", "mm", side).await?;
     let source = tokio::fs::read_to_string(&native).await?;
+    // JLCPCB places only what its BOM lists: a footprint excluded from the
+    // BOM (fiducials, logos, test pads) is not a placement either.
+    let board_text = tokio::fs::read_to_string(board).await?;
+    let source = drop_cpl_rows(&source, &not_in_bom(&board_text));
     let policies = JlcpcbCorrectionPolicies::load(project_policy_path).await?;
     let (source, geometry) = jlcpcb_midpoints::convert_positions(&source, midpoints)?;
     let mut export = jlcpcb_cpl_from_kicad_csv(&source, &policies)?;
     export.orientation_evidence.geometry = geometry;
     cli::publish_verified_bytes(output, &export.bytes, "JLCPCB CPL").await?;
     Ok(export)
+}
+
+/// References of footprints marked `exclude_from_bom`.
+fn not_in_bom(board: &str) -> BTreeSet<String> {
+    let Ok(tree) = konnect_sexp::parse_sexp(board) else { return BTreeSet::new() };
+    konnect_sexp::board::footprints(&tree)
+        .into_iter()
+        .filter(|fp| {
+            fp.find("attr")
+                .and_then(|a| a.children())
+                .is_some_and(|c| c.iter().any(|n| n.as_str() == Some("exclude_from_bom")))
+        })
+        .filter_map(|fp| {
+            fp.find_all("property")
+                .into_iter()
+                .find(|p| p.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("Reference"))
+                .and_then(|p| p.get(2))
+                .and_then(konnect_sexp::SexpNode::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// KiCad's position CSV without the rows of `refs` (first column).
+fn drop_cpl_rows(csv: &str, refs: &BTreeSet<String>) -> String {
+    if refs.is_empty() {
+        return csv.to_string();
+    }
+    csv.lines()
+        .enumerate()
+        .filter(|(i, line)| {
+            *i == 0 || {
+                let first = line.split(',').next().unwrap_or("").trim().trim_matches('"');
+                !refs.contains(first)
+            }
+        })
+        .map(|(_, line)| format!("{line}\n"))
+        .collect()
 }
 
 const BUILT_IN_JLCPCB_CORRECTIONS: &str = include_str!("jlcpcb_cpl_corrections_v1.json");
@@ -2410,5 +2452,22 @@ mod jlcpcb_sourcing_tests {
         let problems = jlcpcb_bom_sourcing(bom, &BTreeSet::new()).unwrap();
         assert_eq!(problems.len(), 1);
         assert!(problems[0].contains("no LCSC column"));
+    }
+}
+
+#[cfg(test)]
+mod cpl_bom_exclusion_tests {
+    use super::{drop_cpl_rows, not_in_bom};
+
+    #[test]
+    fn fiducials_excluded_from_the_bom_leave_the_cpl() {
+        let board = "(kicad_pcb
+          (footprint \"Fiducial:Fiducial_1mm_Mask2mm\" (layer \"F.Cu\") (at 1 1) (property \"Reference\" \"FID1\") (attr smd exclude_from_bom))
+          (footprint \"R\" (layer \"F.Cu\") (at 2 2) (property \"Reference\" \"R1\") (attr smd)))";
+        let refs = not_in_bom(board);
+        assert_eq!(refs.into_iter().collect::<Vec<_>>(), ["FID1"]);
+        let csv = "Ref,Val,Package,PosX,PosY,Rot,Side\n\"FID1\",\"x\",\"f\",1,1,0,top\n\"R1\",\"1k\",\"r\",2,2,0,top\n";
+        let out = drop_cpl_rows(csv, &not_in_bom(board));
+        assert!(!out.contains("FID1") && out.contains("R1") && out.starts_with("Ref,"), "{out}");
     }
 }

@@ -155,6 +155,7 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
     let dsn = retype_as_power(&dsn, &plane_layers)?;
     let left_to_planes = fully_fanned_plane_nets(&board, &removed_planes);
     let dsn = drop_nets(&dsn, &left_to_planes)?;
+    let dsn = edge_clearance_keepouts(&dsn, board_edge_clearance_mm(board_path))?;
     // Not `validate_dsn_syntax`: Topola's reader rejects KiCad's own image
     // outlines (`(outline (polygon …))`, which every stock footprint with a
     // courtyard polygon produces). The structural parse below plus the
@@ -582,6 +583,90 @@ fn drop_nets(dsn: &str, nets: &[String]) -> Result<String> {
     keep_copper_as_obstacles(&out, &removed_wiring)
 }
 
+/// The board's copper-to-edge clearance: the largest `edge_clearance` minimum
+/// in the project's `.kicad_dru` (the fab rules write one) or the
+/// `min_copper_edge_clearance` design setting in the `.kicad_pro`.
+fn board_edge_clearance_mm(board_path: &Path) -> f64 {
+    let mut best: f64 = 0.0;
+    if let Ok(dru) = std::fs::read_to_string(board_path.with_extension("kicad_dru")) {
+        let needle = "edge_clearance (min ";
+        let mut rest = dru.as_str();
+        while let Some(at) = rest.find(needle) {
+            let after = &rest[at + needle.len()..];
+            let number: String = after.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+            if let Ok(v) = number.parse::<f64>() {
+                best = best.max(v);
+            }
+            rest = after;
+        }
+    }
+    if let Ok(pro) = std::fs::read_to_string(board_path.with_extension("kicad_pro")) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&pro) {
+            if let Some(v) = value["board"]["design_settings"]["rules"]["min_copper_edge_clearance"].as_f64() {
+                best = best.max(v);
+            }
+        }
+    }
+    best
+}
+
+/// KiCad's Specctra export carries the board outline but not the
+/// copper-to-edge clearance, so Freerouting keeps only its net-class
+/// clearance from the edge (0.24 mm against JLCPCB's 0.3 mm on the demo
+/// board, which the import's DRC gate then refused). The outline goes back in
+/// as a keep-out band on every signal layer, `2 × clearance` wide.
+fn edge_clearance_keepouts(dsn: &str, clearance_mm: f64) -> Result<String> {
+    if clearance_mm <= 0.0 {
+        return Ok(dsn.to_string());
+    }
+    let root = parse_dsn_sexp(dsn)?;
+    let structure = root.find("structure").context("DSN has no structure")?;
+    let unit_per_mm = match root.find("resolution").and_then(|r| r.get(1)).and_then(SexpNode::as_str) {
+        Some("mil") => 1000.0 / 25.4,
+        Some("mm") => 1.0,
+        _ => 1000.0, // KiCad writes um
+    };
+    let mut keepouts = String::new();
+    let signal_layers: Vec<String> = structure
+        .find_all("layer")
+        .iter()
+        .filter(|layer| layer.find("type").and_then(|t| t.get(1)).and_then(SexpNode::as_str) == Some("signal"))
+        .filter_map(|layer| layer.get(1).and_then(SexpNode::as_str).map(str::to_string))
+        .collect();
+    let width = 2.0 * clearance_mm * unit_per_mm;
+    for boundary in structure.find_all("boundary") {
+        for shape in boundary.children().unwrap_or_default() {
+            let points: Vec<&str> = match shape.head() {
+                Some("path") | Some("polygon") => shape.children().unwrap_or_default().iter().skip(3).filter_map(SexpNode::as_str).collect(),
+                Some("rect") => continue,
+                _ => continue,
+            };
+            if points.len() < 4 {
+                continue;
+            }
+            // One keep-out per edge: Freerouting reads a closed keep-out path
+            // as the area it encloses — the whole board (found on the demo
+            // board: nothing routed).
+            let xy: Vec<(&str, &str)> = points.chunks(2).filter(|c| c.len() == 2).map(|c| (c[0], c[1])).collect();
+            for layer in &signal_layers {
+                for pair in xy.windows(2) {
+                    let ((x1, y1), (x2, y2)) = (pair[0], pair[1]);
+                    if (x1, y1) != (x2, y2) {
+                        keepouts.push_str(&format!("    (keepout \"\" (path {layer} {width} {x1} {y1} {x2} {y2}))\n"));
+                    }
+                }
+            }
+        }
+    }
+    if keepouts.is_empty() {
+        return Ok(dsn.to_string());
+    }
+    let start = dsn.find("(structure").context("DSN has no structure")?;
+    let close = start + balanced_len(&dsn[start..]).context("unbalanced DSN structure")? - 1;
+    let insert_at = dsn[..close].trim_end_matches([' ', '\t']).len();
+    Ok(format!("{}{}{}", &dsn[..insert_at], keepouts, &dsn[insert_at..]))
+}
+
 /// The copper of a net left to its plane (its fan-out stubs and vias) is
 /// still on the board. Without it the router routes straight through it, so
 /// it goes back into the structure as keep-outs of the copper's own size:
@@ -961,5 +1046,26 @@ mod round_trip_tests {
         assert_ne!(edited, BOARD);
         assert!(crate::specctra_ses::parse_import_plan(&path, &edited, &export.bundle.manifest, SES)
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod edge_clearance_tests {
+    use super::edge_clearance_keepouts;
+
+    const DSN: &str = "(pcb x\n  (resolution um 10)\n  (unit um)\n  (structure\n    (layer F.Cu (type signal))\n    (layer In1.Cu (type power))\n    (layer B.Cu (type signal))\n    (boundary\n      (path pcb 0  0 0  1000 0  1000 -1000  0 -1000  0 0)\n    )\n  )\n)\n";
+
+    #[test]
+    fn the_outline_becomes_a_keepout_band_on_each_signal_layer() {
+        let out = edge_clearance_keepouts(DSN, 0.3).unwrap();
+        // Four open edges on each of the two signal layers, never a closed loop.
+        assert_eq!(out.matches("(keepout").count(), 8, "{out}");
+        assert!(out.contains("(keepout \"\" (path F.Cu 600 0 0 1000 0))"), "{out}");
+        assert!(out.contains("(keepout \"\" (path B.Cu 600 0 -1000 0 0))"), "{out}");
+        assert!(!out.contains("(path In1.Cu"), "planes are not routed");
+        // Still parses, and the keep-outs sit inside the structure.
+        let root = super::parse_dsn_sexp(&out).unwrap();
+        assert_eq!(root.find("structure").unwrap().find_all("keepout").len(), 8);
+        assert_eq!(edge_clearance_keepouts(DSN, 0.0).unwrap(), DSN);
     }
 }

@@ -544,7 +544,14 @@ fn decide(line: &Line, overrides: &BTreeMap<String, String>, settings: &Settings
     // An explicit choice for any reference in the line.
     if let Some(choice) = line.references.iter().find_map(|r| overrides.get(r)) {
         let (part, problems) = check_number(choice, line, settings)?;
-        return Ok(with(base, json!({ "status": if problems.is_empty() { "assign" } else { "rejected" },
+        // Already written: nothing to assign.
+        let already = line.lcsc.as_ref().is_some_and(|(_, existing)| existing.eq_ignore_ascii_case(choice));
+        let status = match (problems.is_empty(), already) {
+            (false, _) => "rejected",
+            (true, true) => "ok",
+            (true, false) => "assign",
+        };
+        return Ok(with(base, json!({ "status": status,
             "source": "parts argument", "lcsc": choice, "part": part, "problems": problems })));
     }
     if let Some((field, existing)) = &line.lcsc {
@@ -797,5 +804,8 @@ mod tests {
         o.insert("J1".to_string(), "C165948".to_string());
         let j = d(&line(&["J1"], "USB_C_Receptacle", "Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12"), &o);
         assert_eq!(j["status"], "assign");
+        let mut written = line(&["J1"], "USB_C_Receptacle", "Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12");
+        written.lcsc = Some(("LCSC".into(), "C165948".into()));
+        assert_eq!(d(&written, &o)["status"], "ok", "an explicit choice already written is not re-assigned");
     }
 }

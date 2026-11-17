@@ -503,3 +503,56 @@ The fable reviewer critiqued the fix plan before coding. Its refinements are mar
   - a clean SES wire is accepted.
 
   While I wrote the test, the gate also refused two "clean" wires I had chosen badly: one into Y1's GND pad, and one straight across it. Both were real shorts.
+
+## Pass 10: fixes found by building the STM32 demo board (step 5)
+
+The STM32F072 + Feather nRF52840 USB-C board (`~/Projects/kicad/stm32_demo/build.py`) was built end to end through these tools. A fable subagent reviewed the circuit and layout. Every fix below came from a real failure on that board.
+
+**Design intent:**
+- **New projects:** `apply_design_intent` failed on a project from `create_project` (no `net_settings`). It now starts from KiCad 10's defaults.
+- **Planned planes:** the intent has `plane_layers`, so impedance rules can be made before the pours are drawn. Before this, no layer had a reference plane, and the pair got no rules at all.
+- **Plane-only boards:** current widths only use the inner-layer width when an inner layer can carry tracks. A board with both inner layers as planes was getting a 0.6 mm net class for 0.5 A.
+- **Net names:** `check_design_intent` fails intent nets that aren't on the board (`net_on_board`) and hints at a missing `/` sheet prefix. The demo's `USB_D_P` was really `/USB_D_P`, so its rules would have matched nothing. `set_design_intent` gained `remove_nets`.
+- **Pair coupling:** it now unions every parallel partner segment, not only the best one. Partners further than 3 dielectric heights away count as uncoupled, which is where the coupled-line fit ends.
+  - The demo's length-matching bump had read as a 112 Ω out-of-tolerance section.
+  - The straight run beside two partner segments had read as 11.6 mm uncoupled.
+  - It now measures 90.6 Ω over 17.5 mm.
+
+**Routing:**
+- **Atomic pairs:** `route_path` takes `routes`, several nets in one undo step and one DRC gate. Routing half a differential pair failed its own skew rule (KiCad: 22.4 mm vs 0 mm), so the gate rolled each half back.
+- **Edge clearance:** the Specctra export now carries the copper-to-edge clearance as keep-out bands, one per outline edge on each signal layer.
+  - Freerouting had kept only the 0.2 mm net-class clearance from the edge, and the gate refused its 0.24 mm tracks against JLCPCB's 0.3 mm rule.
+  - A closed keep-out path is read as the whole board, which left nothing routed, so the band is drawn as separate edges.
+
+**Checkpoints:**
+- The list took the saved `<id>.intent.json` sidecar for a checkpoint, and `diff_board` failed on it.
+- A restore failed when any saved file was unchanged, because the journal refuses no-op transitions. Unchanged files are now skipped.
+- The restore test missed both bugs, so it now includes an intent file.
+
+**Ordering:**
+- **CPL:** the JLCPCB CPL leaves out footprints excluded from the BOM (fiducials). They broke the BOM/CPL designator cross-check.
+- **LCSC:** `assign_lcsc_parts` reports an explicit choice that is already written as `ok`.
+
+**Demo result:**
+- **Schematic and parts:** ERC 0/0; 40 parts. The MCU changed to STM32F072C8T6 (C80488), because the CBT6 (C81720) shows 0 stock in the 2026-11-16 database.
+- **Placement:** score 85 (pass); the one deduction is the Feather socket away from the edge, which is intended. All 14 ties are met.
+- **USB pair:**
+  - Routed by hand with `route_path`: 0.3/0.2 mm, length-matched to 22.431 mm each, 0 skew, no vias.
+  - The channel swap on the USBLC6, suggested by the fable review, removed the crossing.
+- **Rest of the board:** 49 pads fanned out to the planes; Freerouting did the rest through the identity gate.
+- **DRC:** 0 errors, 0 unconnected, pours refilled.
+- **Intent checks:** 27/27 pass:
+  - Impedance 90.6 Ω.
+  - +5V drop 86 mV against a 100 mV limit.
+  - Widths and lengths.
+- **JLCPCB package:**
+  - Complete: 24 BOM lines and 37 placements.
+  - The five hand-fitted connectors are listed in `allow_unsourced`.
+  - Five Extended parts: J1, U1, U2, U3, F1.
+- **Iterations:** reaching that took three routing passes. Twice Freerouting reported COMPLETED with 3 nets unrouted around the MCU. Moving C8 out of PF0/PF1/NRST's escape, C6 past C5, and the SWD header beside the MCU cleared it.
+
+**Not fixed:**
+- `route_specctra_dsn` still says COMPLETED when nets are unrouted.
+- `update_pcb_from_schematic` doesn't copy custom fields (LCSC, MPN) to footprints: 37 DRC parity warnings. The BOM is built from the schematic, so the order is unaffected.
+- There is no keep-out area tool. The antenna keep-out was done by stopping the plane pours.
+- Footprint reference text is 0.12 mm thick, under JLCPCB's 0.15 mm guideline (47 DRC warnings).

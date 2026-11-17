@@ -39,6 +39,11 @@ pub struct DesignIntent {
     pub schema: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stackup: Option<Stackup>,
+    /// Copper layers planned as reference planes (e.g. `In1.Cu`), so the
+    /// impedance rules can be made before the plane pours are drawn. Layers
+    /// holding a pour of a `plane` net count as well.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plane_layers: Vec<String>,
     #[serde(default)]
     pub nets: BTreeMap<String, NetIntent>,
     #[serde(default)]
@@ -294,6 +299,7 @@ fn plane_layers(tree: &SexpNode, intent: &DesignIntent) -> BTreeSet<String> {
         .filter(|z| z.net.as_deref().is_some_and(|n| plane_nets.contains(n)))
         .flat_map(|z| z.layers.iter().filter(|l| l.ends_with(".Cu")).cloned())
         .collect();
+    layers.extend(intent.plane_layers.iter().cloned());
     if layers.is_empty() {
         layers = zones
             .iter()
@@ -316,8 +322,13 @@ fn stack_and_planes(intent: &DesignIntent, board: Option<&SexpNode>) -> (LayerSt
         None => {
             let names: Vec<String> = ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"].iter().map(|s| s.to_string()).collect();
             let stack = LayerStack::from_intent(intent.stackup(), &names, 1.6);
-            let planes: BTreeSet<String> = ["In1.Cu".to_string(), "In2.Cu".to_string()].into();
-            (stack, planes, "no board read: assumed 4 layers, 1.6 mm, planes on In1/In2".to_string())
+            let planes: BTreeSet<String> = if intent.plane_layers.is_empty() {
+                ["In1.Cu".to_string(), "In2.Cu".to_string()].into()
+            } else {
+                intent.plane_layers.iter().cloned().collect()
+            };
+            let note = format!("no board read: assumed 4 layers, 1.6 mm, planes on {planes:?}");
+            (stack, planes, note)
         }
     }
 }
@@ -331,7 +342,9 @@ fn requirements_on(intent: &DesignIntent, board: Option<&SexpNode>) -> Vec<NetRe
     let (layers, planes, stack_note) = stack_and_planes(intent, board);
     let outer_oz = layers.copper.first().map_or(intent.stackup().outer_copper_oz, |c| c.1 / eecalc::MM_PER_OZ);
     let inner_oz = if layers.copper.len() > 2 { layers.copper[1].1 / eecalc::MM_PER_OZ } else { intent.stackup().inner_copper_oz };
-    let has_inner = layers.copper.len() > 2;
+    // Only inner layers that can carry tracks need the inner-layer width:
+    // a board whose inner layers are all planes routes power on the outside.
+    let has_inner = layers.copper.iter().skip(1).take(layers.copper.len().saturating_sub(2)).any(|(l, _)| !planes.contains(l));
     let mut out = Vec::new();
     for (net, n) in &intent.nets {
         let mut r = NetRequirement {
@@ -584,7 +597,30 @@ fn managed_rule_names(content: &str, prefix: &str) -> Vec<String> {
 /// width or pair geometry, cloned from `Default` so every field KiCad expects
 /// is present, plus an exact-name `netclass_patterns` entry. Stale
 /// `intent_*` classes and patterns are removed.
+/// `net_settings` as KiCad 10.0 writes it for a new project.
+fn kicad_default_net_settings() -> Value {
+    json!({
+        "classes": [{
+            "bus_width": 12, "clearance": 0.2, "diff_pair_gap": 0.25, "diff_pair_via_gap": 0.25,
+            "diff_pair_width": 0.2, "line_style": 0, "microvia_diameter": 0.3, "microvia_drill": 0.1,
+            "name": "Default", "pcb_color": "rgba(0, 0, 0, 0.000)", "priority": 2147483647,
+            "schematic_color": "rgba(0, 0, 0, 0.000)", "track_width": 0.2, "tuning_profile": "",
+            "via_diameter": 0.6, "via_drill": 0.3, "wire_width": 6
+        }],
+        "meta": { "version": 5 },
+        "net_colors": {},
+        "netclass_assignments": {},
+        "netclass_patterns": []
+    })
+}
+
 fn merge_netclasses(project: &mut Value, intent: &DesignIntent, reqs: &[NetRequirement]) -> anyhow::Result<Vec<String>> {
+    // A project made by `create_project` (or never opened in KiCad) has no
+    // net settings yet: start from KiCad 10's own defaults.
+    let root = project.as_object_mut().context("project file is not a JSON object")?;
+    if !root.get("net_settings").is_some_and(Value::is_object) {
+        root.insert("net_settings".to_string(), kicad_default_net_settings());
+    }
     let settings = project
         .get_mut("net_settings")
         .and_then(Value::as_object_mut)
@@ -905,17 +941,21 @@ impl ImpedanceProfile {
     }
 }
 
-/// The partner segment running beside `(a, b)` on the same layer: parallel
-/// within 5° and overlapping in projection. Returns (edge-to-edge gap,
-/// overlap length).
-fn coupled_gap(a: (f64, f64), b: (f64, f64), w: f64, layer: &str, partner: &NetCopper) -> Option<(f64, f64)> {
+/// How the partner net runs beside `(a, b)` on the same layer: the
+/// edge-to-edge gap (length-weighted) and the length of `(a, b)` that has a
+/// partner alongside. Partner segments must be parallel within 5°, overlap in
+/// projection, and lie within `max_gap` — beyond about three dielectric
+/// heights the lines barely couple and the coupled-line fit no longer holds.
+/// Overlaps from several partner segments (either side of a length-matching
+/// bump) add up; overlapping intervals count once.
+fn coupled_gap(a: (f64, f64), b: (f64, f64), w: f64, layer: &str, partner: &NetCopper, max_gap: f64) -> Option<(f64, f64)> {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let len = dx.hypot(dy);
     if len < 1e-6 {
         return None;
     }
     let (ux, uy) = (dx / len, dy / len);
-    let mut best: Option<(f64, f64)> = None;
+    let mut spans: Vec<(f64, f64, f64)> = Vec::new(); // (from, to, gap) along (a, b)
     for (p, q, pw, pl) in &partner.segments {
         if pl != layer {
             continue;
@@ -926,19 +966,43 @@ fn coupled_gap(a: (f64, f64), b: (f64, f64), w: f64, layer: &str, partner: &NetC
             continue;
         }
         let along = |pt: (f64, f64)| (pt.0 - a.0) * ux + (pt.1 - a.1) * uy;
-        let (s0, s1) = { let (x, y) = (along(*p), along(*q)); (x.min(y), x.max(y)) };
-        let overlap = s1.min(len) - s0.max(0.0);
-        if overlap <= 1e-6 {
+        let (s0, s1) = { let (x, y) = (along(*p), along(*q)); (x.min(y).max(0.0), x.max(y).min(len)) };
+        if s1 - s0 <= 1e-6 {
             continue;
         }
         let mid = ((p.0 + q.0) / 2.0, (p.1 + q.1) / 2.0);
         let distance = ((mid.0 - a.0) * uy - (mid.1 - a.1) * ux).abs();
         let gap = distance - (w + pw) / 2.0;
-        if gap > 0.0 && best.is_none_or(|(g, _)| gap < g) {
-            best = Some((gap, overlap));
+        if gap > 0.0 && gap <= max_gap {
+            spans.push((s0, s1, gap));
         }
     }
-    best
+    if spans.is_empty() {
+        return None;
+    }
+    // Union of the intervals, keeping the nearest partner where they overlap.
+    spans.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut covered = 0.0;
+    let mut weighted = 0.0;
+    let mut reach = 0.0_f64;
+    for (s0, s1, gap) in &spans {
+        let start = s0.max(reach);
+        if *s1 > start {
+            covered += s1 - start;
+            weighted += (s1 - start) * gap;
+            reach = *s1;
+        }
+    }
+    (covered > 1e-6).then(|| (weighted / covered, covered))
+}
+
+/// The dielectric height that scales coupling: to the plane for a
+/// microstrip, to the nearer plane for a stripline.
+fn model_height(model: &crate::tools::layer_stack::LineModel) -> f64 {
+    match *model {
+        crate::tools::layer_stack::LineModel::Microstrip { h_mm, .. } => h_mm,
+        crate::tools::layer_stack::LineModel::Stripline { h1_mm, h2_mm, .. } => h1_mm.min(h2_mm),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -987,7 +1051,7 @@ fn impedance_profile(
             continue;
         }
         let (gap, modelled_len) = match partner {
-            Some(other) => match coupled_gap(*a, *b, *w, layer, other) {
+            Some(other) => match coupled_gap(*a, *b, *w, layer, other, 3.0 * model_height(&model)) {
                 Some((g, overlap)) => {
                     p.uncoupled_mm += (len - overlap).max(0.0);
                     p.gap_min_mm = Some(p.gap_min_mm.map_or(g, |m: f64| m.min(g)));
@@ -1064,6 +1128,27 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
         });
     }
 
+    // An intent net the board does not have is a typo or a missing sheet
+    // prefix: KiCad names local nets `/NAME`. Its rules would never match.
+    let board_nets: BTreeSet<String> = konnect_sexp::net::collect_net_keys(tree).into_iter().collect();
+    for net in intent.nets.keys() {
+        if !board_nets.is_empty() && !board_nets.contains(net) {
+            let hint = [format!("/{net}"), net.trim_start_matches('/').to_string()]
+                .into_iter()
+                .find(|candidate| candidate != net && board_nets.contains(candidate));
+            checks.push(Check {
+                kind: "net_on_board",
+                subject: net.clone(),
+                status: "fail",
+                measured: Value::Null,
+                required: json!({"exists": true}),
+                detail: match hint {
+                    Some(h) => format!("no net '{net}' on the board; did you mean '{h}'? (KiCad names local nets with the sheet path)"),
+                    None => format!("no net '{net}' on the board; its rules and checks match nothing"),
+                },
+            });
+        }
+    }
     for r in &reqs {
         let n = &intent.nets[&r.net];
         let net_copper = copper.get(&r.net).unwrap_or(&empty);
@@ -1519,6 +1604,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "required": ["part", "to", "max_mm"],
                         "additionalProperties": false
                     } },
+                    "remove_nets": { "type": "array", "items": { "type": "string" }, "description": "Net names to delete from the intent" },
                     "remove_ties": { "type": "array", "description": "[{part, to, pin}] to delete", "items": {
                         "type": "object",
                         "properties": { "part": { "type": "string" }, "to": { "type": "string" }, "pin": { "type": "string" } },
@@ -1535,6 +1621,7 @@ pub fn tools() -> Vec<ToolDef> {
                         },
                         "additionalProperties": false
                     },
+                    "plane_layers": { "type": "array", "items": { "type": "string" }, "description": "Copper layers planned as reference planes, e.g. [\"In1.Cu\", \"In2.Cu\"], before their pours exist" },
                     "notes": { "type": "array", "items": { "type": "string" } }
                 },
                 "required": ["project"]
@@ -1752,6 +1839,11 @@ fn handle_set_design_intent(args: &Value) -> anyhow::Result<CallToolResult> {
         }
     }
     let key = |t: &Tie| (t.part.clone(), t.to.clone(), t.pin.clone());
+    if let Some(remove) = args["remove_nets"].as_array() {
+        for net in remove.iter().filter_map(Value::as_str) {
+            intent.nets.remove(net);
+        }
+    }
     if let Some(remove) = args["remove_ties"].as_array() {
         for r in remove {
             let part = r["part"].as_str().unwrap_or_default();
@@ -1775,6 +1867,12 @@ fn handle_set_design_intent(args: &Value) -> anyhow::Result<CallToolResult> {
         match serde_json::from_value::<Stackup>(args["stackup"].clone()) {
             Ok(s) => intent.stackup = Some(s),
             Err(e) => return Ok(invalid("stackup", &e.to_string())),
+        }
+    }
+    if let Some(layers) = args["plane_layers"].as_array() {
+        intent.plane_layers = layers.iter().filter_map(|l| l.as_str().map(str::to_string)).collect();
+        if let Some(bad) = intent.plane_layers.iter().find(|l| !l.ends_with(".Cu")) {
+            return Ok(invalid("plane_layers", &format!("'{bad}' is not a copper layer")));
         }
     }
     if let Some(notes) = args["notes"].as_array() {
@@ -2007,6 +2105,18 @@ mod tests {
     }
 
     #[test]
+    fn a_new_project_without_net_settings_gets_kicads_defaults() {
+        let intent = usb_intent();
+        let mut project = json!({ "meta": { "filename": "x.kicad_pro", "version": 1 }, "board": { "design_settings": {} } });
+        let classes = merge_netclasses(&mut project, &intent, &requirements(&intent)).unwrap();
+        assert!(!classes.is_empty());
+        let names: Vec<&str> = project["net_settings"]["classes"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
+        assert_eq!(names[0], "Default");
+        assert!(names.contains(&"intent_USB_D_P"));
+        assert_eq!(project["net_settings"]["meta"]["version"], 5);
+    }
+
+    #[test]
     fn netclasses_are_cloned_from_default_and_patterns_go_first() {
         let mut project = json!({ "net_settings": {
             "classes": [{ "name": "Default", "clearance": 0.2, "track_width": 0.2, "via_diameter": 0.6, "via_drill": 0.3, "wire_width": 6 }],
@@ -2141,6 +2251,12 @@ mod per_layer_tests {
         assert!(rules.contains_key("intent: impedance USB_D_N/USB_D_P F.Cu"));
         assert!(rules.contains_key("intent: impedance USB_D_N/USB_D_P B.Cu"));
         assert!(rules["intent: impedance USB_D_N/USB_D_P F.Cu"].contains("(layer \"F.Cu\")"));
+        // With In2 a signal layer (its +3V3 pour not a plane net), power can
+        // run inside and needs the inner width.
+        let mut signal_in2 = intent();
+        signal_in2.nets.remove("+3V3");
+        let reqs = requirements_on(&signal_in2, Some(&tree));
+        let rules = dru_rules(&signal_in2, &reqs);
         let power = reqs.iter().find(|r| r.net == "+5V").unwrap();
         let (outer, inner) = (power.current_width_mm.unwrap(), power.inner_current_width_mm.unwrap());
         // Inner: half the k and half the copper (0.5 oz) — several times wider.
@@ -2180,13 +2296,58 @@ mod per_layer_tests {
     }
 
     #[test]
-    fn an_inner_run_at_the_outer_width_fails() {
+    fn declared_plane_layers_stand_in_for_pours_and_plane_only_inners_need_no_inner_width() {
+        let mut i = intent();
+        i.plane_layers = vec!["In1.Cu".into(), "In2.Cu".into()];
+        // No zones at all: the declared planes give F.Cu and B.Cu a model.
+        let bare = konnect_sexp::parse_sexp(r#"(kicad_pcb (general (thickness 1.6)) (layers (0 "F.Cu" signal) (4 "In1.Cu" signal) (6 "In2.Cu" signal) (2 "B.Cu" signal)))"#).unwrap();
+        let reqs = requirements_on(&i, Some(&bare));
+        let pair = reqs.iter().find(|r| r.net == "USB_D_P").unwrap();
+        assert_eq!(pair.impedance_widths.len(), 2, "{:?}", pair.warnings);
+        // Both inner layers are planes: power keeps the outer width.
+        let power = reqs.iter().find(|r| r.net == "+5V").unwrap();
+        assert_eq!(power.inner_current_width_mm, None);
+        assert_eq!(power.track_width_mm, power.current_width_mm);
+    }
+
+    #[test]
+    fn a_length_matching_bump_is_uncoupled_not_out_of_tolerance() {
         let tree = board("");
         let reqs = requirements_on(&intent(), Some(&tree));
+        let w = reqs.iter().find(|r| r.net == "USB_D_P").unwrap().impedance_widths[0].opt_mm;
+        let pitch = w + 0.15;
+        // N: one straight run. P: alongside, with a 1.2 mm bump away from N
+        // in the middle (x 10–11.2).
+        let routed = board(&[
+            seg("USB_D_N", "F.Cu", w, (1.0, 10.0), (20.0, 10.0)),
+            seg("USB_D_P", "F.Cu", w, (1.0, 10.0 + pitch), (10.0, 10.0 + pitch)),
+            seg("USB_D_P", "F.Cu", w, (10.0, 10.0 + pitch), (10.0, 11.2 + pitch)),
+            seg("USB_D_P", "F.Cu", w, (10.0, 11.2 + pitch), (11.2, 11.2 + pitch)),
+            seg("USB_D_P", "F.Cu", w, (11.2, 11.2 + pitch), (11.2, 10.0 + pitch)),
+            seg("USB_D_P", "F.Cu", w, (11.2, 10.0 + pitch), (20.0, 10.0 + pitch)),
+        ]
+        .join("\n"));
+        let checks = check_board(&routed, &intent());
+        let n = checks.iter().find(|c| c.kind == "impedance" && c.subject == "USB_D_N").unwrap();
+        // N's single segment has P beside it on both sides of the bump: 17.8 of 19 mm coupled.
+        assert_eq!(n.status, "pass", "{:?}", n.measured);
+        assert!((n.measured["uncoupled_mm"].as_f64().unwrap() - 1.2).abs() < 1e-6, "{:?}", n.measured);
+        let p = checks.iter().find(|c| c.kind == "impedance" && c.subject == "USB_D_P").unwrap();
+        // The bump's far side (1.2 mm away) is uncoupled, not a 1.2 mm-gap pair out of tolerance.
+        assert_eq!(p.status, "pass", "{:?}", p.measured);
+        assert_eq!(p.measured["out_of_tolerance_mm"].as_f64().unwrap(), 0.0, "{:?}", p.measured);
+    }
+
+    #[test]
+    fn an_inner_run_at_the_outer_width_fails() {
+        let mut i = intent();
+        i.nets.remove("+3V3"); // In2 carries signals
+        let tree = board("");
+        let reqs = requirements_on(&i, Some(&tree));
         let outer = reqs.iter().find(|r| r.net == "+5V").unwrap().current_width_mm.unwrap();
-        let ok = check_board(&board(&seg("+5V", "F.Cu", outer, (0.0, 0.0), (5.0, 0.0))), &intent());
+        let ok = check_board(&board(&seg("+5V", "F.Cu", outer, (0.0, 0.0), (5.0, 0.0))), &i);
         assert_eq!(ok.iter().find(|c| c.kind == "track_width").unwrap().status, "pass");
-        let bad = check_board(&board(&seg("+5V", "In1.Cu", outer, (0.0, 0.0), (5.0, 0.0))), &intent());
+        let bad = check_board(&board(&seg("+5V", "In2.Cu", outer, (0.0, 0.0), (5.0, 0.0))), &i);
         let c = bad.iter().find(|c| c.kind == "track_width").unwrap();
         assert_eq!(c.status, "fail");
         assert!((c.measured["undersized_length_mm"].as_f64().unwrap() - 5.0).abs() < 1e-6);
@@ -2233,6 +2394,21 @@ mod voltage_drop_tests {
     fn drop(extra: &str) -> Check {
         let tree = konnect_sexp::parse_sexp(&format!("(kicad_pcb (general (thickness 1.6)) {PADS} {extra})")).unwrap();
         check_board(&tree, &intent()).into_iter().find(|c| c.kind == "voltage_drop").unwrap()
+    }
+
+    #[test]
+    fn an_intent_net_missing_its_sheet_prefix_is_flagged_with_a_hint() {
+        let mut i = intent();
+        i.nets.insert("USB_D_P".into(), NetIntent { role: "signal".into(), ..Default::default() });
+        let tree = konnect_sexp::parse_sexp(&format!(
+            "(kicad_pcb (general (thickness 1.6)) {PADS} (segment (start 0 5) (end 5 5) (width 0.2) (layer \"F.Cu\") (net \"/USB_D_P\")))"
+        ))
+        .unwrap();
+        let checks = check_board(&tree, &i);
+        let missing = checks.iter().find(|c| c.kind == "net_on_board").unwrap();
+        assert_eq!(missing.subject, "USB_D_P");
+        assert!(missing.detail.contains("did you mean '/USB_D_P'"), "{}", missing.detail);
+        assert!(!checks.iter().any(|c| c.kind == "net_on_board" && c.subject == "+5V"));
     }
 
     #[test]
@@ -2420,6 +2596,8 @@ mod drc_oracle {
         let mut intent = DesignIntent { schema: 1, ..Default::default() };
         intent.nets.insert("A".into(), NetIntent { role: "signal".into(), impedance_ohm: Some(50.0), ..Default::default() });
         intent.nets.insert("+5V".into(), NetIntent { role: "power".into(), current_a: Some(1.0), ..Default::default() });
+        // In1 is the plane; In2 carries signals, so power needs an inner width.
+        intent.plane_layers = vec!["In1.Cu".into()];
         let reqs = requirements_on(&intent, None);
         let a = reqs.iter().find(|r| r.net == "A").unwrap();
         let f = a.impedance_widths.iter().find(|w| w.layer == "F.Cu").unwrap();
