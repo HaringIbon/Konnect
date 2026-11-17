@@ -99,7 +99,7 @@ and Windows servers do not.
 | `list_schematic_components` | List all symbol instances with positions, values, footprints, and properties. |
 | `move_schematic_component` | Move the lowest-numbered unit to a new position and translate every other unit by the same delta. Does NOT adjust connected wires. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
 | `rotate_schematic_component` | Set the lowest-numbered unit's absolute rotation and rotate every other unit by the same delta. Does NOT adjust connected wires; junction dots are re-judged where the pins turned, and a no-connect flag travels with the pin it protects. |
-| `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
+| `move_connected` | **Not implemented:** always refuses, naming `move_schematic_component` (moves the symbol only, wires stay) as the working alternative. |
 | `move_region` | Move all symbols within a bounding box by a given offset. |
 | `annotate_schematic` | Number `?` designators the way eeschema's Tools → Annotate does (first free number in the project, ascending X per sheet instance, numbers reserved across every instance in the file, both places written). The units of one multi-unit part share one designator. Separate parts sharing a designator are reported as `unresolved` with a `partial` outcome, or renumbered with `resolve_duplicates`; a shared designator that could be a package is never renumbered. Annotates one project's instance records (`project`, default the schematic's owner). Konnect's own implementation; kicad-cli has no annotate command. |
 | `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on every placed unit, accounting for rotation/mirroring, plus each pin's `orientation_degrees` and `length_mm`. |
@@ -459,7 +459,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 |------|-------------|
 | `search_templates` | Search the reference circuit template library. Returns matches for common subcircuits; templates have verified component values. |
 | `get_template` | Get full details for a template: components, connections, design notes. Use the template ID from `search_templates`. |
-| `apply_template` | Instantiate a template into the current schematic. Places all components and wires per the connection map; `net_mappings` re-binds template nets to project nets. |
+| `apply_template` | Instantiate a template into the current schematic. Places all components in a column; it does **not** draw wires. Returns the template's connections rewritten to the placed references, to wire with `connect_to_net` / `connect_pins`; `net_mappings` renames template nets in that list. |
 | `list_template_categories` | List all available template categories and the number of templates in each. |
 
 **Built-in templates** (loaded by `load_all_templates` in `templates.rs`):

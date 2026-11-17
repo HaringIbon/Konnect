@@ -147,6 +147,12 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
         bail!("KiCad IPC snapshot root is not 'kicad_pcb'");
     }
     let (dsn, removed_planes) = strip_planes(raw_dsn)?;
+    let plane_layers = removed_planes
+        .iter()
+        .filter(|plane| plane.layer.starts_with("In"))
+        .map(|plane| plane.layer.clone())
+        .collect::<BTreeSet<_>>();
+    let dsn = retype_as_power(&dsn, &plane_layers)?;
     let left_to_planes = fully_fanned_plane_nets(&board, &removed_planes);
     let dsn = drop_nets(&dsn, &left_to_planes)?;
     // Not `validate_dsn_syntax`: Topola's reader rejects KiCad's own image
@@ -487,16 +493,9 @@ fn fully_fanned_plane_nets(board: &SexpNode, planes: &[RemovedPlane]) -> Vec<Str
         .collect::<BTreeSet<_>>();
     nets.into_iter()
         .filter(|net| {
-            let plan = crate::tools::fanout::plan(
-                board,
-                std::slice::from_ref(net),
-                &crate::tools::fanout::FanoutOptions::default(),
-            );
-            plan.fanouts.is_empty()
-                && plan
-                    .skipped
-                    .iter()
-                    .all(|skip| skip.reason.starts_with("already connected"))
+            let defaults = |_: &str| crate::tools::fanout::FanoutOptions::default();
+            crate::tools::fanout::plan(board, std::slice::from_ref(net), &defaults)
+                .all_pads_reach_planes()
         })
         .collect()
 }
@@ -534,7 +533,8 @@ fn drop_nets(dsn: &str, nets: &[String]) -> Result<String> {
         let keep_prefix = |out: &mut String| out.push_str(rest[..start].trim_end_matches([' ', '\t']));
         match tag {
             "(net " => {
-                let name = form[5..].split(|c: char| c.is_whitespace() || c == ')').next().unwrap_or("");
+                let first = dsn_tokens(&form[5..]);
+                let name = first.first().map(String::as_str).unwrap_or("");
                 // `(net NAME (pins …))` in the network; `(net NAME)` inside a
                 // wire or via is handled with its parent below.
                 if names.contains(name) && form.contains("(pins") {
@@ -546,11 +546,12 @@ fn drop_nets(dsn: &str, nets: &[String]) -> Result<String> {
             "(class " => {
                 let body_end = form.find("(circuit").or_else(|| form.find("(rule")).unwrap_or(form.len() - 1);
                 let head = &form[..body_end];
-                let mut tokens = head.split_whitespace();
-                let class_tag = tokens.next().unwrap_or("(class");
-                let class_name = tokens.next().unwrap_or("");
-                let kept = tokens.filter(|token| !names.contains(*token)).collect::<Vec<_>>();
-                if kept.len() != head.split_whitespace().count() - 2 {
+                let all = dsn_tokens(&head[1..]);
+                let class_tag = "(class";
+                let class_name = all.get(1).cloned().unwrap_or_default();
+                let members = all.iter().skip(2).cloned().collect::<Vec<_>>();
+                let kept = members.iter().filter(|token| !names.contains(*token)).cloned().collect::<Vec<_>>();
+                if kept.len() != members.len() {
                     if kept.is_empty() {
                         keep_prefix(&mut out);
                         rest = rest[end..].strip_prefix('\n').unwrap_or(&rest[end..]);
@@ -642,6 +643,48 @@ fn keep_copper_as_obstacles(dsn: &str, wiring: &[String]) -> Result<String> {
     let close = start + balanced_len(&dsn[start..]).context("unbalanced DSN structure")? - 1;
     let insert_at = dsn[..close].trim_end_matches([' ', '\t']).len();
     Ok(format!("{}{}{}", &dsn[..insert_at], keepouts, &dsn[insert_at..]))
+}
+
+/// Whitespace-separated atoms up to the first `(` or `)` outside quotes;
+/// a quoted atom keeps its quotes (`"GND A"`), as DSN names are written.
+fn dsn_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in text.chars() {
+        match ch {
+            '"' => {
+                current.push(ch);
+                quoted = !quoted;
+            }
+            c if !quoted && (c == '(' || c == ')') => break,
+            c if !quoted && c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Mark these layers `power` in the DSN, so Freerouting does not route on
+/// them whatever KiCad typed them. An inner layer carrying a copper zone is a
+/// plane on this board even when its type is `signal` (the default for a
+/// layer `add_layer` creates).
+fn retype_as_power(dsn: &str, layers: &BTreeSet<String>) -> Result<String> {
+    let mut out = dsn.to_string();
+    for layer in layers {
+        let Some(start) = out.find(&format!("(layer {layer}")) else { continue };
+        let end = start + balanced_len(&out[start..]).context("unbalanced DSN layer")?;
+        let form = out[start..end].replace("(type signal)", "(type power)").replace("(type mixed)", "(type power)");
+        out.replace_range(start..end, &form);
+    }
+    Ok(out)
 }
 
 /// Length of the parenthesised form at the start of `text`, honouring quotes.
@@ -775,6 +818,25 @@ mod tests {
     }
 
     #[test]
+    fn names_with_spaces_or_brackets_are_dropped_whole() {
+        let dsn = "(pcb x\n  (structure\n    (layer F.Cu (type signal))\n  )\n  (network\n    (net \"GND A\"\n      (pins U1-1)\n    )\n    (net \"GND(A)\"\n      (pins U1-2)\n    )\n    (net SDA\n      (pins U1-3)\n    )\n    (class Power \"GND A\" \"GND(A)\" SDA\n      (circuit (use_via V))\n    )\n  )\n  (wiring\n  )\n)\n";
+        let out = drop_nets(dsn, &["GND A".to_string(), "GND(A)".to_string()]).unwrap();
+        let root = super::super::parse_dsn_sexp(&out).unwrap();
+        let network = root.find("network").unwrap();
+        assert_eq!(network.find_all("net").len(), 1, "{out}");
+        assert!(!out.contains("GND"), "{out}");
+        assert!(out.contains("(class Power SDA"), "{out}");
+    }
+
+    #[test]
+    fn inner_layers_with_planes_become_power_layers() {
+        let dsn = "(pcb x\n  (structure\n    (layer F.Cu\n      (type signal)\n    )\n    (layer In1.Cu\n      (type signal)\n    )\n  )\n)\n";
+        let out = retype_as_power(dsn, &["In1.Cu".to_string()].into_iter().collect()).unwrap();
+        assert!(out.contains("(layer In1.Cu\n      (type power)"), "{out}");
+        assert!(out.contains("(layer F.Cu\n      (type signal)"), "{out}");
+    }
+
+    #[test]
     fn planes_are_removed_and_reported() {
         let dsn = "(pcb x\n  (structure\n    (layer F.Cu)\n    (plane GND (polygon In1.Cu 0  1 2  3 4))\n    (plane \"+3V3\" (polygon In2.Cu 0  1 2  3 4))\n    (via V)\n  )\n)\n";
         let (out, removed) = strip_planes(dsn).unwrap();
@@ -872,6 +934,23 @@ mod round_trip_tests {
             crate::specctra_ses::parse_import_plan(&path, BOARD, &export.bundle.manifest, &cut)
                 .unwrap_err();
         assert!(format!("{error:#}").contains("plane layer"), "{error:#}");
+    }
+
+    /// The second regression board types its inner planes `signal`; they must
+    /// still be treated as planes.
+    #[test]
+    fn inner_planes_typed_signal_become_unroutable_plane_layers() {
+        const BOARD2: &str = include_str!("../../tests/fixtures/fanout_regress2.kicad_pcb");
+        const DSN2: &str = include_str!("../../tests/fixtures/fanout_regress2.dsn");
+        assert!(DSN2.contains("(layer In1.Cu\n      (type signal)"), "fixture premise");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("regress2.kicad_pcb");
+        std::fs::write(&path, BOARD2).unwrap();
+        let export = super::lower(&path, BOARD2, DSN2).unwrap();
+        assert_eq!(export.power_layers, vec!["In1.Cu", "In2.Cu"]);
+        assert!(export.bundle.dsn.contains("(layer In1.Cu\n      (type power)"));
+        let manifest: serde_json::Value = serde_json::from_str(&export.bundle.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["plane_layers"], serde_json::json!(["In1.Cu", "In2.Cu"]));
     }
 
     #[test]

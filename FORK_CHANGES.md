@@ -256,3 +256,58 @@ Two new tools in `pcb_routing`, both live-only (KiCad IPC), each one undoable co
 - After import and zone refill, DRC shows **0 errors and 0 unconnected items**, with the board's usual 13 warnings.
 
 **Counts:** the tool count is now 230 (237 with meta-tools). The registry, `tool-directory.md`, README, DEV, TROUBLESHOOTING and the plugin/packaging metadata are updated.
+
+## Pass 5: fixes from the independent review
+
+An independent review (fable model) of passes 1–4 reproduced three high-severity and several medium defects with probe tests. All are fixed here.
+
+**Autorouting, high severity:**
+- **Signal traces could be routed through a plane.** The plane guard keyed only on KiCad's layer *type*, and `add_layer` creates `signal` layers. Now any inner layer carrying a copper zone is a plane: it is retyped `power` in the DSN (Freerouting does not route on it), and it is listed in the manifest's `plane_layers`, where the importer refuses copper on it.
+- **`apply_specctra_ses` committed routes that shorted nets and still reported success.**
+  - It now runs KiCad's DRC on the board both before and after, with the project's own `.kicad_pro`/`.kicad_dru`. The candidate was previously checked as a bare file against KiCad's defaults.
+  - Any DRC error the import adds rolls the whole import back.
+  - The report separates `errors`, `errors_before_import`, `warnings` and `unconnected_items`. `clean` now means no errors and nothing unconnected; before, it counted warnings and so was always false.
+- **A net could be left to its plane without reaching it.** "Already connected" accepted any same-net track ending on a pad. Now a pad counts only when it reaches, through same-net tracks, a via that lies inside the net's inner-layer zone. Every planned via must also land inside that zone, so split and partial planes are handled.
+
+**Fan-out geometry, medium:**
+- **Outline:** inside/outside and edge distance come from the real Edge.Cuts lines, arcs, rectangles, circles and polygons. Before, the bounding box let a via land outside an L-shaped board.
+- **Obstacles:**
+  - Routed arcs are obstacles.
+  - Keep-out rule areas, board-level and footprint-embedded, are respected for the whole via circle (`vias not_allowed`) and the stub (`tracks not_allowed`).
+  - Pads are their true rotated rectangles, not axis-aligned boxes. This unblocked 45° QFN pins.
+  - Copper-less pads (exposed-pad paste windows) are not obstacles.
+- **Large pads:** a pad whose smaller side is at least 2 mm (an exposed pad or a regulator tab) gets a grid of up to 3 × 3 vias inside the pad, laid out in the pad's own rotated frame.
+- **Fine pitch:**
+  - A pin with no clear via site can tie with a pin-width stub to a same-net large pad of the same part that has vias (QFN ground pins to the exposed pad).
+  - Clearance comparisons allow 1e-6 mm, so 0.5 mm-pitch stubs at exactly the clearance pass.
+- **Sizes:** stub width and via size and drill come from each net's net class in the `.kicad_pro` (`netclass_patterns` with `*`/`?`, falling back to `Default`). Explicit arguments still override.
+- **`fanout_to_plane` response:** each fan-out reports `in_pad`, `via` (false for a tie) and its sizes.
+
+**Other:**
+- **DSN net names:** names with spaces or brackets (`"GND A"`, `"GND(A)"`) are tokenised with their quotes when nets are dropped. They used to leave the `(net …)` behind.
+- **Freerouting ports:** the API/MCP HTTP servers get a free loopback port per run, so concurrent jobs no longer collide on fixed ports and no other process can sit on a well-known one.
+- **Tool directory:** corrected the stale `apply_template` (it does not wire) and `move_connected` (not implemented) entries.
+- **Test flakiness:** the review saw 3 parallel-run failures in a scratch copy of the repo. Three full runs here passed cleanly, so it is most likely the shared build directory documented in the fork notes.
+
+**Second regression board:** `tests/fixtures/fanout_regress2.*`, built by `poc/regress2/build_regress2.py`. It has:
+- an L-shaped outline with an arc corner;
+- inner planes typed `signal`;
+- an LQFP-48 at 0.5 mm pitch;
+- a QFN-32 at 45° with an exposed pad;
+- back-side 0603 capacitors;
+- an ESP-12E with a footprint antenna keep-out;
+- a board-level keep-out.
+
+Its tests check every planned via independently: on the board, on its plane, out of keep-outs, and clear of every other net's pads and vias. On that board, all 37 SMD power pads plan (9 in-pad, 2 ties, 0 skipped).
+
+**Live verification** (`poc/autoroute_check.py`: fan-out → export → `route_specctra_dsn` with Freerouting 2.3.0 → plan → apply → refill → DRC, all through tool calls):
+
+| Board | Fan-out | Import | Final DRC |
+|---|---|---|---|
+| 4-layer PoC (`frcheck`) | 43 pads (3 in-pad on the SOT-223 tab), 0 skipped, no new DRC errors | `clean: true`, 0 errors, 13 warnings | **0 errors, 0 unconnected**; 8/8 checks |
+| Regression board 2 | 37 pads (9 in-pad on the 45° QFN exposed pad, 2 ties), 0 skipped, no new DRC errors | 0 errors (gate passed), 1 unconnected | 0 errors, **1 unconnected** (SIG6, LQFP → rotated QFN) |
+
+**Open:**
+- On the regression board Freerouting left one signal net unrouted with `max_passes` 20.
+- `route_specctra_dsn` still reports `COMPLETED` in that case, because Freerouting's job details give no unrouted count.
+- The import does report `unconnected_items: 1` and `clean: false`, so the gap is visible, but the router tool itself should surface it.

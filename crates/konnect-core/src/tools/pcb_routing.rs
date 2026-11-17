@@ -699,26 +699,110 @@ async fn handle_lock_routing(
     }
 }
 
+/// Per-net fan-out sizes from the project's net classes: the class a net's
+/// `netclass_patterns` entry names, with any missing value taken from
+/// `Default`, then the built-in defaults. A board with no readable project
+/// gets the built-in defaults for every net.
+fn netclass_fanout_options(
+    board: &Path,
+) -> impl Fn(&str) -> crate::tools::fanout::FanoutOptions + Send + 'static {
+    use crate::tools::fanout::FanoutOptions;
+    let settings = std::fs::read_to_string(board.with_extension("kicad_pro"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .map(|project| project["net_settings"].clone())
+        .unwrap_or(serde_json::Value::Null);
+    let classes: BTreeMap<String, serde_json::Value> = settings["classes"]
+        .as_array()
+        .map(|classes| {
+            classes
+                .iter()
+                .filter_map(|class| Some((class["name"].as_str()?.to_string(), class.clone())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let patterns: Vec<(String, String)> = settings["netclass_patterns"]
+        .as_array()
+        .map(|patterns| {
+            patterns
+                .iter()
+                .filter_map(|p| Some((p["pattern"].as_str()?.to_string(), p["netclass"].as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    move |net: &str| {
+        let defaults = FanoutOptions::default();
+        let class = patterns
+            .iter()
+            .find(|(pattern, _)| glob_matches(pattern, net))
+            .and_then(|(_, class)| classes.get(class));
+        let fallback = classes.get("Default");
+        let value = |key: &str, default: f64| {
+            class
+                .and_then(|c| c[key].as_f64())
+                .or_else(|| fallback.and_then(|c| c[key].as_f64()))
+                .unwrap_or(default)
+        };
+        FanoutOptions {
+            via_size_mm: value("via_diameter", defaults.via_size_mm),
+            via_drill_mm: value("via_drill", defaults.via_drill_mm),
+            track_width_mm: value("track_width", defaults.track_width_mm),
+            clearance_mm: value("clearance", defaults.clearance_mm),
+            ..defaults
+        }
+    }
+}
+
+/// KiCad netclass pattern match: `*` and `?` wildcards, otherwise exact.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    fn go(p: &[u8], n: &[u8]) -> bool {
+        match (p.first(), n.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => go(&p[1..], n) || (!n.is_empty() && go(p, &n[1..])),
+            (Some(b'?'), Some(_)) => go(&p[1..], &n[1..]),
+            (Some(a), Some(b)) if a == b => go(&p[1..], &n[1..]),
+            _ => false,
+        }
+    }
+    go(pattern.as_bytes(), name.as_bytes())
+}
+
 async fn handle_fanout_to_plane(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     use crate::tools::fanout::{plan, plane_nets, FanoutOptions};
     let board = get_path(args, "board")?;
-    let defaults = FanoutOptions::default();
-    let number = |key: &str, default: f64| args[key].as_f64().unwrap_or(default);
-    let options = FanoutOptions {
-        via_size_mm: number("via_size", defaults.via_size_mm),
-        via_drill_mm: number("via_drill", defaults.via_drill_mm),
-        track_width_mm: number("track_width", defaults.track_width_mm),
-        clearance_mm: number("clearance", defaults.clearance_mm),
-        edge_clearance_mm: defaults.edge_clearance_mm,
-        max_stub_mm: number("max_stub", defaults.max_stub_mm),
+    // Sizes come from each net's net class in the .kicad_pro; explicit
+    // arguments override them for every net.
+    let classes = netclass_fanout_options(&board);
+    let overrides = [
+        ("via_size", args["via_size"].as_f64()),
+        ("via_drill", args["via_drill"].as_f64()),
+        ("track_width", args["track_width"].as_f64()),
+        ("clearance", args["clearance"].as_f64()),
+        ("max_stub", args["max_stub"].as_f64()),
+    ];
+    let options_for = move |net: &str| {
+        let mut options = classes(net);
+        for (key, value) in overrides {
+            if let Some(value) = value {
+                match key {
+                    "via_size" => options.via_size_mm = value,
+                    "via_drill" => options.via_drill_mm = value,
+                    "track_width" => options.track_width_mm = value,
+                    "clearance" => options.clearance_mm = value,
+                    _ => options.max_stub_mm = value,
+                }
+            }
+        }
+        options
     };
-    if !(options.via_drill_mm > 0.0 && options.via_size_mm > options.via_drill_mm)
-        || options.track_width_mm <= 0.0
-        || options.clearance_mm < 0.0
-        || options.max_stub_mm <= 0.0
+    let check: FanoutOptions = options_for("");
+    if !(check.via_drill_mm > 0.0 && check.via_size_mm > check.via_drill_mm)
+        || check.track_width_mm <= 0.0
+        || check.clearance_mm < 0.0
+        || check.max_stub_mm <= 0.0
     {
         return Ok(CallToolResult::error_kind(
             ToolErrorKind::InvalidArgument {
@@ -744,7 +828,7 @@ async fn handle_fanout_to_plane(
         if nets.is_empty() {
             anyhow::bail!("no plane nets: the board has no zone on an inner layer; pass `nets`");
         }
-        let fanout = plan(&tree, &nets, &options);
+        let fanout = plan(&tree, &nets, &options_for);
         if dry_run || fanout.fanouts.is_empty() {
             return Ok((fanout, 0usize));
         }
@@ -764,16 +848,18 @@ async fn handle_fanout_to_plane(
                 .get(&item.net)
                 .with_context(|| format!("live board has no net '{}'", item.net))?;
             let mut via = konnect_ipc::builders::build_via(
-                &item.net, code, item.via_x, item.via_y, options.via_drill_mm, options.via_size_mm,
+                &item.net, code, item.via_x, item.via_y, item.via_drill_mm, item.via_size_mm,
             );
             via.locked = locked;
-            let mut stub = konnect_ipc::builders::build_track(
-                &item.net, code, &item.layer, options.track_width_mm,
-                item.pad_x, item.pad_y, item.via_x, item.via_y,
-            );
-            stub.locked = locked;
             items.push(konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via"));
-            items.push(konnect_ipc::builders::pack_any(&stub, "kiapi.board.types.Track"));
+            if !item.in_pad {
+                let mut stub = konnect_ipc::builders::build_track(
+                    &item.net, code, &item.layer, item.track_width_mm,
+                    item.pad_x, item.pad_y, item.via_x, item.via_y,
+                );
+                stub.locked = locked;
+                items.push(konnect_ipc::builders::pack_any(&stub, "kiapi.board.types.Track"));
+            }
         }
         // The plan was made from this exact revision.
         if client.save_document_to_string_in(document.clone())? != snapshot {
@@ -1043,10 +1129,46 @@ struct ApplyEvidence {
     created_count: usize,
     preserved_locked_track_count: usize,
     preserved_locked_via_count: usize,
-    drc_violations: usize,
+    drc_errors: usize,
+    drc_warnings: usize,
+    baseline_drc_errors: usize,
     unconnected_items: usize,
     schematic_parity_violations: usize,
     refill_zones: bool,
+}
+
+/// DRC of `source` with the project's own rules: KiCad reads the
+/// `.kicad_pro` and `.kicad_dru` beside a board, so a bare copy elsewhere is
+/// checked against defaults. Returns the report and the JSON KiCad wrote.
+async fn drc_with_project_rules(
+    cli_path: &str,
+    board: &Path,
+    source: &str,
+    refill_zones: bool,
+) -> anyhow::Result<(cli::DrcReport, String)> {
+    let dir = tempfile::tempdir().context("create DRC directory")?;
+    let stem = board.file_stem().context("board has no file name")?;
+    let copy = dir.path().join(stem).with_extension("kicad_pcb");
+    std::fs::write(&copy, source).context("write board for DRC")?;
+    for extension in ["kicad_pro", "kicad_dru"] {
+        let rules = board.with_extension(extension);
+        if rules.is_file() {
+            std::fs::copy(&rules, copy.with_extension(extension))
+                .with_context(|| format!("copy {} for DRC", rules.display()))?;
+        }
+    }
+    let report = cli::run_drc(cli_path, &copy, refill_zones).await?;
+    let json = std::fs::read_to_string(copy.with_extension("drc.json")).unwrap_or_default();
+    Ok((report, json))
+}
+
+/// Error-severity violations, counted by rule.
+fn drc_errors_by_rule(report: &cli::DrcReport) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for violation in report.violations.iter().filter(|v| v.severity == "error") {
+        *counts.entry(violation.rule.clone()).or_insert(0) += 1;
+    }
+    counts
 }
 
 fn created_route_item_ids(items: &[prost_types::Any]) -> anyhow::Result<Vec<String>> {
@@ -1268,14 +1390,49 @@ async fn handle_apply_specctra_ses(
             let candidate_source = client.save_document_to_string_in(document.clone())?;
             konnect_sexp::write_new_atomic(&candidate_for_ipc, &candidate_source)
                 .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
-            // A board with zones is checked with them refilled: a schema-2
-            // export routes plane nets as ordinary nets, and the planes only
-            // reconnect once the zones are refilled around the new copper.
-            let drc = runtime.block_on(cli::run_drc(
+            // Both DRCs use the project's own rules, and a board with zones is
+            // checked with them refilled: the planes only reconnect once the
+            // zones are refilled around the new copper.
+            let (baseline, _) = runtime.block_on(drc_with_project_rules(
                 &cli_path,
-                &candidate_for_ipc,
+                &board_for_ipc,
+                &before,
                 plan.refill_zones,
             ))?;
+            let (drc, drc_json) = runtime.block_on(drc_with_project_rules(
+                &cli_path,
+                &board_for_ipc,
+                &candidate_source,
+                plan.refill_zones,
+            ))?;
+            std::fs::write(&drc_output_for_ipc, drc_json)
+                .with_context(|| format!("write {}", drc_output_for_ipc.display()))?;
+            // The import may not add a DRC error the board did not already
+            // have (a short through a plane-net via, a clearance violation):
+            // any new error rolls the whole import back.
+            let before_errors = drc_errors_by_rule(&baseline);
+            let after_errors = drc_errors_by_rule(&drc);
+            let added = after_errors
+                .iter()
+                .filter_map(|(rule, &count)| {
+                    let was = before_errors.get(rule).copied().unwrap_or(0);
+                    (count > was).then(|| format!("{} more {rule}", count - was))
+                })
+                .collect::<Vec<_>>();
+            if !added.is_empty() {
+                let examples = drc
+                    .violations
+                    .iter()
+                    .filter(|v| v.severity == "error" && before_errors.get(&v.rule).copied().unwrap_or(0) < after_errors[&v.rule])
+                    .take(3)
+                    .map(|v| v.description.clone())
+                    .collect::<Vec<_>>();
+                anyhow::bail!(
+                    "the routes add DRC errors ({}), e.g. {}; the import was rolled back",
+                    added.join(", "),
+                    examples.join("; ")
+                );
+            }
             let parity_count = drc.schematic_parity.as_ref().map_or(0, Vec::len);
             Ok(ApplyEvidence {
                 source_sha256: plan.source_sha256.clone(),
@@ -1286,7 +1443,9 @@ async fn handle_apply_specctra_ses(
                 created_count: created_ids.len(),
                 preserved_locked_track_count: plan.locked_track_count,
                 preserved_locked_via_count: plan.locked_via_count,
-                drc_violations: drc.violations.len(),
+                drc_errors: after_errors.values().sum(),
+                drc_warnings: drc.violations.iter().filter(|v| v.severity != "error").count(),
+                baseline_drc_errors: before_errors.values().sum(),
                 unconnected_items: drc.unconnected_items.as_ref().map_or(0, Vec::len),
                 schematic_parity_violations: parity_count,
                 refill_zones: plan.refill_zones,
@@ -1351,10 +1510,13 @@ async fn handle_apply_specctra_ses(
             },
             "ipc_readback": "exact_count_match",
             "drc": {
-                "clean": evidence.drc_violations == 0
-                    && evidence.unconnected_items == 0
-                    && evidence.schematic_parity_violations == 0,
-                "violations": evidence.drc_violations,
+                // Errors and unconnected items only: warnings (silkscreen,
+                // library drift) and schematic parity never made this true.
+                "clean": evidence.drc_errors == 0 && evidence.unconnected_items == 0,
+                "errors": evidence.drc_errors,
+                "errors_before_import": evidence.baseline_drc_errors,
+                "warnings": evidence.drc_warnings,
+                "rules": "project .kicad_pro / .kicad_dru",
                 "unconnected_items": evidence.unconnected_items,
                 "schematic_parity_violations": evidence.schematic_parity_violations,
                 "zones_refilled": evidence.refill_zones

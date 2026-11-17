@@ -29,26 +29,37 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SES_BYTES: u64 = 512 * 1024 * 1024;
 
-fn server_arguments() -> &'static [&'static str] {
-    &[
-        "--api_server.enabled=true",
-        "--api_server.authentication.enabled=false",
-        "--api_server-endpoints=http://127.0.0.1:37864",
-        "--mcp_server.enabled=true",
-        "--mcp_server.authentication.enabled=false",
-        "--mcp_server-endpoints=http://127.0.0.1:37964",
-        "--mcp_server.stdio=true",
+/// Launch arguments for one run, with the API and MCP HTTP servers on the
+/// given loopback ports. Konnect talks to Freerouting over stdio; the HTTP
+/// servers only have to exist (the MCP tools call the API), so each run gets
+/// fresh ports: two jobs at once do not collide, and a process already
+/// holding a well-known port never receives the board.
+fn server_arguments(api_port: u16, mcp_port: u16) -> Vec<String> {
+    vec![
+        "--api_server.enabled=true".to_string(),
+        "--api_server.authentication.enabled=false".to_string(),
+        format!("--api_server-endpoints=http://127.0.0.1:{api_port}"),
+        "--mcp_server.enabled=true".to_string(),
+        "--mcp_server.authentication.enabled=false".to_string(),
+        format!("--mcp_server-endpoints=http://127.0.0.1:{mcp_port}"),
+        "--mcp_server.stdio=true".to_string(),
         // Freerouting 2.3.0 (build 2026-08-07) refuses a plain-HTTP endpoint
         // unless allowed ("Can't use the endpoint … because HTTP is not
         // allowed"); its MCP tools then fail with "Internal error" because
         // they call that API. Both endpoints are loopback-only (see test).
-        "--api_server.http_allowed=true",
-        "--mcp_server.http_allowed=true",
+        "--api_server.http_allowed=true".to_string(),
+        "--mcp_server.http_allowed=true".to_string(),
         // It also reports usage to api.freerouting.app by default. This tool
         // promises never to send anything to a cloud service.
-        "--usage_and_diagnostic_data.disable_analytics=true",
-        "--gui.enabled=false",
+        "--usage_and_diagnostic_data.disable_analytics=true".to_string(),
+        "--gui.enabled=false".to_string(),
     ]
+}
+
+/// A loopback port free right now (the OS picks it).
+fn free_loopback_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).context("find a free loopback port")?;
+    Ok(listener.local_addr()?.port())
 }
 
 const REQUIRED_TOOLS: &[&str] = &[
@@ -483,7 +494,7 @@ impl LocalMcpClient {
         command
             .arg("-jar")
             .arg(jar)
-            .args(server_arguments())
+            .args(server_arguments(free_loopback_port()?, free_loopback_port()?))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -845,13 +856,20 @@ mod tests {
     }
 
     #[test]
+    fn each_run_gets_its_own_free_ports() {
+        let (a, b) = (free_loopback_port().unwrap(), free_loopback_port().unwrap());
+        assert!(a > 0 && b > 0);
+    }
+
+    #[test]
     fn unauthenticated_servers_are_forced_to_loopback() {
-        let arguments = server_arguments();
-        assert!(arguments.contains(&"--api_server.authentication.enabled=false"));
-        assert!(arguments.contains(&"--api_server-endpoints=http://127.0.0.1:37864"));
-        assert!(arguments.contains(&"--mcp_server.authentication.enabled=false"));
-        assert!(arguments.contains(&"--mcp_server-endpoints=http://127.0.0.1:37964"));
-        assert!(arguments.contains(&"--usage_and_diagnostic_data.disable_analytics=true"));
+        let arguments = server_arguments(41001, 41002);
+        let has = |flag: &str| arguments.iter().any(|argument| argument == flag);
+        assert!(has("--api_server.authentication.enabled=false"));
+        assert!(has("--api_server-endpoints=http://127.0.0.1:41001"));
+        assert!(has("--mcp_server.authentication.enabled=false"));
+        assert!(has("--mcp_server-endpoints=http://127.0.0.1:41002"));
+        assert!(has("--usage_and_diagnostic_data.disable_analytics=true"));
         assert!(!arguments
             .iter()
             .any(|argument| argument.contains("0.0.0.0")));
