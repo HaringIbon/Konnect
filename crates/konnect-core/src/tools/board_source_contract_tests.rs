@@ -798,12 +798,20 @@ async fn any_other_refusal_of_the_open_document_list_is_not_read_as_no_editor() 
                     "{status:?} {tool} {mode:?} was answered: {}",
                     body_of(&refused)
                 );
+                // AS_NOT_READY is the one transient refusal: dispatch gives it
+                // the more specific `editor_not_ready` (retry hint), keeping
+                // `editor_unavailable` as its original kind. Either way it is
+                // a refusal, never an answer from the file.
+                let expected = if status == Status::AsNotReady { "editor_not_ready" } else { "editor_unavailable" };
                 assert_eq!(
                     kind_of(&refused).as_deref(),
-                    Some("editor_unavailable"),
+                    Some(expected),
                     "{status:?} {tool} {mode:?}: {}",
                     body_of(&refused)
                 );
+                if status == Status::AsNotReady {
+                    assert_eq!(body_of(&refused)["error"]["original_kind"], "editor_unavailable");
+                }
             }
 
             let saved = scene.body(tool, Some("saved")).await;

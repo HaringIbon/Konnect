@@ -286,6 +286,13 @@ impl McpHandler {
         );
 
         let (result, status, error_kind) = self.dispatch_tool(&params.name, &args).await;
+        // One shape for a transient "KiCad not ready yet", whichever tool hit it.
+        let result = crate::mcp::error::normalize_editor_not_ready(result);
+        let error_kind = if result.is_error {
+            crate::mcp::error::extract_error_kind(&result).or(error_kind)
+        } else {
+            error_kind
+        };
 
         let dur_ms = started.elapsed().as_millis() as u64;
         let result_bytes = result_content_bytes(&result);

@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 mod board_extents_tests;
+mod board_history;
 #[cfg(test)]
 mod board_layer_refusal_tests;
 mod board_session;

@@ -40,6 +40,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "integer",
                         "description": "Maximum number of violations to return",
                         "default": 50
+                    },
+                    "detail": {
+                        "type": "string",
+                        "enum": ["full", "summary"],
+                        "default": "full",
+                        "description": "'summary': counts per rule plus one compact example per rule (no item lists) — a few hundred bytes instead of tens of KB; write the full report with 'output'"
                     }
                 },
                 "required": ["board"]
@@ -281,6 +287,36 @@ async fn handle_run_drc(
     let warnings = filtered.iter().filter(|v| v.severity == "warning").count();
     let shown = filtered.len().min(limit);
     let truncated = filtered.len() > limit;
+    // Counts per (severity, rule): the part of the report an agent decides on.
+    let mut by_rule: std::collections::BTreeMap<(String, String), (usize, &str)> =
+        std::collections::BTreeMap::new();
+    for v in &filtered {
+        by_rule
+            .entry((v.severity.clone(), v.rule.clone()))
+            .or_insert((0, v.description.as_str()))
+            .0 += 1;
+    }
+    let by_rule_json: Vec<serde_json::Value> = by_rule
+        .iter()
+        .map(|((severity, rule), (count, example))| {
+            json!({ "severity": severity, "rule": rule, "count": count, "example": example })
+        })
+        .collect();
+    if args["detail"].as_str() == Some("summary") {
+        return Ok(CallToolResult::json(&json!({
+            "detail": "summary",
+            "source": provenance.source,
+            "live_board_synced": provenance.live_board_synced,
+            "zones_refilled": provenance.zones_refilled,
+            "errors": errors,
+            "warnings": warnings,
+            "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
+            "schematic_parity": report.schematic_parity.as_ref().map(Vec::len),
+            "categories_not_reported": report.missing_categories(),
+            "by_rule": by_rule_json,
+            "full_report": args["output"].as_str(),
+        })));
+    }
     let missing = report.missing_categories();
 
     Ok(CallToolResult::text(
@@ -303,6 +339,7 @@ async fn handle_run_drc(
             "filtered_count": filtered.len(),
             "errors": errors,
             "warnings": warnings,
+            "by_rule": by_rule_json,
             "severity_filter": severity_filter,
             "shown": shown,
             "truncated": truncated,

@@ -88,6 +88,15 @@ pub enum ToolErrorKind {
     /// No live editor endpoint is configured or reachable for the requested
     /// semantic operation.
     EditorUnavailable { editor: String, reason: String },
+    /// KiCad is running and reachable but not answering yet (its IPC server
+    /// replies AS_NOT_READY while it starts, loads a board or shows a modal
+    /// dialog). Transient: wait `retry_after_s` and retry the same call.
+    EditorNotReady {
+        retry_after_s: u32,
+        /// The kind the tool itself reported before normalisation.
+        original_kind: String,
+        reason: String,
+    },
     /// The running KiCad version or the bundled stable protocol does not
     /// provide a capability the caller requested.
     UnsupportedCapability {
@@ -165,6 +174,7 @@ impl ToolErrorKind {
             Self::StaleTarget { .. } => "stale_target",
             Self::PlanBlocked { .. } => "plan_blocked",
             Self::EditorUnavailable { .. } => "editor_unavailable",
+            Self::EditorNotReady { .. } => "editor_not_ready",
             Self::UnsupportedCapability { .. } => "unsupported_capability",
             Self::ReadbackMismatch { .. } => "readback_mismatch",
             Self::MutationOutcomeUncertain { .. } => "mutation_outcome_uncertain",
@@ -197,6 +207,43 @@ impl CallToolResult {
     }
 }
 
+/// One shape for "KiCad is not ready yet", whichever tool hit it.
+///
+/// KiCad's `AS_NOT_READY` reached callers as `stale_target`,
+/// `editor_unavailable`, `handler_error` or plain text depending on the tool,
+/// so an agent could not tell a transient start-up wait from a real failure.
+/// Any error result mentioning it becomes `editor_not_ready` with a retry
+/// hint; the original kind and message are kept.
+pub fn normalize_editor_not_ready(result: CallToolResult) -> CallToolResult {
+    if !result.is_error {
+        return result;
+    }
+    let text: String = result
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            ToolContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let not_ready = text.contains("AS_NOT_READY") || text.contains("not ready to reply");
+    let original_kind = extract_error_kind(&result).unwrap_or_else(|| "handler_error".into());
+    if !not_ready || original_kind == "editor_not_ready" {
+        return result;
+    }
+    let message = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v["message"].as_str().map(str::to_string))
+        .unwrap_or(text);
+    CallToolResult::error_kind(
+        ToolErrorKind::EditorNotReady { retry_after_s: 15, original_kind, reason: message.clone() },
+        format!(
+            "KiCad is running but not ready yet (AS_NOT_READY: starting, loading a board or a \
+             modal dialog). Nothing was done; retry this call in about 15 s. ({message})"
+        ),
+    )
+}
+
 /// Extract the `kind` discriminant from a structured error result, if any.
 ///
 /// Returns `None` for success results. Returns `Some("handler_error")` as a
@@ -226,6 +273,24 @@ pub fn extract_error_kind(result: &CallToolResult) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_ready_errors_are_normalised_whatever_shape_they_arrive_in() {
+        for raw in [
+            CallToolResult::error("KiCad IPC error: KiCad is not ready to reply (AS_NOT_READY)"),
+            CallToolResult::error_kind(
+                ToolErrorKind::StaleTarget { target: "board".into(), reason: "AS_NOT_READY".into() },
+                "stale: AS_NOT_READY",
+            ),
+        ] {
+            let n = normalize_editor_not_ready(raw);
+            assert_eq!(extract_error_kind(&n).as_deref(), Some("editor_not_ready"));
+        }
+        let other = CallToolResult::error("file not found");
+        assert_eq!(extract_error_kind(&normalize_editor_not_ready(other)).as_deref(), Some("handler_error"));
+        let ok = CallToolResult::text("AS_NOT_READY appears in a successful result");
+        assert!(!normalize_editor_not_ready(ok).is_error);
+    }
 
     #[test]
     fn error_kind_round_trips_through_extract() {

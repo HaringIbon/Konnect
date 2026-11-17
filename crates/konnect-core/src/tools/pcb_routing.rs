@@ -15,7 +15,7 @@ use anyhow::Context;
 use konnect_sexp::writer::{apply_edits, write_atomic_if_unchanged, SexpEdit};
 use prost::Message;
 use serde_json::json;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use super::cli;
@@ -128,6 +128,56 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_name", "x", "y"]
             }),
             |args, ctx| async move { handle_add_via(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "route_path",
+            "Route one net as polylines in one KiCad undo step: each path is a layer and a list \
+             of points, each point {x, y} (mm) or {ref, pad} to land exactly on a pad; plus \
+             optional vias (through, or blind/buried with start_layer/end_layer). The net is \
+             given or inferred from the named pads (all must share it); a surface-mount pad on \
+             another layer is refused. Width and via size default to the net's net class. \
+             lock: true locks the copper (for routing critical nets before autorouting).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "net": { "type": "string" },
+                    "width": { "type": "number", "description": "mm; default from the net class" },
+                    "lock": { "type": "boolean", "default": false },
+                    "paths": { "type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "layer": { "type": "string" },
+                            "width": { "type": "number" },
+                            "points": { "type": "array", "minItems": 2, "items": {
+                    "type": "object",
+                    "description": "Either {x, y} in mm, or {ref, pad} to end exactly on a pad",
+                    "properties": {
+                        "x": { "type": "number" }, "y": { "type": "number" },
+                        "ref": { "type": "string" }, "pad": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                } }
+                        },
+                        "required": ["layer", "points"],
+                        "additionalProperties": false
+                    } },
+                    "vias": { "type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "x": { "type": "number" }, "y": { "type": "number" },
+                            "size": { "type": "number" }, "drill": { "type": "number" },
+                            "start_layer": { "type": "string" }, "end_layer": { "type": "string" },
+                            "via_type": { "type": "string", "enum": ["through", "blind", "buried", "micro"] }
+                        },
+                        "required": ["x", "y"],
+                        "additionalProperties": false
+                    } }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_route_path(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
@@ -892,6 +942,194 @@ async fn handle_fanout_to_plane(
                 reason: failure.message().to_string(),
             },
             format!("fanout_to_plane failed: {}", failure.message()),
+        )),
+    }
+}
+
+/// One resolved point of a path: where it is, and the pad it names (if any).
+#[derive(Debug, Clone)]
+struct PathPoint {
+    x: f64,
+    y: f64,
+    pad: Option<(String, String)>,
+}
+
+/// Validate the `paths` / `vias` arguments into plain data before any IPC.
+#[allow(clippy::type_complexity)]
+fn parse_route_path_args(
+    args: &serde_json::Value,
+) -> Result<(Vec<(String, Option<f64>, Vec<serde_json::Value>)>, Vec<serde_json::Value>), CallToolResult> {
+    let invalid = |field: &str, reason: String| {
+        CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument { field: field.to_string(), reason: reason.clone() },
+            format!("Invalid '{field}': {reason}"),
+        )
+    };
+    let paths = args["paths"].as_array().cloned().unwrap_or_default();
+    let vias = args["vias"].as_array().cloned().unwrap_or_default();
+    if paths.is_empty() && vias.is_empty() {
+        return Err(invalid("paths", "give at least one path or via".into()));
+    }
+    let mut parsed = Vec::new();
+    for (i, path) in paths.iter().enumerate() {
+        let layer = path["layer"].as_str().unwrap_or("").to_string();
+        if konnect_ipc::builders::try_layer_from_name(&layer).is_err() || !konnect_sexp::layers::is_copper_name(&layer) {
+            return Err(invalid("paths", format!("path {i}: '{layer}' is not a copper layer")));
+        }
+        let points = path["points"].as_array().cloned().unwrap_or_default();
+        if points.len() < 2 {
+            return Err(invalid("paths", format!("path {i}: needs at least two points")));
+        }
+        for (j, p) in points.iter().enumerate() {
+            let xy = p["x"].is_number() && p["y"].is_number();
+            let pad = p["ref"].is_string() && p["pad"].is_string();
+            if xy == pad {
+                return Err(invalid("paths", format!("path {i} point {j}: give either x and y, or ref and pad")));
+            }
+        }
+        parsed.push((layer, path["width"].as_f64(), points));
+    }
+    for (i, via) in vias.iter().enumerate() {
+        if !(via["x"].is_number() && via["y"].is_number()) {
+            return Err(invalid("vias", format!("via {i}: x and y are required")));
+        }
+    }
+    Ok((parsed, vias))
+}
+
+async fn handle_route_path(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi::common::types::LockedState;
+    let board = get_path(args, "board")?;
+    let (paths, vias) = match parse_route_path_args(args) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let requested_net = args["net"].as_str().map(str::to_string);
+    let lock = args["lock"].as_bool().unwrap_or(false);
+    let width_arg = args["width"].as_f64();
+    let classes = netclass_fanout_options(&board);
+    // Via spans are checked before KiCad is asked anything.
+    let mut via_specs = Vec::new();
+    for (i, via) in vias.iter().enumerate() {
+        let start = via["start_layer"].as_str().unwrap_or("F.Cu").to_string();
+        let end = via["end_layer"].as_str().unwrap_or("B.Cu").to_string();
+        match via_span(&start, &end, via["via_type"].as_str()) {
+            Ok(span) => via_specs.push((via["x"].as_f64().unwrap(), via["y"].as_f64().unwrap(), via["size"].as_f64(), via["drill"].as_f64(), span)),
+            Err(reason) => {
+                return Ok(CallToolResult::error_kind(
+                    ToolErrorKind::InvalidArgument { field: "vias".into(), reason: format!("via {i}: {reason}") },
+                    format!("Invalid 'vias': via {i}: {reason}"),
+                ))
+            }
+        }
+    }
+
+    let result = with_board_ipc_classified(ctx, &board, move |client, document| {
+        // Resolve every pad reference once.
+        let mut pads_by_ref: BTreeMap<String, Vec<konnect_ipc::IpcPad>> = BTreeMap::new();
+        let mut resolved: Vec<(String, Option<f64>, Vec<PathPoint>)> = Vec::new();
+        for (layer, width, points) in &paths {
+            let mut out = Vec::new();
+            for p in points {
+                if let (Some(x), Some(y)) = (p["x"].as_f64(), p["y"].as_f64()) {
+                    out.push(PathPoint { x, y, pad: None });
+                    continue;
+                }
+                let reference = p["ref"].as_str().unwrap().to_string();
+                let number = p["pad"].as_str().unwrap().to_string();
+                if !pads_by_ref.contains_key(&reference) {
+                    let pads = client
+                        .get_footprint_pads_in(document.clone(), &reference)?
+                        .with_context(|| format!("no footprint '{reference}' on the board"))?;
+                    pads_by_ref.insert(reference.clone(), pads);
+                }
+                let pad = pads_by_ref[&reference]
+                    .iter()
+                    .find(|pad| pad.number == number)
+                    .with_context(|| format!("{reference} has no pad '{number}'"))?;
+                let smd = pad.pad_type.as_deref() == Some("smd");
+                if smd && !pad.layers.iter().any(|l| l == layer) {
+                    anyhow::bail!("{reference}.{number} is a surface-mount pad on {:?}, not on {layer}", pad.layers);
+                }
+                out.push(PathPoint { x: pad.x, y: pad.y, pad: Some((reference, number)) });
+            }
+            resolved.push((layer.clone(), *width, out));
+        }
+        // The net: named, or the one net every named pad shares.
+        let pad_nets: BTreeSet<String> = resolved
+            .iter()
+            .flat_map(|(_, _, pts)| pts.iter().filter_map(|p| p.pad.clone()))
+            .map(|(r, n)| pads_by_ref[&r].iter().find(|pad| pad.number == n).map(|pad| pad.net.clone()).unwrap_or_default())
+            .collect();
+        let net = match (&requested_net, pad_nets.len()) {
+            (Some(net), _) => {
+                if let Some(other) = pad_nets.iter().find(|n| *n != net) {
+                    anyhow::bail!("a named pad is on net '{other}', not '{net}'");
+                }
+                net.clone()
+            }
+            (None, 1) => pad_nets.into_iter().next().unwrap(),
+            (None, 0) => anyhow::bail!("no pad is named; pass `net`"),
+            (None, _) => anyhow::bail!("the named pads are on different nets: {pad_nets:?}"),
+        };
+        if net.is_empty() {
+            anyhow::bail!("the named pads carry no net; pass `net`");
+        }
+        let code = client.resolve_net_code_in(document.clone(), &net)?;
+        let sizes = classes(&net);
+        let locked = if lock { LockedState::LsLocked } else { LockedState::LsUnlocked } as i32;
+        let mut items = Vec::new();
+        let mut segments = 0usize;
+        let mut length = 0.0f64;
+        for (layer, width, points) in &resolved {
+            let w = width.or(width_arg).unwrap_or(sizes.track_width_mm);
+            for pair in points.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                let l = (b.x - a.x).hypot(b.y - a.y);
+                if l < 1e-6 {
+                    continue;
+                }
+                let mut track = konnect_ipc::builders::build_track(&net, code, layer, w, a.x, a.y, b.x, b.y);
+                track.locked = locked;
+                items.push(konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track"));
+                segments += 1;
+                length += l;
+            }
+        }
+        for (x, y, size, drill, (start, end, kind)) in &via_specs {
+            let mut via = konnect_ipc::builders::build_via_span(
+                &net, code, *x, *y,
+                drill.unwrap_or(sizes.via_drill_mm),
+                size.unwrap_or(sizes.via_size_mm),
+                *start, *end, *kind,
+            );
+            via.locked = locked;
+            items.push(konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via"));
+        }
+        let expected = items.len();
+        let created = client.run_commit("Route path", |client| client.create_items_in_returning(document.clone(), items))?;
+        if created.len() != expected {
+            anyhow::bail!("KiCad created {} of {} route items", created.len(), expected);
+        }
+        Ok((net, segments, via_specs.len(), length))
+    })
+    .await?;
+    match result {
+        Ok((net, segments, vias, length)) => Ok(CallToolResult::json(&json!({
+            "net": net,
+            "segments": segments,
+            "vias": vias,
+            "routed_length_mm": (length * 1000.0).round() / 1000.0,
+            "locked": lock,
+            "undo": "one KiCad undo step ('Route path')",
+            "next_step": "run_drc to check clearances"
+        }))),
+        Err(failure) => Ok(CallToolResult::error_kind(
+            ToolErrorKind::HandlerError { reason: failure.message().to_string() },
+            format!("route_path refused: {}", failure.message()),
         )),
     }
 }
@@ -4068,5 +4306,33 @@ mod lock_state_tests {
         let (updates, counts) = set_lock_state(items, false, None).unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(counts["vias"]["already"], 1);
+    }
+}
+
+#[cfg(test)]
+mod route_path_args_tests {
+    use super::parse_route_path_args;
+    use serde_json::json;
+
+    #[test]
+    fn well_formed_paths_and_vias_parse() {
+        let args = json!({ "paths": [{ "layer": "F.Cu", "points": [{ "ref": "U1", "pad": "8" }, { "x": 30.0, "y": 18.0 }] }],
+                           "vias": [{ "x": 30.0, "y": 18.0 }] });
+        let (paths, vias) = parse_route_path_args(&args).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(vias.len(), 1);
+    }
+
+    #[test]
+    fn malformed_input_is_refused_before_any_ipc() {
+        for args in [
+            json!({}),
+            json!({ "paths": [{ "layer": "F.SilkS", "points": [{ "x": 0, "y": 0 }, { "x": 1, "y": 0 }] }] }),
+            json!({ "paths": [{ "layer": "F.Cu", "points": [{ "x": 0, "y": 0 }] }] }),
+            json!({ "paths": [{ "layer": "F.Cu", "points": [{ "x": 0, "y": 0, "ref": "U1", "pad": "1" }, { "x": 1, "y": 0 }] }] }),
+            json!({ "vias": [{ "x": 1 }] }),
+        ] {
+            assert!(parse_route_path_args(&args).is_err(), "{args}");
+        }
     }
 }

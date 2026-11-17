@@ -76,9 +76,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_board",
-        description: "Board outline, layers, zones, mounting holes, board text, SVG logo import",
+        description: "Board outline, layers, zones, mounting holes, board text, SVG logo import, board checkpoints, diff and restore",
         category: "pcb",
-        tool_count: 13,
+        tool_count: 16,
     },
     ToolsetMeta {
         name: "pcb_components",
@@ -90,7 +90,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_routing",
         description: "Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import",
         category: "pcb",
-        tool_count: 17,
+        tool_count: 18,
     },
     ToolsetMeta {
         name: "design_intent",
@@ -108,7 +108,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_export",
         description: "Gerber, PDF, SVG, 3D model, BOM, Specctra DSN, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++",
         category: "pcb",
-        tool_count: 14,
+        tool_count: 15,
     },
     ToolsetMeta {
         name: "library",

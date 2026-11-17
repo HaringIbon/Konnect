@@ -314,7 +314,7 @@ Its tests check every planned via independently: on the board, on its plane, out
 
 ## Pass 6: design intent, calculators and support-part placement
 
-New toolset **`design_intent`** (6 tools; 22 toolsets, 236 tools, 243 with meta-tools). The calculators exist for the AI's own decisions: results are JSON with the method, assumptions, valid range and warnings behind every number.
+New toolset **`design_intent`** (6 tools, making 22 toolsets). The calculators exist for the AI's own decisions: results are JSON with the method, assumptions, valid range and warnings behind every number.
 
 - **`engineering_calc`** (`tools/eecalc.rs`):
   - Width for current: IPC-2221 curve fit (outer k 0.048, inner 0.024). This errs wide compared with IPC-2152, which is the safe side for a decision.
@@ -357,3 +357,51 @@ New toolset **`design_intent`** (6 tools; 22 toolsets, 236 tools, 243 with meta-
 **Not done here:**
 - `score_placement` and `place_decoupling_caps` keep their proven-rectangle outline model. Declared ties are now measured exactly by `check_design_intent` and placed by `plan_tie_placement` on any outline, so loosening that model, which several placement tools share, was left alone.
 - Circuit-level checks with EELearn's nodal solver or ngspice are a separate step.
+
+## Pass 7: AI-control tools and placement on real outlines
+
+**Placement:** `score_placement` and `place_decoupling_caps`, committed separately as `8650a54`.
+- **Real outlines:** any readable outline (rounded, notched, L-shaped, arcs) is checked against its real Edge.Cuts geometry through `fanout::BoardOutline::contains_rect`. A rectangle passes only if its corners are inside and no outline edge cuts into it. Before, such outlines skipped the checks with `outline_unproven`.
+  - `outline_checks` reports `rectangle`, `real_outline` or `none`.
+  - An edge-mount connector (J*) whose courtyard overhangs the edge, with its centre on the board, goes to `edge_overhangs` instead of failing.
+- **Decoupling distance:** measured pad edge to pad edge, from the capacitor's pad on a shared supply net to the nearest IC pin on that net. The old courtyard distance and the 8-reference fanout limit remain only as a fallback when there is no pad geometry. This is why the 4-layer PoC's six MCU associations used to come out "unproven".
+- **`place_decoupling_caps` is pin-driven:**
+  - Each capacitor gets the nearest unclaimed same-net IC pin (pins are shared when they run out) and is placed beside it by the design-intent tie planner.
+  - Capacitors already within their limit stay, and are listed in `unplaced` with the reason.
+  - Capacitors sharing no supply net with the IC keep the old row on `side`.
+  - Under the pin-level score the old row plan *lowered* the fixture's score (85 → 70); the pin-driven plan raises it to 100.
+- **Tests:** about 20 tests were updated to the new metric, each with the distance hand-checked from the fixture geometry. Examples:
+  - C2's VCC pad is 2.383 mm from U1 pin 8: dx 1.24, dy 2.035;
+  - C1 is 7.146 mm from it, beside pins 1–4.
+
+  One test's premise ("a cap within both the IC and the connector limit") cannot hold once the distance is measured to the VCC pin, so it was rewritten around the fixture's C2. The off-board row tests now use capacitors that share no supply net, so they still exercise the row path. The deprecated force-directed refiner's tests use a courtyard overlap, because its net-centroid model cannot improve a pin-level decoupling distance.
+- **New tests:** a notch cutting a part whose four corners are all on the board, and connector overhang.
+- **Live:** on the rounded 4-layer board, the score went from 50 to 85 (pass). C1, C2 and C3 moved to 1.1, 0.5 and 2.5 mm from their pins, with 0 courtyard violations in KiCad's DRC.
+
+**AI-control tools:**
+- **`route_path`** (`pcb_routing`): polylines whose points are `{x, y}` or `{ref, pad}`, plus through, blind or buried vias, in one KiCad undo step.
+  - The net is given or inferred from the named pads. A pad on another net, or an SMD pad on another layer, is refused.
+  - Widths and via sizes default to the net class. `lock` is optional.
+  - Arguments are validated before any IPC call.
+- **`render_board_png`** (`pcb_export`): renders the live board, or the saved file, as a PNG.
+  - Chosen layers are drawn back to front: B.*, inner, F.Cu, front mask and paste, F.SilkS, outline.
+  - `kicad-cli` paints in the order given, so a B.Cu pour used to hide the front copper.
+  - A dark background is added.
+  - The view is the whole board or a region in board mm, and the response returns `px_per_mm` and the region so pixels map back to board coordinates.
+- **`checkpoint_board` / `diff_board` / `restore_checkpoint`** (`pcb_board`, new `board_history.rs`):
+  - Checkpoints live under `.konnect/checkpoints/<board>/` with metadata.
+  - The semantic diff reports parts added, removed, moved, rotated or flipped (with footprint changes), per-net segment, via and length changes, and zones.
+  - A restore needs KiCad closed on the board, is revision-checked, and checkpoints the current file first.
+- **`run_drc` `detail: "summary"`:** counts per rule with one example each (1.1 KB on the PoC, against about 33 KB in full). Every response gains `by_rule`.
+- **`editor_not_ready` error kind:** any error result mentioning KiCad's `AS_NOT_READY` is normalised at dispatch, with `retry_after_s` and the original kind kept. It used to arrive as `stale_target`, `editor_unavailable`, `handler_error` or plain text, depending on the tool. A contract test now expects this kind for that one status.
+
+**Live check** (`poc/step3_check.py`, 4-layer board):
+- During pcbnew start-up the refusal arrived as `editor_unavailable` (no listener yet), then as `editor_not_ready` with `retry_after_s: 15`.
+- Checks 7/7:
+  - checkpoint from the live board;
+  - whole-board render (1200 × 960, 24 px/mm) and a U1 zoom (56 px/mm), both inspected;
+  - `route_path` U1.7 → Y1.1 inferred `/XTAL1` (3.302 mm, one undo step), and refused a pad on another net;
+  - DRC summary 1,120 bytes;
+  - `diff_board` showed the new XTAL1 segment.
+
+**Counts:** 241 tools (248 with meta-tools). `pcb_board` has 16, `pcb_routing` 18 and `pcb_export` 15.

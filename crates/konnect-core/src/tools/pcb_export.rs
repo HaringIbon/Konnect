@@ -297,6 +297,31 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_export_specctra_dsn(args, ctx).await }
         ),
         tool!(
+            "render_board_png",
+            "Render the board (live when KiCad holds it, else the saved file) as a PNG for \
+             visual review: chosen layers (default F.Cu, B.Cu, F.SilkS, Edge.Cuts) on a dark \
+             background, the whole board or a region in board mm to zoom in. Returns the image \
+             plus px_per_mm and the region, so pixel positions map back to board coordinates.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "layers": { "type": "array", "items": { "type": "string" } },
+                    "region": {
+                        "type": "object",
+                        "description": "Board-mm rectangle to show; omit for the whole board",
+                        "properties": { "x0": { "type": "number" }, "y0": { "type": "number" }, "x1": { "type": "number" }, "y1": { "type": "number" } },
+                        "required": ["x0", "y0", "x1", "y1"],
+                        "additionalProperties": false
+                    },
+                    "width_px": { "type": "integer", "minimum": 64, "maximum": 4096, "default": 1200 },
+                    "board_source": crate::tools::board_source::board_source_schema()
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_render_board_png(args, ctx).await }
+        ),
+        tool!(
             "export_position_file",
             "Generate a component placement (pick-and-place) position file for SMT assembly. \
              KiCad automatically omits footprints marked exclude_from_pos_files.",
@@ -1043,6 +1068,141 @@ async fn handle_export_specctra_dsn(
         })
         .to_string(),
     ))
+}
+
+
+/// Set the SVG root's viewBox (and its mm width/height) and put a background
+/// rectangle under everything. KiCad's layer colours are made for a dark
+/// background; a transparent PNG reads poorly.
+fn frame_board_svg(svg: &str, view: Option<(f64, f64, f64, f64)>) -> anyhow::Result<(String, (f64, f64, f64, f64))> {
+    let root_start = svg.find("<svg").context("SVG has no root element")?;
+    let root_end = root_start + svg[root_start..].find('>').context("unterminated SVG root")?;
+    let root = &svg[root_start..root_end];
+    let attr = |name: &str| -> Option<String> {
+        let at = root.find(&format!("{name}=\""))? + name.len() + 2;
+        Some(root[at..at + root[at..].find('"')?].to_string())
+    };
+    let current: Vec<f64> = attr("viewBox")
+        .context("SVG root has no viewBox")?
+        .split_whitespace()
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    anyhow::ensure!(current.len() == 4, "unexpected SVG viewBox");
+    let vb = view.unwrap_or((current[0], current[1], current[2], current[3]));
+    let mut new_root = root.to_string();
+    for (name, value) in [
+        ("viewBox", format!("{:.4} {:.4} {:.4} {:.4}", vb.0, vb.1, vb.2, vb.3)),
+        ("width", format!("{:.4}mm", vb.2)),
+        ("height", format!("{:.4}mm", vb.3)),
+    ] {
+        if let Some(old) = attr(name) {
+            new_root = new_root.replacen(&format!("{name}=\"{old}\""), &format!("{name}=\"{value}\""), 1);
+        }
+    }
+    let background = format!(
+        "\n<rect x=\"{:.4}\" y=\"{:.4}\" width=\"{:.4}\" height=\"{:.4}\" fill=\"#0b1626\"/>",
+        vb.0, vb.1, vb.2, vb.3
+    );
+    Ok((format!("{}{}>{}{}", &svg[..root_start], new_root, background, &svg[root_end + 1..]), vb))
+}
+
+async fn handle_render_board_png(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use base64::Engine;
+    let board = get_path(args, "board")?;
+    let layers: Vec<String> = args["layers"]
+        .as_array()
+        .map(|l| l.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_else(|| ["F.Cu", "B.Cu", "F.SilkS", "Edge.Cuts"].iter().map(|s| s.to_string()).collect());
+    let width_px = args["width_px"].as_u64().unwrap_or(1200).clamp(64, 4096) as u32;
+    let source = match crate::tools::board_source::BoardSource::from_args(args) {
+        Ok(s) => s,
+        Err(e) => return Ok(e),
+    };
+    let read = crate::tools::board_source::read_board(ctx, &board, source, "board render", |client, document| {
+        client.save_document_to_string_in(document)
+    })
+    .await?;
+    let (snapshot, from) = match read {
+        crate::tools::board_source::BoardRead::Live(text) => (text, "live".to_string()),
+        crate::tools::board_source::BoardRead::Saved(saved) => (
+            std::fs::read_to_string(&board).with_context(|| format!("read {}", board.display()))?,
+            format!("saved file ({})", saved.detail()),
+        ),
+        crate::tools::board_source::BoardRead::Refused(result) => return Ok(result),
+    };
+    let tree = konnect_sexp::parse_sexp(&snapshot).context("parse board")?;
+    let Some((bx0, by0, bx1, by1)) = konnect_sexp::board::board_outline_bbox(&tree) else {
+        return Ok(invalid_export_argument("board", "the board has no readable Edge.Cuts outline to frame"));
+    };
+    let dir = tempfile::tempdir()?;
+    let stem = board.file_stem().context("board has no name")?;
+    let copy = dir.path().join(stem).with_extension("kicad_pcb");
+    std::fs::write(&copy, &snapshot)?;
+    if board.with_extension("kicad_pro").is_file() {
+        std::fs::copy(board.with_extension("kicad_pro"), copy.with_extension("kicad_pro"))?;
+    }
+    let svg_path = dir.path().join("board.svg");
+    // kicad-cli paints layers in the order given, later on top. Draw back to
+    // front so a B.Cu pour cannot hide the front copper and silkscreen.
+    let depth = |layer: &str| match layer {
+        l if l.starts_with("B.") => 0,
+        l if l.starts_with("In") => 1,
+        "F.Cu" => 2,
+        "F.Paste" | "F.Mask" | "F.Adhes" => 3,
+        "F.SilkS" | "F.Silkscreen" | "F.Fab" | "F.CrtYd" | "F.Courtyard" => 4,
+        _ => 5,
+    };
+    let mut layers = layers;
+    layers.sort_by_key(|l| depth(l));
+    let layer_refs: Vec<&str> = layers.iter().map(String::as_str).collect();
+    cli::export_svg_pcb_board_area(&ctx.config.kicad_cli, &copy, &svg_path, &layer_refs).await?;
+    let svg = std::fs::read_to_string(&svg_path)?;
+    // The board-area SVG puts the outline's top-left at (0, 0); KiCad trims
+    // the edge-line width evenly, so centre the difference.
+    let (_, full) = frame_board_svg(&svg, None)?;
+    let origin = (bx0 + ((bx1 - bx0) - full.2) / 2.0, by0 + ((by1 - by0) - full.3) / 2.0);
+    let region = args.get("region").filter(|r| !r.is_null()).map(|r| {
+        (r["x0"].as_f64(), r["y0"].as_f64(), r["x1"].as_f64(), r["y1"].as_f64())
+    });
+    let view = match region {
+        None => None,
+        Some((Some(x0), Some(y0), Some(x1), Some(y1))) if x1 > x0 && y1 > y0 => {
+            Some((x0 - origin.0, y0 - origin.1, x1 - x0, y1 - y0))
+        }
+        Some(_) => return Ok(invalid_export_argument("region", "needs x0 < x1 and y0 < y1, in board mm")),
+    };
+    let (framed, vb) = frame_board_svg(&svg, view)?;
+    let rendered = match konnect_render::svg_to_png(framed.as_bytes(), width_px) {
+        Ok(r) => r,
+        Err(e) => return Ok(CallToolResult::error(format!("render failed: {e:#}"))),
+    };
+    let meta = json!({
+        "board": board,
+        "source": from,
+        "layers": layers,
+        "region_mm": { "x0": r3(vb.0 + origin.0), "y0": r3(vb.1 + origin.1), "x1": r3(vb.0 + vb.2 + origin.0), "y1": r3(vb.1 + vb.3 + origin.1) },
+        "width_px": rendered.width_px,
+        "height_px": rendered.height_px,
+        "px_per_mm": r3(rendered.width_px as f64 / vb.2),
+        "note": "pixel (px, py) is board (x0 + px / px_per_mm, y0 + py / px_per_mm)"
+    });
+    Ok(CallToolResult {
+        content: vec![
+            crate::mcp::protocol::ToolContent::Text { text: meta.to_string() },
+            crate::mcp::protocol::ToolContent::Image {
+                data: base64::engine::general_purpose::STANDARD.encode(&rendered.png),
+                mime_type: "image/png".into(),
+            },
+        ],
+        is_error: false,
+    })
+}
+
+fn r3(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
 }
 
 async fn handle_export_position_file(

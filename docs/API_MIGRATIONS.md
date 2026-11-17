@@ -2325,3 +2325,17 @@ There are six new tools: `engineering_calc`, `get_design_intent`, `set_design_in
 They store intent in `<project>.intent.json`. When applied, intent writes net classes named `intent_<net>` into the `.kicad_pro` and rules named `intent: …` into the `.kicad_dru`. Applying intent removes stale classes and rules with those names; other classes and rules are untouched.
 
 `apply_design_intent` defaults to `dry_run: true`.
+
+## Unreleased (fork): placement on real outlines, pin-level decoupling
+
+- **`score_placement`:**
+  - A non-rectangular outline is now judged against its real geometry, so the verdict can be `pass` where it used to be `outline_unproven`.
+  - New field `outline_checks` (`rectangle`, `real_outline` or `none`), and new list `edge_overhangs`.
+  - Decoupling `distance_mm` is now pad edge to supply pin, not cap centre to IC courtyard, so scores on existing boards change.
+- **`place_decoupling_caps`:** caps are placed beside their supply pins, the plan gains an `unplaced` list, and `planned_moves` entries can carry `pin`, `pin_distance_mm` and `within_limit`.
+
+## Unreleased (fork): AI-control tools
+
+- **New tools:** `route_path`, `render_board_png` (returns a text block plus an image block), `checkpoint_board`, `diff_board`, `restore_checkpoint`.
+- **`run_drc`:** takes `detail: "summary"`, and every response includes `by_rule`.
+- **Errors:** an error caused by KiCad's `AS_NOT_READY` now has kind `editor_not_ready`, with `retry_after_s` and `original_kind`.

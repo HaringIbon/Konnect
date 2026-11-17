@@ -1653,6 +1653,19 @@ pub async fn export_svg_pcb(
     Ok(())
 }
 
+/// KiCAD 10: `pcb export svg --mode-single --page-size-mode 2
+/// --exclude-drawing-sheet --layers <a,b> --output <path> <input>`: the board
+/// area only (no frame or title block), for rendering previews.
+pub async fn export_svg_pcb_board_area(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
+    let layer_list = layers.join(",");
+    let args = [
+        "pcb", "export", "svg", "--mode-single", "--page-size-mode", "2", "--exclude-drawing-sheet",
+        "--layers", &layer_list, "--output", output.to_str().unwrap(), pcb.to_str().unwrap(),
+    ];
+    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    Ok(())
+}
+
 /// KiCAD 10: `pcb export <format> --output <path> [--no-unspecified] <input>`
 /// Supported 3D formats: step, vrml, glb, brep, stl, ply, stpz, u3d, xao, 3dpdf
 fn export_3d_args<'a>(
