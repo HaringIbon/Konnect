@@ -1074,3 +1074,60 @@ mod regress2_tests {
         }
     }
 }
+
+// ─── Shared with design-intent checks ───────────────────────────────────────
+
+/// A copper pad in board coordinates, as its true (rotated) rectangle.
+#[derive(Debug, Clone)]
+pub(crate) struct CopperPad {
+    pub reference: String,
+    pub number: String,
+    pub net: Option<String>,
+    pub corners: [(f64, f64); 4],
+    pub layer: &'static str,
+}
+
+pub(crate) fn copper_pads(tree: &SexpNode) -> Vec<CopperPad> {
+    collect_pads(tree)
+        .into_iter()
+        .map(|pad| CopperPad {
+            corners: pad.corners(),
+            reference: pad.reference,
+            number: pad.number,
+            net: pad.net,
+            layer: pad.layer,
+        })
+        .collect()
+}
+
+/// Edge-to-edge distance between two convex polygons (0 when they overlap).
+pub(crate) fn polygon_distance(a: &[(f64, f64)], b: &[(f64, f64)]) -> f64 {
+    if a.iter().any(|p| point_in_polygon(*p, b)) || b.iter().any(|p| point_in_polygon(*p, a)) {
+        return 0.0;
+    }
+    let mut best = f64::INFINITY;
+    for (p, q) in polygon_edges(a) {
+        for (r, s) in polygon_edges(b) {
+            best = best.min(segment_segment_distance(p, q, r, s));
+        }
+    }
+    best
+}
+
+/// Sample an arc through start, mid and end (for lengths and drawing).
+pub(crate) fn sample_arc(start: (f64, f64), mid: (f64, f64), end: (f64, f64), steps: usize) -> Vec<(f64, f64)> {
+    arc_points(start, mid, end, steps)
+}
+
+/// The board outline (real Edge.Cuts geometry) for containment checks.
+pub(crate) struct BoardOutline(BoardGeometry);
+
+impl BoardOutline {
+    pub(crate) fn read(tree: &SexpNode) -> Self {
+        Self(BoardGeometry::read(tree))
+    }
+    /// `p` is inside the outline and at least `margin` from every edge.
+    pub(crate) fn contains(&self, p: (f64, f64), margin: f64) -> bool {
+        self.0.inside_board(p, margin)
+    }
+}

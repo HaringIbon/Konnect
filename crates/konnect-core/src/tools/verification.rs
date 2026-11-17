@@ -368,7 +368,7 @@ fn project_rule_value(project: &serde_json::Value, key: &str) -> Option<f64> {
     project["board"]["design_settings"]["rules"][key].as_f64()
 }
 
-fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
+pub(crate) fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
     let needle = format!("(rule \"{name}\"");
     let start = content.find(&needle)?;
     let mut depth = 0i32;
@@ -409,7 +409,7 @@ fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
     None
 }
 
-fn upsert_named_rule(content: &str, name: &str, rule: &str) -> String {
+pub(crate) fn upsert_named_rule(content: &str, name: &str, rule: &str) -> String {
     if let Some((start, end)) = named_rule_range(content, name) {
         return format!("{}{}{}", &content[..start], rule, &content[end..]);
     }

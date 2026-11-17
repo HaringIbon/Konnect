@@ -15,6 +15,8 @@ pub(crate) mod cross_probe;
 pub mod design_review;
 pub(crate) mod drc;
 pub mod editor_navigation;
+pub mod design_intent;
+pub(crate) mod eecalc;
 pub(crate) mod fanout;
 mod footprint_graphics;
 mod footprint_metadata;

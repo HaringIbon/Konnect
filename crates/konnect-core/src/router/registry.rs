@@ -93,6 +93,12 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         tool_count: 17,
     },
     ToolsetMeta {
+        name: "design_intent",
+        description: "Design intent (net roles, current and impedance targets, part ties), engineering calculators, intent-to-rules and checks against the board",
+        category: "pcb",
+        tool_count: 6,
+    },
+    ToolsetMeta {
         name: "placement",
         description: "Placement quality and automation: score with named deductions, plan decoupling rows and BGA fanouts, first placement, force-directed refinement",
         category: "pcb",
@@ -185,6 +191,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "pcb_components" => Some(pcb_components::tools()),
         "pcb_routing" => Some(pcb_routing::tools()),
         "placement" => Some(placement::tools()),
+        "design_intent" => Some(design_intent::tools()),
         "pcb_export" => Some(pcb_export::tools()),
         "library" => Some(library::tools()),
         "integration" => Some(integration::tools()),

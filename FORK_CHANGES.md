@@ -311,3 +311,49 @@ Its tests check every planned via independently: on the board, on its plane, out
 - On the regression board Freerouting left one signal net unrouted with `max_passes` 20.
 - `route_specctra_dsn` still reports `COMPLETED` in that case, because Freerouting's job details give no unrouted count.
 - The import does report `unconnected_items: 1` and `clean: false`, so the gap is visible, but the router tool itself should surface it.
+
+## Pass 6: design intent, calculators and support-part placement
+
+New toolset **`design_intent`** (6 tools; 22 toolsets, 236 tools, 243 with meta-tools). The calculators exist for the AI's own decisions: results are JSON with the method, assumptions, valid range and warnings behind every number.
+
+- **`engineering_calc`** (`tools/eecalc.rs`):
+  - Width for current: IPC-2221 curve fit (outer k 0.048, inner 0.024). This errs wide compared with IPC-2152, which is the safe side for a decision.
+  - Trace resistance and voltage drop: ρ(20 °C) = 1.7241e-8 Ω·m (IACS annealed copper). The temperature ratio comes from the NIST copper table (Matula 1979), as tabulated in EELearn's materials data.
+  - Microstrip impedance: Hammerstad–Jensen with thickness correction.
+  - Stripline and edge-coupled differential impedance: IPC-2141A.
+  - Width for a target impedance (bisection), E12/E24/E96 values, and divider pairs.
+  - Oracle tests against published values:
+    - Pozar Example 3.7 (50 Ω, εe 1.87);
+    - Wheeler's air microstrip (126.5 Ω at w/h 1);
+    - the IPC-2141A stripline formula;
+    - the IPC-2221 chart (1 A ≈ 0.3 mm, 2 A ≈ 0.76 mm);
+    - 1 oz sheet resistance ≈ 0.495 mΩ/□ and +0.39 %/°C.
+- **`get_design_intent` / `set_design_intent`:** `<project>.intent.json` (schema 1).
+  - Contents:
+    - per-net role (`signal`, `diff_pair`, `power`, `clock`, `sensitive`, `plane`), priority, pair, impedance, gap, current, temperature rise, maximum drop, source pad, maximum length, skew and clearance;
+    - ties (`part`, `to`, `pin`, `max_mm`);
+    - stackup, defaulting to JLC04161H-7628.
+  - Merge semantics (null removes a net). Validated: roles, reciprocal pairs, positive values and `REF.PAD` sources. Revision-checked writes.
+- **`apply_design_intent`:** dry run by default; refused while KiCad holds the project.
+  - **Net classes:** one `intent_<net>` per net, cloned from `Default`, with exact-name patterns placed first.
+  - **DRC rules:** `intent: …` rules in the `.kicad_dru` (track width minimum, diff-pair gap, skew, length, clearance).
+  - Stale intent classes and rules are removed; user classes and rules are left as they were.
+  - Warns when a pair's names lack the P/N or +/- suffix KiCad needs to treat them as a pair.
+- **`check_design_intent`** (live or saved board), with each check pass, fail or unverified:
+  - tie distance, pad edge to pad edge, measured from the part's pad on the pin's net;
+  - routed length and pair skew;
+  - track width against the current or impedance requirement;
+  - voltage drop: Dijkstra over routed-copper resistance from the source pad, conservatively assuming the full current on every path;
+  - impedance estimate and plane zones.
+- **`plan_tie_placement`:** for each failing tie, a same-side position and rotation that minimises the distance from the part's pad on the pin's net to the pin. Its courtyard must clear the other courtyards and stay inside the real outline (via `fanout::BoardOutline`), and its pads must clear other nets. Later ties see earlier plans. It returns `placements` for `set_component_placements`.
+- **Shared code:** `fanout.rs` now exposes `copper_pads` (true rotated pad outlines), `polygon_distance`, `sample_arc` and `BoardOutline`. `verification::named_rule_range` and `upsert_named_rule` are now `pub(crate)`.
+
+**Verification:** 13 new unit tests, plus the oracle tests. Live run on a copy of the autorouted 4-layer board with KiCad closed (`poc/intent_check.py`, 9/9 checks):
+- **Calculators through the tool:** 1 A → 0.302 mm; a 90 Ω pair on 7628 → 0.268 mm wide with a 0.15 mm gap; 5 V → 3 V → 20 k/30 k.
+- **Rules and DRC:** `apply_design_intent` wrote 3 classes and 5 rules. `kicad-cli pcb drc` accepted them and enforced them: the XTAL2 length and its clearance to neighbouring nets were reported under the `intent:` rule names.
+- **`check_design_intent`:** found C1, C2 and C3 at 5.9, 10.6 and 7.9 mm from VCC/AVCC (2 mm required), XTAL2 at 11.1 mm (10 mm allowed), and the +5V drop at 31 mV (100 mV allowed).
+- **`plan_tie_placement`:** moved C1 to 1.1 mm and C3 to 0.5 mm. C2 reached 2.5 mm and is reported `meets: false`: VCC pins 4 and 6 share one side, and C1 took the nearest spot. After applying the plan, KiCad's DRC shows 0 courtyard violations, and `check_design_intent` agrees with the planner to 0.001 mm.
+
+**Not done here:**
+- `score_placement` and `place_decoupling_caps` keep their proven-rectangle outline model. Declared ties are now measured exactly by `check_design_intent` and placed by `plan_tie_placement` on any outline, so loosening that model, which several placement tools share, was left alone.
+- Circuit-level checks with EELearn's nodal solver or ngspice are a separate step.

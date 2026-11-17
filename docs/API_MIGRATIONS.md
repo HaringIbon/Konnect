@@ -2317,3 +2317,11 @@ Boards the strict exporter accepted are exported exactly as before.
 In KiCad's DSN, zones are removed from the routing job and listed in `removed_planes`. Their nets are routed as ordinary nets. Layers KiCad types `power` are listed in `power_layers_not_routed`. The reverse manifest for such an export is schema 2. `plan_specctra_ses_import` and `apply_specctra_ses` accept schemas 1 and 2.
 
 The SES importer now accepts Freerouting 2.1's repeated via padstacks, and drops exact repeated wires instead of refusing the session. The plan reports how many were dropped as `duplicate_wires_dropped`.
+
+## Unreleased (fork): `design_intent` toolset
+
+There are six new tools: `engineering_calc`, `get_design_intent`, `set_design_intent`, `apply_design_intent`, `plan_tie_placement` and `check_design_intent`.
+
+They store intent in `<project>.intent.json`. When applied, intent writes net classes named `intent_<net>` into the `.kicad_pro` and rules named `intent: …` into the `.kicad_dru`. Applying intent removes stale classes and rules with those names; other classes and rules are untouched.
+
+`apply_design_intent` defaults to `dry_run: true`.

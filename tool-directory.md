@@ -12,8 +12,8 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **21 toolsets** organized into 10 categories
-- **230 registered tools** + **7 always-visible meta-tools** = **237 total**
+- **22 toolsets** organized into 10 categories
+- **236 registered tools** + **7 always-visible meta-tools** = **243 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -28,7 +28,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 21 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 22 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -302,6 +302,19 @@ and Windows servers do not.
 | `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets those patterns match. Mixed-source: definitions and patterns come from the `.kicad_pro`, the board nets from a live KiCad where one holds the board and from the saved board file otherwise (`board_source` selects that), and `sources` names each. KiCad need not be running. Reports `Default` (marked) and any pattern naming a class that does not exist. |
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
+
+### `design_intent` · 6 tools
+**Purpose:** What the design must do, kept per project in `<project>.intent.json`: net roles (diff pair, power, clock, sensitive, plane), priorities, current/impedance/length/skew targets, part ties; engineering calculators for decisions; intent turned into KiCad net classes and `.kicad_dru` rules; checks and placement plans against the board.
+**Source:** [`crates/konnect-core/src/tools/design_intent.rs`](crates/konnect-core/src/tools/design_intent.rs), [`eecalc.rs`](crates/konnect-core/src/tools/eecalc.rs)
+
+| Tool | Description |
+|------|-------------|
+| `engineering_calc` | Width for current (IPC-2221), trace resistance and voltage drop, microstrip/stripline and differential impedance, width for a target impedance, E12/E24/E96 values, dividers. JSON with method, assumptions, valid range and warnings. |
+| `get_design_intent` | Read the intent and what it works out to per net (track width, pair gap, with the calculation behind each), sorted by routing priority. |
+| `set_design_intent` | Merge nets, ties, stackup and notes into the intent; validated (roles, reciprocal pairs, positive values, `REF.PAD` sources); revision-checked write. |
+| `apply_design_intent` | Write `intent_<net>` net classes into the `.kicad_pro` and `intent: …` rules into the `.kicad_dru` (track width, diff-pair gap, skew, length, clearance) so KiCad's DRC enforces them; user classes and rules kept; dry run by default; refused while KiCad holds the project. |
+| `plan_tie_placement` | For each failing tie, a position and rotation that puts the part's pad on the pin's net closest to the pin, courtyard clear and inside the real outline. A plan to apply with `set_component_placements`. |
+| `check_design_intent` | Measure the live or saved board against the intent: tie distances, routed length, pair skew, track width against current/impedance, voltage drop from the source pad, impedance estimate, plane zones. pass / fail / unverified with measured and required values. |
 
 ### `placement` · 5 tools
 **Purpose:** Placement quality and automation — score, plan decoupling rows, plan BGA fanouts; every plan reports its own before/after score.
