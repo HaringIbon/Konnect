@@ -275,8 +275,17 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
         let name = dsn_atom(image, 1, "image name")?.to_string();
         let mut pins = Vec::new();
         for pin in image.find_all("pin") {
+            // `(pin <padstack> [(rotate <deg>)] <pin id> <x> <y>)`: a pad
+            // rotated within its footprint puts a list before the id.
+            let name = pin
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .skip(2)
+                .find_map(SexpNode::as_str)
+                .context("DSN is missing pin name")?;
             pins.push((
-                dsn_atom(pin, 2, "pin name")?.to_string(),
+                name.to_string(),
                 dsn_atom(pin, 1, "pin padstack")?.to_string(),
             ));
         }
@@ -973,6 +982,25 @@ mod round_trip_tests {
             .find(|padstack| padstack["name"] == "Via[0-3]_600:300_um")
             .unwrap();
         assert_eq!((via["size_x_um"].as_i64(), via["drill_um"].as_i64()), (Some(600), Some(300)));
+    }
+
+    /// A pad rotated within its footprint is written
+    /// `(pin <padstack> (rotate <deg>) <id> <x> <y>)`; the id is the first
+    /// atom after the padstack, not index 2.
+    #[test]
+    fn rotated_pins_keep_their_names() {
+        let (_dir, path) = board();
+        let pin = "(pin RoundRect[T]Pad_900.000000x950.000000_225.856000_um_0.000000_0 1 -775 0)";
+        assert!(DSN.contains(pin));
+        let rotated = DSN.replacen(
+            pin,
+            "(pin RoundRect[T]Pad_900.000000x950.000000_225.856000_um_0.000000_0 (rotate 90) 1 -775 0)",
+            1,
+        );
+        let plain = super::lower(&path, BOARD, DSN).unwrap();
+        let export = super::lower(&path, BOARD, &rotated).unwrap();
+        assert_eq!(export.bundle.component_count, plain.bundle.component_count);
+        assert_eq!(export.bundle.manifest, plain.bundle.manifest);
     }
 
     #[test]

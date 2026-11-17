@@ -2377,3 +2377,7 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
 ## Unreleased (fork): delete_zones
 
 - **New tool:** `delete_zones` (`pcb_routing`).
+
+## Unreleased (fork): rotated pads in Specctra export
+
+- **`export_specctra_dsn`:** boards with pads rotated inside their footprint (common on two-sided boards) now export through KiCad's exporter. They used to fail with "DSN is missing pin name". No argument or response changes.

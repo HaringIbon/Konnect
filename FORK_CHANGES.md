@@ -569,3 +569,15 @@ The STM32F072 + Feather nRF52840 USB-C board (`~/Projects/kicad/stm32_demo/build
   - SWDIO is hand-routed before the fan-out.
   - Results: DRC 0 errors / 0 unconnected; 27/27 intent checks (90.6 Ω pair, +5V drop 33 mV); JLCPCB package complete.
 - **Not fixed:** the DRC gate compares unconnected items by count. One import lowered the total from 64 to 8 while stranding two fan-out vias, so per-item comparison would be stricter. KiCad doesn't give unconnected items stable identities across refills, so this is noted, not changed.
+
+## Pass 12: rotated pads in KiCad's Specctra export
+
+- **Bug:** `export_specctra_dsn` failed with "DSN is missing pin name" on any board where a pad is rotated within its footprint. Two-sided boards hit this all the time; the Ethernet board's agent reported it too.
+  - KiCad writes such a pin as `(pin <padstack> (rotate <deg>) <id> <x> <y>)`.
+  - The KiCad-exporter lowering in `specctra/native.rs` read the id at a fixed index 2, which is the `(rotate …)` list.
+- **Fix:** the id is now the first atom after the padstack.
+- **Test:** `rotated_pins_keep_their_names` inserts a `(rotate 90)` into the 4-layer fixture. The manifest must come out identical to the unrotated one.
+- **Found while building:** `boards/stm32_nrf_module`, the two-sided castellated-module board.
+- **Noted, not changed:**
+  - `update_pcb_from_schematic` refuses every pad-net change on a board that has zones. KiCad 10's zone protobuf hides the net, so the check fails closed. Workaround: delete the pours first, sync, then pour again.
+  - `add_board_outline` appends a second outline rather than replacing the old one; its description says so. Workaround: clear Edge.Cuts with `delete_graphics` first.
