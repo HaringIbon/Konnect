@@ -99,6 +99,20 @@ fn sanitize(label: &str) -> String {
     label.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).take(40).collect()
 }
 
+/// The project files saved beside each checkpoint, by suffix: the rules and
+/// intent the design tools write change as much as the board does.
+const SIDECARS: [&str; 3] = ["kicad_pro", "kicad_dru", "intent.json"];
+
+fn sidecar_path(board: &Path, suffix: &str) -> PathBuf {
+    let stem = board.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    board.with_file_name(format!("{stem}.{suffix}"))
+}
+
+/// A checkpoint id names files in the checkpoint directory only.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 80 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 fn write_checkpoint(board: &Path, content: &str, label: &str, source: &str) -> anyhow::Result<String> {
     let dir = checkpoint_dir(board);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -110,12 +124,20 @@ fn write_checkpoint(board: &Path, content: &str, label: &str, source: &str) -> a
         id = format!("{stamp}-{}-{n}", sanitize(label));
     }
     konnect_sexp::write_new_atomic(&dir.join(format!("{id}.kicad_pcb")), content)?;
+    let mut sidecars = serde_json::Map::new();
+    for suffix in SIDECARS {
+        if let Ok(text) = std::fs::read_to_string(sidecar_path(board, suffix)) {
+            konnect_sexp::write_new_atomic(&dir.join(format!("{id}.{suffix}")), &text)?;
+            sidecars.insert(suffix.to_string(), json!(sha256(&text)));
+        }
+    }
     let meta = json!({
         "id": id,
         "label": label,
         "source": source,
         "sha256": sha256(content),
         "bytes": content.len(),
+        "sidecars": sidecars,
     });
     konnect_sexp::write_new_atomic(&dir.join(format!("{id}.json")), &serde_json::to_string_pretty(&meta)?)?;
     Ok(id)
@@ -178,6 +200,7 @@ async fn handle_checkpoint(args: &Value, ctx: &ToolContext) -> anyhow::Result<Ca
 
 #[derive(Debug, Clone, PartialEq)]
 struct Part {
+    reference: String,
     footprint: String,
     x: f64,
     y: f64,
@@ -190,10 +213,16 @@ struct NetRouting {
     segments: usize,
     vias: usize,
     length_mm: f64,
+    /// Routed length per `layer@width`, so a reroute at another width or on
+    /// another layer shows even when counts and length are unchanged.
+    copper: BTreeMap<String, f64>,
 }
 
+/// Footprints keyed by their UUID (references repeat: `REF**`, `H1`
+/// twice, an unannotated `R?`), falling back to the reference.
 fn parts(tree: &SexpNode) -> BTreeMap<String, Part> {
     let mut out = BTreeMap::new();
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for fp in konnect_sexp::board::footprints(tree) {
         let Some(reference) = fp
             .find_all("property")
@@ -205,9 +234,18 @@ fn parts(tree: &SexpNode) -> BTreeMap<String, Part> {
             continue;
         };
         let at = fp.find("at");
+        let key = match fp.find_str("uuid") {
+            Some(uuid) => uuid.to_string(),
+            None => {
+                let n = seen.entry(reference.to_string()).or_insert(0);
+                *n += 1;
+                if *n == 1 { reference.to_string() } else { format!("{reference}#{n}") }
+            }
+        };
         out.insert(
-            reference.to_string(),
+            key,
             Part {
+                reference: reference.to_string(),
                 footprint: fp.get(1).and_then(SexpNode::as_str).unwrap_or("").to_string(),
                 x: at.and_then(|a| a.get_f64(1)).unwrap_or(0.0),
                 y: at.and_then(|a| a.get_f64(2)).unwrap_or(0.0),
@@ -223,8 +261,10 @@ fn routing(tree: &SexpNode) -> BTreeMap<String, NetRouting> {
     let mut out: BTreeMap<String, NetRouting> = BTreeMap::new();
     for t in konnect_sexp::board::tracks(tree).items {
         let e = out.entry(t.net.unwrap_or_default()).or_default();
+        let len = (t.x2 - t.x1).hypot(t.y2 - t.y1);
         e.segments += 1;
-        e.length_mm += (t.x2 - t.x1).hypot(t.y2 - t.y1);
+        e.length_mm += len;
+        *e.copper.entry(format!("{}@{:.3}", t.layer, t.width)).or_insert(0.0) += len;
     }
     for arc in tree.find_all("arc") {
         let p = |tag: &str| arc.find(tag).and_then(|n| Some((n.get_f64(1)?, n.get_f64(2)?)));
@@ -232,8 +272,11 @@ fn routing(tree: &SexpNode) -> BTreeMap<String, NetRouting> {
             let net = arc.find("net").and_then(konnect_sexp::net::net_name).unwrap_or("").to_string();
             let pts = crate::tools::fanout::sample_arc(s, m, e, 16);
             let entry = out.entry(net).or_default();
+            let len = pts.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum::<f64>();
             entry.segments += 1;
-            entry.length_mm += pts.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum::<f64>();
+            entry.length_mm += len;
+            let key = format!("{}@{:.3}", arc.find_str("layer").unwrap_or(""), arc.find_f64("width").unwrap_or(0.0));
+            *entry.copper.entry(key).or_insert(0.0) += len;
         }
     }
     for v in konnect_sexp::board::vias(tree).items {
@@ -254,18 +297,65 @@ fn r3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
+/// Hashes of what the part, routing and zone summaries do not cover. Zone
+/// fills are left out (a refill is not a design change).
+fn other_digests(tree: &SexpNode) -> BTreeMap<&'static str, String> {
+    let digest = |parts: Vec<String>| sha256(&parts.join("\n"));
+    let on_edge = |n: &SexpNode| n.find_str("layer") == Some("Edge.Cuts");
+    let mut edge = Vec::new();
+    for node in tree.children().unwrap_or(&[]) {
+        if node.head().is_some_and(|h| h.starts_with("gr_")) && on_edge(node) {
+            edge.push(format!("{node:?}"));
+        }
+    }
+    for fp in konnect_sexp::board::footprints(tree) {
+        for node in fp.children().unwrap_or(&[]) {
+            if node.head().is_some_and(|h| h.starts_with("fp_")) && on_edge(node) {
+                edge.push(format!("{:?}|{node:?}", fp.find("at")));
+            }
+        }
+    }
+    let zones = tree
+        .find_all("zone")
+        .iter()
+        .map(|z| {
+            let kept: Vec<String> = z
+                .children()
+                .unwrap_or(&[])
+                .iter()
+                .filter(|c| !matches!(c.head(), Some("filled_polygon" | "fill_segments")))
+                .map(|c| format!("{c:?}"))
+                .collect();
+            kept.join("|")
+        })
+        .collect();
+    let mut pads: Vec<String> = crate::tools::fanout::copper_pads(tree)
+        .into_iter()
+        .map(|p| format!("{}.{}={}", p.reference, p.number, p.net.unwrap_or_default()))
+        .collect();
+    pads.sort();
+    let setup = ["setup", "layers", "general"].iter().map(|t| format!("{:?}", tree.find(t))).collect();
+    BTreeMap::from([
+        ("edge_cuts", digest(edge)),
+        ("zone_outlines_and_settings", digest(zones)),
+        ("pad_nets", digest(pads)),
+        ("board_setup_and_stackup", digest(setup)),
+    ])
+}
+
 pub(crate) fn diff_trees(before: &SexpNode, after: &SexpNode) -> Value {
     let (pa, pb) = (parts(before), parts(after));
-    let added: Vec<&String> = pb.keys().filter(|k| !pa.contains_key(*k)).collect();
-    let removed: Vec<&String> = pa.keys().filter(|k| !pb.contains_key(*k)).collect();
+    let added: Vec<&String> = pb.iter().filter(|(k, _)| !pa.contains_key(*k)).map(|(_, p)| &p.reference).collect();
+    let removed: Vec<&String> = pa.iter().filter(|(k, _)| !pb.contains_key(*k)).map(|(_, p)| &p.reference).collect();
     let mut moved = Vec::new();
-    for (reference, a) in &pa {
-        let Some(b) = pb.get(reference) else { continue };
+    for (key, a) in &pa {
+        let Some(b) = pb.get(key) else { continue };
         let distance = (b.x - a.x).hypot(b.y - a.y);
         let rotated = (b.rotation - a.rotation).rem_euclid(360.0) > 1e-6;
-        if distance > 1e-4 || rotated || a.back != b.back || a.footprint != b.footprint {
+        if distance > 1e-4 || rotated || a.back != b.back || a.footprint != b.footprint || a.reference != b.reference {
             moved.push(json!({
-                "reference": reference,
+                "reference": b.reference,
+                "renamed_from": (a.reference != b.reference).then(|| a.reference.clone()),
                 "from": { "x": a.x, "y": a.y, "rotation": a.rotation },
                 "to": { "x": b.x, "y": b.y, "rotation": b.rotation },
                 "distance_mm": r3(distance),
@@ -280,12 +370,16 @@ pub(crate) fn diff_trees(before: &SexpNode, after: &SexpNode) -> Value {
     for net in nets {
         let a = ra.get(net).cloned().unwrap_or_default();
         let b = rb.get(net).cloned().unwrap_or_default();
-        if a.segments != b.segments || a.vias != b.vias || (a.length_mm - b.length_mm).abs() > 1e-3 {
+        let keys: BTreeSet<&String> = a.copper.keys().chain(b.copper.keys()).collect();
+        let copper_changed = keys.iter().any(|k| (a.copper.get(*k).unwrap_or(&0.0) - b.copper.get(*k).unwrap_or(&0.0)).abs() > 1e-3);
+        if a.segments != b.segments || a.vias != b.vias || (a.length_mm - b.length_mm).abs() > 1e-3 || copper_changed {
+            let per = |r: &NetRouting| r.copper.iter().map(|(k, v)| (k.clone(), json!(r3(*v)))).collect::<serde_json::Map<_, _>>();
             routed.push(json!({
                 "net": net,
                 "segments": [a.segments, b.segments],
                 "vias": [a.vias, b.vias],
                 "length_mm": [r3(a.length_mm), r3(b.length_mm)],
+                "length_by_layer_and_width": [per(&a), per(&b)],
             }));
         }
     }
@@ -294,6 +388,8 @@ pub(crate) fn diff_trees(before: &SexpNode, after: &SexpNode) -> Value {
         (r.values().map(|n| n.segments).sum::<usize>(), r.values().map(|n| n.vias).sum::<usize>(), r3(r.values().map(|n| n.length_mm).sum::<f64>()))
     };
     let (ta, tb) = (total(&ra), total(&rb));
+    let (da, db) = (other_digests(before), other_digests(after));
+    let other: Vec<&str> = da.iter().filter(|(k, v)| db.get(*k) != Some(*v)).map(|(k, _)| *k).collect();
     json!({
         "summary": {
             "parts_added": added.len(),
@@ -305,7 +401,9 @@ pub(crate) fn diff_trees(before: &SexpNode, after: &SexpNode) -> Value {
             "routed_length_mm": [ta.2, tb.2],
             "zones_added": zb.difference(&za).count(),
             "zones_removed": za.difference(&zb).count(),
+            "other_changes": other.len(),
         },
+        "other_changes": other,
         "parts": { "added": added, "removed": removed, "moved": moved },
         "routing": routed,
         "zones": { "added": zb.difference(&za).collect::<Vec<_>>(), "removed": za.difference(&zb).collect::<Vec<_>>() },
@@ -338,6 +436,20 @@ async fn handle_diff(args: &Value, ctx: &ToolContext) -> anyhow::Result<CallTool
     body["checkpoint_label"] = meta["label"].clone();
     body["source"] = json!(source);
     body["identical"] = json!(sha256(&now) == meta["sha256"].as_str().unwrap_or(""));
+    let mut files = serde_json::Map::new();
+    for suffix in SIDECARS {
+        let then = meta["sidecars"][suffix].as_str();
+        let current = std::fs::read_to_string(sidecar_path(&board, suffix)).ok().map(|t| sha256(&t));
+        let state = match (then, current.as_deref()) {
+            (None, None) => continue,
+            (Some(a), Some(b)) if a == b => "unchanged",
+            (Some(_), Some(_)) => "changed",
+            (None, Some(_)) => if meta.get("sidecars").is_some() { "added" } else { "not in checkpoint" },
+            (Some(_), None) => "removed",
+        };
+        files.insert(suffix.to_string(), json!(state));
+    }
+    body["project_files"] = Value::Object(files);
     body["checkpoints"] = json!(checkpoints.iter().map(|(i, m)| json!({"id": i, "label": m["label"]})).collect::<Vec<_>>());
     Ok(CallToolResult::json(&body))
 }
@@ -345,29 +457,74 @@ async fn handle_diff(args: &Value, ctx: &ToolContext) -> anyhow::Result<CallTool
 async fn handle_restore(args: &Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let id = args["checkpoint"].as_str().unwrap_or_default().to_string();
-    let path = checkpoint_dir(&board).join(format!("{id}.kicad_pcb"));
-    let Ok(restored) = std::fs::read_to_string(&path) else {
-        return Ok(CallToolResult::error_kind(
-            ToolErrorKind::InvalidArgument { field: "checkpoint".into(), reason: format!("no checkpoint '{id}'") },
-            format!("No checkpoint '{id}' for this board"),
-        ));
+    let refuse = |reason: String| {
+        CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument { field: "checkpoint".into(), reason: reason.clone() },
+            format!("checkpoint '{id}': {reason}"),
+        )
     };
+    if !valid_id(&id) {
+        return Ok(refuse("not a checkpoint id (letters, digits, '-' and '_' only)".into()));
+    }
+    let dir = checkpoint_dir(&board);
+    let Ok(restored) = std::fs::read_to_string(dir.join(format!("{id}.kicad_pcb"))) else {
+        return Ok(refuse("no such checkpoint for this board".into()));
+    };
+    let meta: Value = std::fs::read_to_string(dir.join(format!("{id}.json")))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+    // The checkpoint must be the one recorded, and a board KiCad can read.
+    if meta["sha256"].as_str() != Some(sha256(&restored).as_str()) {
+        return Ok(refuse("its content does not match the recorded sha256; it was changed or truncated".into()));
+    }
+    if !konnect_sexp::parse_sexp(&restored).map(|t| t.head() == Some("kicad_pcb")).unwrap_or(false) {
+        return Ok(refuse("it does not parse as a KiCad board".into()));
+    }
+    let mut sidecars: Vec<(PathBuf, String)> = Vec::new();
+    for suffix in SIDECARS {
+        let Some(recorded) = meta["sidecars"][suffix].as_str() else { continue };
+        let text = std::fs::read_to_string(dir.join(format!("{id}.{suffix}")))
+            .with_context(|| format!("read the checkpoint's {suffix}"))?;
+        if sha256(&text) != recorded {
+            return Ok(refuse(format!("its {suffix} does not match the recorded sha256")));
+        }
+        sidecars.push((sidecar_path(&board, suffix), text));
+    }
     if let Some(refusal) = crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "checkpoint restore").await? {
+        return Ok(refusal);
+    }
+    if let Some(refusal) = crate::tools::pcb_board::refuse_if_project_locked_by_kicad(&sidecar_path(&board, "kicad_pro"), "checkpoint restore") {
         return Ok(refusal);
     }
     let current = konnect_sexp::writer::read_consistent(&board)?;
     let safety = write_checkpoint(&board, &current, "pre-restore", "saved file")?;
-    match konnect_sexp::write_atomic_if_unchanged(&board, &current, &restored) {
-        Ok(()) => Ok(CallToolResult::json(&json!({
+    let mut transitions = vec![konnect_sexp::transaction::FileTransition::replace(&board, current, restored)];
+    let mut restored_files = vec![board.display().to_string()];
+    for (path, text) in sidecars {
+        transitions.push(match std::fs::read_to_string(&path) {
+            Ok(now) => konnect_sexp::transaction::FileTransition::replace(&path, now, text),
+            Err(_) => konnect_sexp::transaction::FileTransition::create(&path, text),
+        });
+        restored_files.push(path.display().to_string());
+    }
+    let journal_dir = board.parent().unwrap_or(Path::new("."));
+    match konnect_sexp::transaction::try_commit_file_transaction(journal_dir, transitions) {
+        Ok(_) => Ok(CallToolResult::json(&json!({
             "restored": id,
-            "board": board,
+            "files": restored_files,
             "previous_state_checkpoint": safety,
+            "note": if meta.get("sidecars").is_some() { "board, project, rules and intent restored together" } else { "an older checkpoint: only the board was saved, so only the board was restored" },
         }))),
-        Err(konnect_sexp::SexpError::Conflict { .. }) => Ok(CallToolResult::error_kind(
-            ToolErrorKind::Conflict { paths: vec![board.display().to_string()] },
-            "The board file changed while restoring; nothing was written. Retry.",
+        Err(failure) if failure.journal.is_none() => Ok(CallToolResult::error_kind(
+            ToolErrorKind::Conflict { paths: restored_files },
+            format!("Nothing was written: {}", failure.error),
         )),
-        Err(e) => Err(e.into()),
+        Err(failure) => Err(anyhow::anyhow!(
+            "restore failed after its journal reached disk ({}); recovery will complete or roll it back: {:?}",
+            failure.error,
+            failure.journal
+        )),
     }
 }
 
@@ -432,5 +589,64 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&board).unwrap(), original);
         // The pre-restore state was kept, so the restore can be undone.
         assert_eq!(list(&board).len(), 2);
+    }
+
+    #[test]
+    fn diff_sees_width_layer_outline_and_duplicate_references() {
+        let before = konnect_sexp::parse_sexp(
+            "(kicad_pcb
+              (gr_rect (start 0 0) (end 50 50) (layer \"Edge.Cuts\"))
+              (footprint \"H\" (layer \"F.Cu\") (uuid \"a\") (at 5 5) (property \"Reference\" \"H1\"))
+              (footprint \"H\" (layer \"F.Cu\") (uuid \"b\") (at 45 5) (property \"Reference\" \"H1\"))
+              (segment (start 0 0) (end 10 0) (width 0.2) (layer \"F.Cu\") (net \"A\")))",
+        )
+        .unwrap();
+        let after = konnect_sexp::parse_sexp(
+            "(kicad_pcb
+              (gr_rect (start 0 0) (end 60 50) (layer \"Edge.Cuts\"))
+              (footprint \"H\" (layer \"F.Cu\") (uuid \"a\") (at 5 5) (property \"Reference\" \"H1\"))
+              (footprint \"H\" (layer \"F.Cu\") (uuid \"b\") (at 55 5) (property \"Reference\" \"H1\"))
+              (segment (start 0 0) (end 10 0) (width 0.4) (layer \"B.Cu\") (net \"A\")))",
+        )
+        .unwrap();
+        let d = diff_trees(&before, &after);
+        // The second H1 moved; with reference keys it collapsed into the first.
+        assert_eq!(d["summary"]["parts_moved"], 1, "{d}");
+        assert_eq!(d["parts"]["moved"][0]["distance_mm"], 10.0);
+        // Same count and length, other width and layer.
+        assert_eq!(d["routing"][0]["net"], "A", "{d}");
+        assert_eq!(d["other_changes"], json!(["edge_cuts"]));
+        assert_eq!(diff_trees(&before, &before)["summary"]["other_changes"], 0);
+        assert_eq!(diff_trees(&before, &before)["routing"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_tampered_or_escaping_checkpoints_and_restores_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        let dru = dir.path().join("b.kicad_dru");
+        std::fs::write(&board, "(kicad_pcb (version 1))\n").unwrap();
+        std::fs::write(&dru, "(version 1)\n").unwrap();
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(String::new());
+        let made = handle_checkpoint(&json!({ "board": board, "label": "x" }), &ctx).await.unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &made.content[0] else { panic!() };
+        let id = serde_json::from_str::<Value>(text).unwrap()["checkpoint"].as_str().unwrap().to_string();
+        std::fs::write(&dru, "(version 1)\n(rule \"later\" (constraint clearance (min 1mm)))\n").unwrap();
+        std::fs::write(&board, "(kicad_pcb (version 2))\n").unwrap();
+
+        for bad in ["../../etc/passwd", "a/b", ""] {
+            let r = handle_restore(&json!({ "board": board, "checkpoint": bad }), &ctx).await.unwrap();
+            assert!(r.is_error, "{bad}");
+        }
+        let stored = checkpoint_dir(&board).join(format!("{id}.kicad_pcb"));
+        let original = std::fs::read_to_string(&stored).unwrap();
+        std::fs::write(&stored, "(kicad_pcb (version 9))\n").unwrap();
+        assert!(handle_restore(&json!({ "board": board, "checkpoint": id }), &ctx).await.unwrap().is_error, "hash mismatch");
+        std::fs::write(&stored, original).unwrap();
+
+        let r = handle_restore(&json!({ "board": board, "checkpoint": id }), &ctx).await.unwrap();
+        assert!(!r.is_error, "{r:?}");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), "(kicad_pcb (version 1))\n");
+        assert_eq!(std::fs::read_to_string(&dru).unwrap(), "(version 1)\n", "rules restored with the board");
     }
 }

@@ -145,6 +145,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "net": { "type": "string" },
                     "width": { "type": "number", "description": "mm; default from the net class" },
                     "lock": { "type": "boolean", "default": false },
+                    "drc_gate": { "type": "boolean", "default": true, "description": "Run KiCad DRC before and after (project rules, zones refilled) and undo the path if it adds any DRC error" },
                     "paths": { "type": "array", "items": {
                         "type": "object",
                         "properties": {
@@ -218,6 +219,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "clearance":   { "type": "number", "default": 0.2, "description": "Minimum copper clearance used when choosing via sites" },
                     "max_stub":    { "type": "number", "default": 2.5, "description": "Longest stub from pad centre to via (mm)" },
                     "lock":        { "type": "boolean", "default": true },
+                    "drc_gate":    { "type": "boolean", "default": true, "description": "Run KiCad DRC before and after (project rules, zones refilled) and undo the fan-out if it adds any DRC error" },
                     "dry_run":     { "type": "boolean", "default": false }
                 },
                 "required": ["board"]
@@ -870,6 +872,10 @@ async fn handle_fanout_to_plane(
     });
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
     let lock = args["lock"].as_bool().unwrap_or(true);
+    let drc_gate = args["drc_gate"].as_bool().unwrap_or(true);
+    let cli_path = ctx.config.kicad_cli.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let board_for_gate = board.canonicalize().unwrap_or_else(|_| board.clone());
 
     let result = with_board_ipc_classified(ctx, &board, move |client, document| {
         let snapshot = client.save_document_to_string_in(document.clone())?;
@@ -880,7 +886,7 @@ async fn handle_fanout_to_plane(
         }
         let fanout = plan(&tree, &nets, &options_for);
         if dry_run || fanout.fanouts.is_empty() {
-            return Ok((fanout, 0usize));
+            return Ok((fanout, 0usize, None));
         }
         let codes = client
             .get_nets_in(document.clone())?
@@ -915,6 +921,10 @@ async fn handle_fanout_to_plane(
         if client.save_document_to_string_in(document.clone())? != snapshot {
             anyhow::bail!("the board changed while the fan-out was planned; retry");
         }
+        if drc_gate {
+            let evidence = gated_commit(client, document, &snapshot, "Fan out to plane", items, &board_for_gate, &cli_path, &runtime)?;
+            return Ok((fanout, evidence.created, Some(evidence)));
+        }
         let expected = items.len();
         let created = client.run_commit("Fan out to plane", |client| {
             client.create_items_in_returning(document.clone(), items)
@@ -922,20 +932,22 @@ async fn handle_fanout_to_plane(
         if created.len() != expected {
             anyhow::bail!("KiCad created {} of {} fan-out items", created.len(), expected);
         }
-        Ok((fanout, created.len()))
+        Ok((fanout, created.len(), None))
     })
     .await?;
     match result {
-        Ok((fanout, created)) => Ok(CallToolResult::json(&json!({
+        Ok((fanout, created, gate)) => Ok(CallToolResult::json(&json!({
+            "drc_gate": gate,
             "dry_run": dry_run,
             "nets": fanout.nets,
+            "plane_source": fanout.plane_source,
             "planned": fanout.fanouts.len(),
             "created_items": created,
             "locked": lock && !dry_run,
             "through_hole_pads_skipped": fanout.through_hole_pads,
             "fanouts": fanout.fanouts,
             "skipped": fanout.skipped,
-            "next_step": "Refill zones and run DRC: site checks are box-model approximations."
+            "next_step": if drc_gate && !dry_run { "KiCad DRC found no new errors (zones refilled); autoroute the remaining nets." } else { "Refill zones and run DRC." }
         }))),
         Err(failure) => Ok(CallToolResult::error_kind(
             ToolErrorKind::HandlerError {
@@ -1027,7 +1039,12 @@ async fn handle_route_path(
         }
     }
 
+    let drc_gate = args["drc_gate"].as_bool().unwrap_or(true);
+    let cli_path = ctx.config.kicad_cli.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let board_for_gate = board.canonicalize().unwrap_or_else(|_| board.clone());
     let result = with_board_ipc_classified(ctx, &board, move |client, document| {
+        let before = if drc_gate { Some(client.save_document_to_string_in(document.clone())?) } else { None };
         // Resolve every pad reference once.
         let mut pads_by_ref: BTreeMap<String, Vec<konnect_ipc::IpcPad>> = BTreeMap::new();
         let mut resolved: Vec<(String, Option<f64>, Vec<PathPoint>)> = Vec::new();
@@ -1109,23 +1126,28 @@ async fn handle_route_path(
             via.locked = locked;
             items.push(konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via"));
         }
+        if let Some(before) = before {
+            let evidence = gated_commit(client, document, &before, "Route path", items, &board_for_gate, &cli_path, &runtime)?;
+            return Ok((net, segments, via_specs.len(), length, Some(evidence)));
+        }
         let expected = items.len();
         let created = client.run_commit("Route path", |client| client.create_items_in_returning(document.clone(), items))?;
         if created.len() != expected {
             anyhow::bail!("KiCad created {} of {} route items", created.len(), expected);
         }
-        Ok((net, segments, via_specs.len(), length))
+        Ok((net, segments, via_specs.len(), length, None))
     })
     .await?;
     match result {
-        Ok((net, segments, vias, length)) => Ok(CallToolResult::json(&json!({
+        Ok((net, segments, vias, length, gate)) => Ok(CallToolResult::json(&json!({
+            "drc_gate": gate,
             "net": net,
             "segments": segments,
             "vias": vias,
             "routed_length_mm": (length * 1000.0).round() / 1000.0,
             "locked": lock,
             "undo": "one KiCad undo step ('Route path')",
-            "next_step": "run_drc to check clearances"
+            "next_step": if gate_used(&gate) { "KiCad DRC found no new errors" } else { "run_drc to check clearances" }
         }))),
         Err(failure) => Ok(CallToolResult::error_kind(
             ToolErrorKind::HandlerError { reason: failure.message().to_string() },
@@ -1400,6 +1422,149 @@ async fn drc_with_project_rules(
     Ok((report, json))
 }
 
+/// What identifies one DRC violation across two runs: its rule and the KIIDs
+/// of the items it involves. KIIDs survive save and zone refill. A violation
+/// naming no item falls back to its rule and positions at 10 µm (not its
+/// description, which embeds measured values that move with a refill).
+fn violation_key(violation: &cli::DrcViolation) -> String {
+    let mut ids: Vec<&str> = violation.items.iter().filter_map(|i| i.uuid.as_deref()).collect();
+    if !ids.is_empty() {
+        ids.sort_unstable();
+        return format!("{}|{}", violation.rule, ids.join(","));
+    }
+    let positions: Vec<String> = violation
+        .items
+        .iter()
+        .filter_map(|i| i.pos.as_ref())
+        .chain(violation.pos.as_ref())
+        .map(|p| format!("{:.2},{:.2}", p.x, p.y))
+        .collect();
+    format!("{}|{}", violation.rule, positions.join(";"))
+}
+
+/// Error violations in `after` that `before` did not have, by identity: a
+/// new short does not hide behind an unrelated error the change removed.
+/// Copper faults that block a change whatever severity the project gives
+/// them: a project that downgrades clearance to a warning must not let a
+/// short through the gate.
+const ALWAYS_BLOCKING: [&str; 4] = ["shorting_items", "tracks_crossing", "clearance", "hole_clearance"];
+
+fn blocks(violation: &cli::DrcViolation) -> bool {
+    violation.severity == "error" || ALWAYS_BLOCKING.contains(&violation.rule.as_str())
+}
+
+pub(crate) fn new_drc_errors<'a>(before: &cli::DrcReport, after: &'a cli::DrcReport) -> Vec<&'a cli::DrcViolation> {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for violation in before.violations.iter().filter(|v| blocks(v)) {
+        *seen.entry(violation_key(violation)).or_insert(0) += 1;
+    }
+    let mut added = Vec::new();
+    for violation in after.violations.iter().filter(|v| blocks(v)) {
+        match seen.get_mut(&violation_key(violation)) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => added.push(violation),
+        }
+    }
+    added
+}
+
+fn describe_new_errors(added: &[&cli::DrcViolation]) -> String {
+    let mut by_rule: BTreeMap<&str, usize> = BTreeMap::new();
+    for v in added {
+        *by_rule.entry(v.rule.as_str()).or_insert(0) += 1;
+    }
+    let counts = by_rule.iter().map(|(r, n)| format!("{n} {r}")).collect::<Vec<_>>().join(", ");
+    let examples = added.iter().take(3).map(|v| v.description.clone()).collect::<Vec<_>>().join("; ");
+    format!("{counts}; e.g. {examples}")
+}
+
+fn gate_used(gate: &Option<GateEvidence>) -> bool {
+    gate.is_some()
+}
+
+/// Evidence from a DRC-gated commit.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct GateEvidence {
+    pub created: usize,
+    pub baseline_drc_errors: usize,
+    pub drc_errors: usize,
+    pub new_drc_errors: usize,
+    pub unconnected_before: Option<usize>,
+    pub unconnected_after: Option<usize>,
+    pub refill_zones: bool,
+    /// The DRC ran on a refilled copy; the live board's fills are as they
+    /// were. Refill (or export with refill) before manufacturing.
+    pub zones_stale: bool,
+}
+
+/// Create `items` in one commit, then DRC the board before and after with
+/// the project's rules (zones refilled when the board has any). Any new
+/// error by identity deletes exactly the created KIIDs in a compensating
+/// commit and proves the board serialises as it did before; the error says
+/// what was added. Runs inside a blocking IPC closure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gated_commit(
+    client: &konnect_ipc::client::KiCadIpcClient,
+    document: konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    before: &str,
+    label: &str,
+    items: Vec<prost_types::Any>,
+    board: &Path,
+    cli_path: &str,
+    runtime: &tokio::runtime::Handle,
+) -> anyhow::Result<GateEvidence> {
+    let expected = items.len();
+    let created_ids = client.run_commit(label, |client| {
+        let created = client.create_items_in_returning(document.clone(), items)?;
+        if created.len() != expected {
+            anyhow::bail!("KiCad created {} of {} items", created.len(), expected);
+        }
+        created_route_item_ids(&created)
+    })?;
+    let refill = before.contains("(zone");
+    let checked = (|| -> anyhow::Result<GateEvidence> {
+        let after = client.save_document_to_string_in(document.clone())?;
+        let (baseline, _) = runtime.block_on(drc_with_project_rules(cli_path, board, before, refill))?;
+        let (report, _) = runtime.block_on(drc_with_project_rules(cli_path, board, &after, refill))?;
+        let added = new_drc_errors(&baseline, &report);
+        if !added.is_empty() {
+            anyhow::bail!("the change adds DRC errors ({})", describe_new_errors(&added));
+        }
+        // A via or track can cut a plane neck once zones refill; pairs change,
+        // so the count is what is compared.
+        let unconnected = |r: &cli::DrcReport| r.unconnected_items.as_ref().map(Vec::len);
+        if let (Some(was), Some(now)) = (unconnected(&baseline), unconnected(&report)) {
+            if now > was {
+                anyhow::bail!("the change leaves {now} unconnected items where there were {was} (zones refilled)");
+            }
+        }
+        let errors = |r: &cli::DrcReport| r.violations.iter().filter(|v| v.severity == "error").count();
+        Ok(GateEvidence {
+            created: created_ids.len(),
+            baseline_drc_errors: errors(&baseline),
+            drc_errors: errors(&report),
+            new_drc_errors: 0,
+            unconnected_before: baseline.unconnected_items.as_ref().map(Vec::len),
+            unconnected_after: report.unconnected_items.as_ref().map(Vec::len),
+            refill_zones: refill,
+            zones_stale: refill,
+        })
+    })();
+    match checked {
+        Ok(evidence) => Ok(evidence),
+        Err(error) => {
+            client
+                .run_commit(&format!("Undo {label}"), |client| client.delete_items_in(document.clone(), created_ids.clone()))
+                .with_context(|| format!("{error:#}; the compensating deletion also failed"))?;
+            let restored = client.save_document_to_string_in(document.clone())?;
+            if restored != before {
+                anyhow::bail!("{error:#}; the created items were deleted but the board does not serialise exactly as before");
+            }
+            Err(error.context("rolled back: the board is exactly as before"))
+        }
+    }
+}
+
 /// Error-severity violations, counted by rule.
 fn drc_errors_by_rule(report: &cli::DrcReport) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
@@ -1648,27 +1813,15 @@ async fn handle_apply_specctra_ses(
             // The import may not add a DRC error the board did not already
             // have (a short through a plane-net via, a clearance violation):
             // any new error rolls the whole import back.
+            // Compared by identity (rule + involved KIIDs), not by count per
+            // rule: a new short must not hide behind an error the routes fixed.
             let before_errors = drc_errors_by_rule(&baseline);
             let after_errors = drc_errors_by_rule(&drc);
-            let added = after_errors
-                .iter()
-                .filter_map(|(rule, &count)| {
-                    let was = before_errors.get(rule).copied().unwrap_or(0);
-                    (count > was).then(|| format!("{} more {rule}", count - was))
-                })
-                .collect::<Vec<_>>();
+            let added = new_drc_errors(&baseline, &drc);
             if !added.is_empty() {
-                let examples = drc
-                    .violations
-                    .iter()
-                    .filter(|v| v.severity == "error" && before_errors.get(&v.rule).copied().unwrap_or(0) < after_errors[&v.rule])
-                    .take(3)
-                    .map(|v| v.description.clone())
-                    .collect::<Vec<_>>();
                 anyhow::bail!(
-                    "the routes add DRC errors ({}), e.g. {}; the import was rolled back",
-                    added.join(", "),
-                    examples.join("; ")
+                    "the routes add DRC errors ({}); the import was rolled back",
+                    describe_new_errors(&added)
                 );
             }
             let parity_count = drc.schematic_parity.as_ref().map_or(0, Vec::len);
@@ -4334,5 +4487,68 @@ mod route_path_args_tests {
         ] {
             assert!(parse_route_path_args(&args).is_err(), "{args}");
         }
+    }
+}
+
+#[cfg(test)]
+mod drc_identity_tests {
+    use super::{new_drc_errors, cli};
+
+    fn violation(rule: &str, ids: &[&str]) -> cli::DrcViolation {
+        serde_json::from_value(serde_json::json!({
+            "severity": "error", "description": format!("{rule} between {ids:?}"), "rule": rule, "pos": null,
+            "items": ids.iter().map(|id| serde_json::json!({"description": id, "pos": {"x": 1.0, "y": 2.0}, "uuid": id})).collect::<Vec<_>>()
+        })).unwrap()
+    }
+
+    fn report(violations: Vec<cli::DrcViolation>) -> cli::DrcReport {
+        cli::DrcReport { violations, unconnected_items: Some(vec![]), schematic_parity: None,
+                         ownership_diagnostic: None, schematic_parity_diagnostic: None }
+    }
+
+    #[test]
+    fn a_swap_within_one_rule_is_caught() {
+        // The change fixes one clearance error and creates another: the old
+        // per-rule count stayed at 1 and let the new short through.
+        let before = report(vec![violation("clearance", &["a", "b"])]);
+        let after = report(vec![violation("clearance", &["c", "new-track"])]);
+        let added = new_drc_errors(&before, &after);
+        assert_eq!(added.len(), 1);
+        assert!(added[0].description.contains("new-track"));
+    }
+
+    #[test]
+    fn identical_errors_in_any_order_are_not_new() {
+        let before = report(vec![violation("clearance", &["a", "b"]), violation("shorting_items", &["x", "y"])]);
+        let after = report(vec![violation("shorting_items", &["y", "x"]), violation("clearance", &["b", "a"])]);
+        assert!(new_drc_errors(&before, &after).is_empty());
+    }
+
+    #[test]
+    fn duplicates_count_as_a_multiset_and_warnings_are_ignored() {
+        let before = report(vec![violation("clearance", &["a", "b"])]);
+        let mut warning = violation("silk_overlap", &["s"]);
+        warning.severity = "warning".into();
+        let after = report(vec![violation("clearance", &["a", "b"]), violation("clearance", &["a", "b"]), warning]);
+        assert_eq!(new_drc_errors(&before, &after).len(), 1);
+        // A short blocks even when the project made it a warning.
+        let mut short = violation("shorting_items", &["n1", "n2"]);
+        short.severity = "warning".into();
+        assert_eq!(new_drc_errors(&before, &report(vec![violation("clearance", &["a", "b"]), short])).len(), 1);
+    }
+
+    #[test]
+    fn violations_without_ids_compare_by_position() {
+        let mut v = violation("hole_clearance", &[]);
+        v.items = vec![];
+        v.pos = Some(serde_json::from_value(serde_json::json!({"x": 10.0, "y": 5.0})).unwrap());
+        let mut moved = v.clone();
+        moved.pos = Some(serde_json::from_value(serde_json::json!({"x": 10.5, "y": 5.0})).unwrap());
+        // A refill changes the measured value in the description, not the identity.
+        let mut remeasured = v.clone();
+        remeasured.description = "hole clearance (actual 0.1499 mm)".into();
+        assert!(new_drc_errors(&report(vec![v.clone()]), &report(vec![remeasured])).is_empty());
+        assert!(new_drc_errors(&report(vec![v.clone()]), &report(vec![v.clone()])).is_empty());
+        assert_eq!(new_drc_errors(&report(vec![v]), &report(vec![moved])).len(), 1);
     }
 }

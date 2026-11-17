@@ -92,6 +92,8 @@ pub(crate) const ALREADY_REACHES_PLANE: &str = "already reaches its plane throug
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct FanoutPlan {
     pub nets: Vec<String>,
+    /// What "reaches the plane" was judged against.
+    pub plane_source: &'static str,
     pub fanouts: Vec<PlannedFanout>,
     pub skipped: Vec<SkippedPad>,
     /// Through-hole pads on the nets: they reach every layer already.
@@ -129,6 +131,9 @@ struct BoardGeometry {
     edges: Vec<(Point, Point)>,
     /// Same-net zone outlines on inner layers, per net.
     planes: BTreeMap<String, Vec<Vec<Point>>>,
+    /// The zones' filled copper on inner layers, per net, when the file
+    /// holds a fill: voids, islands and higher-priority zones are cut out.
+    fills: BTreeMap<String, Vec<Vec<Point>>>,
     keepouts: Vec<Keepout>,
 }
 
@@ -228,6 +233,7 @@ impl BoardGeometry {
         }
 
         let mut planes: BTreeMap<String, Vec<Vec<Point>>> = BTreeMap::new();
+        let mut fills: BTreeMap<String, Vec<Vec<Point>>> = BTreeMap::new();
         let mut keepouts = Vec::new();
         let mut zone_nodes: Vec<&SexpNode> = tree.find_all("zone");
         for footprint in konnect_sexp::board::footprints(tree) {
@@ -249,9 +255,17 @@ impl BoardGeometry {
                 if layers.iter().any(|layer| is_inner(layer)) {
                     planes.entry(net.to_string()).or_default().push(polygon);
                 }
+                for fill in zone.find_all("filled_polygon") {
+                    if fill.find_str("layer").is_some_and(is_inner) {
+                        let points = polygon_points(fill);
+                        if points.len() >= 3 {
+                            fills.entry(net.to_string()).or_default().push(points);
+                        }
+                    }
+                }
             }
         }
-        Self { edges, planes, keepouts }
+        Self { edges, planes, fills, keepouts }
     }
 
     fn inside_board(&self, p: Point, margin: f64) -> bool {
@@ -269,7 +283,29 @@ impl BoardGeometry {
     }
 
     fn reaches_plane(&self, net: &str, p: Point) -> bool {
-        self.planes.get(net).is_some_and(|zones| zones.iter().any(|zone| point_in_polygon(p, zone)))
+        self.reaches_plane_with(net, p, 0.0)
+    }
+
+    /// A via of radius `r` at `p` lands wholly on the net's plane copper:
+    /// inside the fill when the file has one (else the outline) and at least
+    /// `r` from its edges. KiCad's fills are fractured into single outlines,
+    /// so the even-odd test and edge distance hold for them.
+    fn reaches_plane_with(&self, net: &str, p: Point, r: f64) -> bool {
+        let polygons = self.fills.get(net).or_else(|| self.planes.get(net));
+        polygons.is_some_and(|zones| {
+            zones.iter().any(|zone| {
+                point_in_polygon(p, zone)
+                    && (r <= 0.0 || polygon_edges(zone).all(|(a, b)| point_segment_distance(p, a, b) >= r - EPS))
+            })
+        })
+    }
+
+    fn plane_source(&self, nets: &[String]) -> &'static str {
+        if nets.iter().all(|n| self.fills.contains_key(n)) {
+            "filled zones (refill after moving parts so the fill is current)"
+        } else {
+            "zone outlines: the file holds no fill for some plane nets, so voids and islands are not seen"
+        }
     }
 
     /// Does a circle at `p` (radius `r`) avoid every via keep-out?
@@ -494,7 +530,7 @@ pub(crate) fn plan(
         });
     }
 
-    let mut result = FanoutPlan { nets: nets.to_vec(), ..FanoutPlan::default() };
+    let mut result = FanoutPlan { nets: nets.to_vec(), plane_source: geometry.plane_source(nets), ..FanoutPlan::default() };
     // Large pads first, so small pads beside them can tie to their vias.
     let mut order: Vec<&PadInfo> = pads.iter().collect();
     order.sort_by_key(|pad| {
@@ -540,7 +576,7 @@ pub(crate) fn plan(
             track_width_mm: options.track_width_mm,
         };
         if pad.size.0.min(pad.size.1) >= options.large_pad_mm {
-            let sites = in_pad_sites(pad, net, &geometry, &options);
+            let sites = in_pad_sites(pad, net, &obstacles, &geometry, &options);
             if sites.is_empty() {
                 result.skipped.push(skip("large pad: no via site inside it reaches the plane"));
                 continue;
@@ -634,7 +670,7 @@ fn closest_point(p: Point, a: Point, b: Point) -> Point {
 }
 
 /// A grid of vias inside a large pad, in the pad's own (rotated) frame.
-fn in_pad_sites(pad: &PadInfo, net: &str, geometry: &BoardGeometry, options: &FanoutOptions) -> Vec<Point> {
+fn in_pad_sites(pad: &PadInfo, net: &str, obstacles: &[Obstacle], geometry: &BoardGeometry, options: &FanoutOptions) -> Vec<Point> {
     let via_r = options.via_size_mm / 2.0;
     let inset = via_r + 0.15;
     let pitch = options.via_size_mm + 0.5;
@@ -651,9 +687,12 @@ fn in_pad_sites(pad: &PadInfo, net: &str, geometry: &BoardGeometry, options: &Fa
     for dx in axis(pad.size.0) {
         for dy in axis(pad.size.1) {
             let site = konnect_sexp::geometry::transform_pad(dx, dy, pad.center.0, pad.center.1, pad.angle);
+            // A through via in the pad spans every layer: other-net copper on
+            // any of them (a B.Cu track under an exposed pad) must be clear.
             if geometry.inside_board(site, options.edge_clearance_mm + via_r)
-                && geometry.reaches_plane(net, site)
+                && geometry.reaches_plane_with(net, site, via_r)
                 && geometry.via_allowed(site, via_r)
+                && site_is_clear(site, pad, net, obstacles, via_r, 0.0, options.clearance_mm, true)
             {
                 sites.push(site);
             }
@@ -694,7 +733,7 @@ fn best_site(
             if !geometry.inside_board(site, options.edge_clearance_mm + via_r) {
                 break;
             }
-            if !geometry.reaches_plane(net, site)
+            if !geometry.reaches_plane_with(net, site, via_r)
                 || !geometry.via_allowed(site, via_r)
                 || !geometry.track_allowed(pad.center, site, half_w, pad.layer)
                 || !site_is_clear(site, pad, net, obstacles, via_r, half_w, options.clearance_mm, true)
@@ -824,7 +863,7 @@ fn segment_polygon_distance(a: Point, b: Point, polygon: &[Point]) -> f64 {
     polygon_edges(polygon).map(|(p, q)| segment_segment_distance(a, b, p, q)).fold(f64::INFINITY, f64::min)
 }
 
-fn point_in_polygon((x, y): Point, polygon: &[Point]) -> bool {
+pub(crate) fn point_in_polygon((x, y): Point, polygon: &[Point]) -> bool {
     let mut inside = false;
     let mut j = polygon.len().wrapping_sub(1);
     for i in 0..polygon.len() {
@@ -998,6 +1037,58 @@ mod tests {
         }
     }
 
+    /// A 3.45 mm exposed GND pad at (10, 10); `extra` adds copper.
+    fn exposed_pad(extra: &str) -> SexpNode {
+        parse_sexp(&format!(
+            "(kicad_pcb (gr_rect (start 0 0) (end 20 20) (layer \"Edge.Cuts\"))
+              (footprint \"QFN\" (layer \"F.Cu\") (at 10 10) (property \"Reference\" \"U1\")
+                (pad \"33\" smd rect (at 0 0) (size 3.45 3.45) (layers \"F.Cu\") (net \"GND\")))
+              (zone (net \"GND\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 20 0) (xy 20 20) (xy 0 20)))
+                {extra}))"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_in_pad_via_avoids_other_net_copper_on_the_far_side() {
+        // A B.Cu signal track runs under the pad along y = 10; a through via
+        // there would short it. The grid row on y = 10 must be dropped.
+        let clear = plan(&exposed_pad(""), &gnd(), &defaults);
+        assert_eq!(clear.fanouts.len(), 9);
+        let tree = parse_sexp(
+            "(kicad_pcb (gr_rect (start 0 0) (end 20 20) (layer \"Edge.Cuts\"))
+              (footprint \"QFN\" (layer \"F.Cu\") (at 10 10) (property \"Reference\" \"U1\")
+                (pad \"33\" smd rect (at 0 0) (size 3.45 3.45) (layers \"F.Cu\") (net \"GND\")))
+              (zone (net \"GND\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 20 0) (xy 20 20) (xy 0 20))))
+              (segment (start 0 10) (end 20 10) (width 0.2) (layer \"B.Cu\") (net \"SIG\")))",
+        )
+        .unwrap();
+        let crossed = plan(&tree, &gnd(), &defaults);
+        assert_eq!(crossed.fanouts.len(), 6, "{crossed:?}");
+        for f in &crossed.fanouts {
+            assert!((f.via_y - 10.0).abs() > 0.3 + 0.1 + 0.2, "{f:?}");
+        }
+    }
+
+    #[test]
+    fn a_void_in_the_plane_fill_is_not_the_plane() {
+        // The outline covers the board, but the fill has a void over the pad's
+        // left half (x < 10): only the right-hand grid column lands on copper.
+        let fill = "(filled_polygon (layer \"In1.Cu\") (pts (xy 10 0) (xy 20 0) (xy 20 20) (xy 10 20)))";
+        let plan = plan(&exposed_pad(fill), &gnd(), &defaults);
+        assert!(plan.plane_source.starts_with("filled zones"), "{}", plan.plane_source);
+        assert!(!plan.fanouts.is_empty());
+        for f in &plan.fanouts {
+            assert!(f.via_x - 0.3 >= 10.0 - 1e-6, "via circle must be wholly on the fill: {f:?}");
+        }
+        let unfilled = plan_fn(&exposed_pad(""));
+        assert!(unfilled.plane_source.starts_with("zone outlines"));
+    }
+
+    fn plan_fn(tree: &SexpNode) -> FanoutPlan {
+        plan(tree, &gnd(), &defaults)
+    }
+
     #[test]
     fn per_net_options_set_the_sizes() {
         let sizes = |_: &str| FanoutOptions { via_size_mm: 0.7, via_drill_mm: 0.35, track_width_mm: 0.4, ..FanoutOptions::default() };
@@ -1085,6 +1176,8 @@ pub(crate) struct CopperPad {
     pub net: Option<String>,
     pub corners: [(f64, f64); 4],
     pub layer: &'static str,
+    /// Surface-mount (one layer) rather than plated through (every layer).
+    pub smd: bool,
 }
 
 pub(crate) fn copper_pads(tree: &SexpNode) -> Vec<CopperPad> {
@@ -1096,6 +1189,7 @@ pub(crate) fn copper_pads(tree: &SexpNode) -> Vec<CopperPad> {
             number: pad.number,
             net: pad.net,
             layer: pad.layer,
+            smd: pad.smd,
         })
         .collect()
 }

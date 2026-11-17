@@ -450,3 +450,56 @@ New toolset **`design_intent`** (6 tools, making 22 toolsets). The calculators e
   - The one remaining warning is real: the board's 4 mounting holes predate the pass-2 attribute fix and lack `exclude_from_pos_files`, so they are in the CPL but not the BOM.
 
 **Review:** a fable review of passes 1–7 and the test design ran alongside this pass. Its other findings are listed for the next pass: impedance enforcement and real stackup, inner-layer width check, voltage-drop reachability, SES gate by violation identity, in-pad via obstacles, diff and restore coverage, and calculator input validation. So are its test methods: KiCad-DRC oracles with seeded violations, negative gate tests, proptest geometry and metamorphic tests, published impedance tables, and CI for the live checks.
+
+## Pass 9: review fixes (fable review of passes 1–8) and oracle tests
+
+The fable reviewer critiqued the fix plan before coding. Its refinements are marked *(review)*.
+
+1. **DRC gate by identity.**
+   - **Comparison:** the gate used to compare error counts per rule, so one new short could cancel one fixed error. Now `new_drc_errors` takes the multiset difference of violations keyed by rule and sorted item KIIDs.
+   - **Fallbacks:** a violation that names no items is keyed by rule and position at 10 µm, never by description, because descriptions embed measured values that change on a refill *(review)*.
+   - **Always blocking:** `shorting_items`, `tracks_crossing`, `clearance` and `hole_clearance` block even when a project downgrades them to warnings *(review)*.
+   - **Shared helper:** `gated_commit` creates items in one commit, then runs DRC before and after with the project rules and zones refilled on a copy. It refuses any new error, or any rise in unconnected items *(review)*. On refusal it deletes exactly the created KIIDs and proves the board serialises byte-identically.
+   - **Coverage:** `route_path` and `fanout_to_plane` use it (`drc_gate`, default on). The SES import uses the identity comparison. Results report `zones_stale` *(review)*.
+   - **Not fixed:** the SES path still refuses boards with existing arcs, because the exporter does not yet represent them to the router *(review)*.
+2. **Impedance** (new `layer_stack.rs`).
+   - **Stackup:** read from the board's `(setup (stackup))`, with sub-layers combined by thickness-weighted harmonic-mean εr. Falls back to the intent plus the board thickness.
+   - **Per-layer model:** the reference planes are the copper layers holding plane-role zones. An outer layer over a plane is a microstrip; an inner layer between two planes is a symmetric stripline, or an IPC-2141A asymmetric one (2·Za·Zb/(Za+Zb)). Any other layer is unmodelled, never given a number.
+   - **Rules:** per-layer width rules (`intent: impedance <net> <layer>`) with min and opt solved from Z·(1±tol) *(review)*. A width below the fab minimum, or a current width over the impedance maximum, is reported as a `conflict`; the width is no longer silently widened.
+   - **Check:** each segment is evaluated on its own layer's model. A plane zone must cover the segment. A pair uses the measured edge-to-edge gap to the partner's parallel overlapping segments *(review)*. The check reports lengths in and out of tolerance, unmodelled, uncoupled and outside the formula's fit.
+3. **Current width per layer.**
+   - The inner minimum comes from the inner copper weight and the inner IPC-2221 factor. There are separate `(layer outer)` and `(layer inner)` rules.
+   - The net-class width is the wider one, so the autorouter's single width is valid on every layer *(review)*.
+   - The check compares each segment with its own layer's minimum at the DRC rule's rounding, and reports the undersized length. Up to 1 mm of necking passes.
+   - The `eecalc` comment claiming IPC-2221 "errs wide" was corrected *(review)*.
+4. **Voltage drop.**
+   - Nodes are per layer, and vias join their span through a barrel resistance (0.020 mm plating). A segment is split wherever a track end, via or pad centre lies on it, which handles T-junctions.
+   - An SMD pad joins its own layer; a through pad joins every layer. Copper is taken at 25 °C plus the allowed rise *(review)*.
+   - A load that routed copper does not reach makes the check `unverified` and is listed by name. It used to be dropped silently, as an existing test showed: C1 sat mid-trace.
+   - A failing track-only drop on a net that also has a zone is `unverified`, not `fail`.
+5. **Fan-out.**
+   - In-pad vias are now checked against other-net copper on every layer.
+   - "Reaches the plane" is judged on the zone's `filled_polygon` when the file has one, and requires the whole via circle on copper *(review)*. Each plan reports its `plane_source`.
+6. **Board history.**
+   - Parts are keyed by footprint UUID, so duplicate references are told apart.
+   - Routing is compared by length per layer and width. `other_changes` digests Edge.Cuts, zone outlines and settings (not fills), pad nets, and board setup and stackup.
+   - Checkpoints include `.kicad_pro`, `.kicad_dru` and `.intent.json`.
+   - A restore checks that the id is a plain name, verifies every stored sha256, parses the board, and refuses while the project is locked. It then writes all the files in one journaled `try_commit_file_transaction`. Older board-only checkpoints still restore *(review)*.
+7. **Calculator inputs.** `engineering_calc` refuses inputs that are non-finite, ≤ 0, εr < 1, or a temperature at or below absolute zero *(review)*.
+
+**Oracle tests** (method 1): `drc_oracle` builds seeded boards, judged by `kicad-cli`, and is added to the KiCad e2e workflow.
+- **Coverage:** every JLCPCB rule must fire on a violation 20 µm past its limit and stay silent 10 µm inside it. The intent rule wins over the fab floor in the written order, and is masked in the reverse order. The per-layer impedance and inner-width rules fire only on their own layer.
+- **Bugs found:** the oracle found two bugs that string tests had passed.
+  - `!A.isPlated()` never matches an NPTH pad in KiCad 10; the rule now uses `A.Pad_Type == 'NPTH, mechanical'`.
+  - The rule map sorted the fab rules by name, so the general `hole diameter` rule followed and overrode the NPTH one. Fab rules are now written in authored order, general first.
+- **Dead-rule note:** "track to PTH hole" only bites where a hole has no copper on the track's layer, such as an inner layer with unused via pads removed.
+
+**Negative gate tests** (method 2):
+- **Unit tests:** a swap within one rule, ordering, multiset counts, uuid-less violations, a description re-measured after refill, and a downgraded short.
+- **Live** (`poc/gate_check.py`, 4-layer board in pcbnew):
+  - a `route_path` shorting XTAL1 into XTAL2 is refused (shorting_items, clearance, mask bridge) and the board diffs as identical;
+  - a clean `route_path` passes;
+  - a hand-made SES wire shorting two nets is rolled back, and the board is identical afterwards;
+  - a clean SES wire is accepted.
+
+  While I wrote the test, the gate also refused two "clean" wires I had chosen badly: one into Y1's GND pad, and one straight across it. Both were real shorts.

@@ -16,7 +16,8 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::board_source::{self, BoardRead, BoardSource};
 use crate::tools::eecalc::{self, LineGeometry};
-use crate::tools::fanout::{copper_pads, polygon_distance, sample_arc, BoardOutline, CopperPad};
+use crate::tools::fanout::{copper_pads, point_in_polygon, polygon_distance, sample_arc, BoardOutline, CopperPad};
+use crate::tools::layer_stack::{width_bounds, LayerStack, LayerWidth};
 use crate::tools::{ToolContext, ToolDef};
 use anyhow::{bail, Context};
 use konnect_sexp::SexpNode;
@@ -93,6 +94,9 @@ pub struct NetIntent {
     /// Edge-to-edge gap for a differential pair (default 0.15 mm).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gap_mm: Option<f64>,
+    /// Impedance tolerance, ± percent (default 10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impedance_tolerance_pct: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_a: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,6 +144,7 @@ impl DesignIntent {
             for (name, value) in [
                 ("impedance_ohm", intent.impedance_ohm),
                 ("gap_mm", intent.gap_mm),
+                ("impedance_tolerance_pct", intent.impedance_tolerance_pct),
                 ("current_a", intent.current_a),
                 ("max_temp_rise_c", intent.max_temp_rise_c),
                 ("max_drop_mv", intent.max_drop_mv),
@@ -256,7 +261,16 @@ struct NetRequirement {
     net: String,
     role: String,
     priority: Option<u8>,
+    /// The net-class width: the autorouter routes every layer with it.
     track_width_mm: Option<f64>,
+    /// IPC-2221 minimum widths for the current, outer and inner layers.
+    current_width_mm: Option<f64>,
+    inner_current_width_mm: Option<f64>,
+    /// Impedance width bounds per layer that has a reference model.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    impedance_widths: Vec<LayerWidth>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    impedance_unmodelled: Vec<String>,
     diff_pair_gap_mm: Option<f64>,
     clearance_mm: Option<f64>,
     max_length_mm: Option<f64>,
@@ -266,7 +280,58 @@ struct NetRequirement {
 }
 
 fn requirements(intent: &DesignIntent) -> Vec<NetRequirement> {
-    let stack = intent.stackup();
+    requirements_on(intent, None)
+}
+
+/// Copper layers that act as reference planes: those holding a zone of a
+/// `plane` net, else (no plane nets in the intent) any inner layer with a
+/// net zone.
+fn plane_layers(tree: &SexpNode, intent: &DesignIntent) -> BTreeSet<String> {
+    let zones = konnect_sexp::board::zones(tree).items;
+    let plane_nets: BTreeSet<&str> = intent.nets.iter().filter(|(_, n)| n.role == "plane").map(|(k, _)| k.as_str()).collect();
+    let mut layers: BTreeSet<String> = zones
+        .iter()
+        .filter(|z| z.net.as_deref().is_some_and(|n| plane_nets.contains(n)))
+        .flat_map(|z| z.layers.iter().filter(|l| l.ends_with(".Cu")).cloned())
+        .collect();
+    if layers.is_empty() {
+        layers = zones
+            .iter()
+            .filter(|z| z.net.is_some())
+            .flat_map(|z| z.layers.iter().filter(|l| l.starts_with("In")).cloned())
+            .collect();
+    }
+    layers
+}
+
+/// The stack and reference planes the requirements use, and where they came from.
+fn stack_and_planes(intent: &DesignIntent, board: Option<&SexpNode>) -> (LayerStack, BTreeSet<String>, String) {
+    match board {
+        Some(tree) => {
+            let stack = LayerStack::for_board(tree, intent.stackup());
+            let planes = plane_layers(tree, intent);
+            let note = format!("{}; reference planes from the board's zones: {:?}", stack.source, planes);
+            (stack, planes, note)
+        }
+        None => {
+            let names: Vec<String> = ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"].iter().map(|s| s.to_string()).collect();
+            let stack = LayerStack::from_intent(intent.stackup(), &names, 1.6);
+            let planes: BTreeSet<String> = ["In1.Cu".to_string(), "In2.Cu".to_string()].into();
+            (stack, planes, "no board read: assumed 4 layers, 1.6 mm, planes on In1/In2".to_string())
+        }
+    }
+}
+
+/// The fab's minimum track width on a layer (JLCPCB standard process).
+fn fab_min_width(stack: &LayerStack, layer: &str) -> f64 {
+    if stack.is_outer(layer) { 0.127 } else { 0.09 }
+}
+
+fn requirements_on(intent: &DesignIntent, board: Option<&SexpNode>) -> Vec<NetRequirement> {
+    let (layers, planes, stack_note) = stack_and_planes(intent, board);
+    let outer_oz = layers.copper.first().map_or(intent.stackup().outer_copper_oz, |c| c.1 / eecalc::MM_PER_OZ);
+    let inner_oz = if layers.copper.len() > 2 { layers.copper[1].1 / eecalc::MM_PER_OZ } else { intent.stackup().inner_copper_oz };
+    let has_inner = layers.copper.len() > 2;
     let mut out = Vec::new();
     for (net, n) in &intent.nets {
         let mut r = NetRequirement {
@@ -274,6 +339,10 @@ fn requirements(intent: &DesignIntent) -> Vec<NetRequirement> {
             role: n.role.clone(),
             priority: n.priority,
             track_width_mm: None,
+            current_width_mm: None,
+            inner_current_width_mm: None,
+            impedance_widths: vec![],
+            impedance_unmodelled: vec![],
             diff_pair_gap_mm: None,
             clearance_mm: n.clearance_mm,
             max_length_mm: n.max_length_mm,
@@ -282,33 +351,69 @@ fn requirements(intent: &DesignIntent) -> Vec<NetRequirement> {
             warnings: vec![],
         };
         if let Some(current) = n.current_a {
-            let calc = eecalc::width_for_current(current, n.max_temp_rise_c.unwrap_or(10.0), stack.outer_copper_oz, false);
-            r.track_width_mm = Some(calc.result.width_mm.max(0.15));
-            r.warnings.extend(calc.warnings.clone());
-            if n.role != "plane" {
-                r.warnings.push("width is for outer layers; an inner-layer run needs about 2.6× as wide (IPC-2221)".to_string());
+            let rise = n.max_temp_rise_c.unwrap_or(10.0);
+            let outer = eecalc::width_for_current(current, rise, outer_oz, false);
+            let inner = eecalc::width_for_current(current, rise, inner_oz, true);
+            let (wo, wi) = (outer.result.width_mm.max(0.15), inner.result.width_mm.max(0.15));
+            r.current_width_mm = Some(wo);
+            r.inner_current_width_mm = has_inner.then_some(wi);
+            // One net-class width serves every layer the autorouter uses, so
+            // it is the wider (inner) width when the board has inner layers.
+            r.track_width_mm = Some(if has_inner { wo.max(wi) } else { wo });
+            if has_inner && n.role != "plane" {
+                r.warnings.push(format!("net-class width {} mm is the inner-layer width ({inner_oz:.2} oz); outer runs need only {} mm", r3(wo.max(wi)), r3(wo)));
             }
-            r.basis.push(serde_json::to_value(&calc).unwrap_or(Value::Null));
+            r.warnings.extend(outer.warnings.clone());
+            r.basis.push(serde_json::to_value(&outer).unwrap_or(Value::Null));
+            if has_inner {
+                r.warnings.extend(inner.warnings.clone());
+                r.basis.push(serde_json::to_value(&inner).unwrap_or(Value::Null));
+            }
         }
         if let Some(target) = n.impedance_ohm {
             let gap = (n.role == "diff_pair").then(|| n.gap_mm.unwrap_or(0.15));
-            let geometry = LineGeometry {
-                width_mm: 0.0,
-                height_mm: stack.outer_dielectric_mm,
-                thickness_mm: stack.outer_copper_oz * eecalc::MM_PER_OZ,
-                er: stack.er,
-                gap_mm: gap,
-            };
-            match eecalc::width_for_impedance(target, geometry, false) {
-                Some(calc) => {
-                    let width = calc.result.geometry.width_mm;
-                    r.track_width_mm = Some(r.track_width_mm.map_or(width, |w: f64| w.max(width)));
-                    r.diff_pair_gap_mm = gap;
-                    r.warnings.extend(calc.warnings.clone());
-                    r.basis.push(serde_json::to_value(&calc).unwrap_or(Value::Null));
+            let tol = n.impedance_tolerance_pct.unwrap_or(10.0) / 100.0;
+            r.diff_pair_gap_mm = gap;
+            for (layer, _) in &layers.copper {
+                if planes.contains(layer) {
+                    continue;
                 }
-                None => r.warnings.push(format!("{target} Ω is not reachable on this stackup with widths 0.01–{} mm", 20.0 * stack.outer_dielectric_mm)),
+                match layers.model(layer, &planes) {
+                    Ok(model) => match width_bounds(model, layer, target, tol, gap) {
+                        Some(bounds) => {
+                            let fab = fab_min_width(&layers, layer);
+                            if bounds.min_mm < fab {
+                                r.warnings.push(format!("conflict: on {layer} the {target} Ω ±{:.0} % minimum width {} mm is below the fab minimum {fab} mm", tol * 100.0, r3(bounds.min_mm)));
+                            }
+                            if !bounds.in_range {
+                                r.warnings.push(format!("{layer}: the geometry is outside the {} fit; treat the width as an estimate", bounds.method));
+                            }
+                            r.impedance_widths.push(bounds);
+                        }
+                        None => r.warnings.push(format!("{layer}: {target} Ω is not reachable with widths 0.01–5 mm")),
+                    },
+                    Err(reason) => r.impedance_unmodelled.push(reason),
+                }
             }
+            if r.impedance_widths.is_empty() {
+                r.warnings.push(format!("no signal layer has a reference model for {target} Ω: {}", r.impedance_unmodelled.join("; ")));
+            }
+            let preferred = r.impedance_widths.iter().find(|w| layers.is_outer(&w.layer)).or(r.impedance_widths.first());
+            if let Some(p) = preferred {
+                if let Some(cw) = r.current_width_mm {
+                    if cw > p.max_mm {
+                        r.warnings.push(format!(
+                            "conflict: the current needs {} mm but {target} Ω allows at most {} mm on {}; the impedance governs and the current rule is not emitted",
+                            r3(cw), r3(p.max_mm), p.layer
+                        ));
+                    }
+                }
+                r.track_width_mm = Some(p.opt_mm);
+                if r.impedance_widths.iter().any(|w| (w.opt_mm - p.opt_mm).abs() > 0.01) {
+                    r.warnings.push(format!("the net class carries the {} width ({} mm); per-layer width rules hold the other layers, so keep this net on {} or route it by hand", p.layer, r3(p.opt_mm), p.layer));
+                }
+            }
+            r.basis.push(json!({ "stackup": stack_note, "tolerance_pct": tol * 100.0 }));
         }
         if n.role == "diff_pair" {
             let recognised = |name: &str| name.ends_with('P') || name.ends_with('N') || name.ends_with('+') || name.ends_with('-');
@@ -344,9 +449,15 @@ fn dru_rules(intent: &DesignIntent, reqs: &[NetRequirement]) -> BTreeMap<String,
             let key = if *net < partner { (net.clone(), partner.clone()) } else { (partner.clone(), net.clone()) };
             if paired.insert(key.clone()) {
                 let mut body = Vec::new();
-                if let (Some(w), Some(g)) = (r.track_width_mm, r.diff_pair_gap_mm) {
-                    body.push(format!("  (constraint track_width (min {}) (opt {}))", mm(w * 0.95), mm(w)));
+                if let Some(g) = r.diff_pair_gap_mm {
                     body.push(format!("  (constraint diff_pair_gap (min {}) (opt {}) (max {}))", mm(g * 0.9), mm(g), mm(g * 1.2)));
+                }
+                for w in &r.impedance_widths {
+                    let name = format!("{RULE_PREFIX}impedance {}/{} {}", key.0, key.1, w.layer);
+                    rules.insert(name.clone(), format!(
+                        "(rule \"{name}\"\n  (layer \"{}\")\n  (condition \"A.NetName == '{}' || A.NetName == '{}'\")\n  (constraint track_width (min {}) (opt {})))",
+                        w.layer, quoted(&key.0), quoted(&key.1), mm(w.min_mm), mm(w.opt_mm)
+                    ));
                 }
                 if let Some(skew) = r.max_skew_mm {
                     body.push(format!("  (constraint skew (max {}))", mm(skew)));
@@ -361,13 +472,29 @@ fn dru_rules(intent: &DesignIntent, reqs: &[NetRequirement]) -> BTreeMap<String,
                     );
                 }
             }
-        } else if let Some(w) = r.track_width_mm {
-            if n.role != "plane" {
+        } else if !r.impedance_widths.is_empty() {
+            for w in &r.impedance_widths {
+                let name = format!("{RULE_PREFIX}impedance {net} {}", w.layer);
+                rules.insert(name.clone(), format!(
+                    "(rule \"{name}\"\n  (layer \"{}\")\n  (condition \"A.NetName == '{}'\")\n  (constraint track_width (min {}) (opt {})))",
+                    w.layer, quoted(net), mm(w.min_mm), mm(w.opt_mm)
+                ));
+            }
+        } else if let (Some(w), true) = (r.current_width_mm, n.role != "plane") {
+            let layer = if r.inner_current_width_mm.is_some() { "\n  (layer outer)" } else { "" };
+            rules.insert(
+                format!("{RULE_PREFIX}width {net}"),
+                format!(
+                    "(rule \"{RULE_PREFIX}width {net}\"{layer}\n  (condition \"A.NetName == '{}'\")\n  (constraint track_width (min {})))",
+                    quoted(net), mm(w)
+                ),
+            );
+            if let Some(wi) = r.inner_current_width_mm {
                 rules.insert(
-                    format!("{RULE_PREFIX}width {net}"),
+                    format!("{RULE_PREFIX}width {net} inner"),
                     format!(
-                        "(rule \"{RULE_PREFIX}width {net}\"\n  (condition \"A.NetName == '{}'\")\n  (constraint track_width (min {})))",
-                        quoted(net), mm(w)
+                        "(rule \"{RULE_PREFIX}width {net} inner\"\n  (layer inner)\n  (condition \"A.NetName == '{}'\")\n  (constraint track_width (min {})))",
+                        quoted(net), mm(wi)
                     ),
                 );
             }
@@ -403,10 +530,12 @@ fn merge_dru(existing: Option<&str>, rules: &BTreeMap<String, String>) -> String
 /// Fab limits are floors: KiCad lets a later rule override an earlier one
 /// for the same constraint, so they go first in the file, where any user or
 /// intent rule (an 0.8 mm power width, say) takes precedence over them.
-fn merge_fab_rules(existing: Option<&str>, rules: &BTreeMap<String, String>) -> String {
+fn merge_fab_rules(existing: Option<&str>, rules: &[(String, String)]) -> String {
     let none = BTreeMap::new();
     let content = merge_managed_rules(existing, &none, FAB_PREFIX);
-    let block: String = rules.values().map(|rule| format!("{rule}\n")).collect();
+    // In table order: within the fab set too, a later rule overrides an
+    // earlier one, so general limits come before specific ones.
+    let block: String = rules.iter().map(|(_, rule)| format!("{rule}\n")).collect();
     let insert_at = match content.find("(version") {
         Some(at) => content[at..].find('\n').map_or(content.len(), |end| at + end + 1),
         None => 0,
@@ -569,37 +698,129 @@ fn r3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
+/// Plating thickness assumed for via barrels (mm): JLCPCB's typical hole wall.
+const VIA_PLATING_MM: f64 = 0.020;
+
+/// The voltage-drop result over routed copper.
+#[derive(Debug)]
+struct DropResult {
+    drop_mv: f64,
+    worst_pad: String,
+    /// Load pads no routed path reaches (fed through a zone, or not routed).
+    unreachable: Vec<String>,
+    temp_c: f64,
+}
+
 /// Worst-case voltage drop from `source` to each pad of the net through the
-/// routed copper (Dijkstra on resistance), assuming the full current flows
-/// along each path: conservative for a net with several loads.
-fn voltage_drop(net: &str, n: &NetIntent, copper: &NetCopper, pads: &[CopperPad], stack: Stackup) -> Result<(f64, String), String> {
+/// routed tracks and vias (Dijkstra on resistance), assuming the full current
+/// flows along each path: conservative for a net with several loads. Nodes
+/// are per layer; a via joins the layers it spans through its barrel; a
+/// track end, via or pad centre lying on another segment splits it (a T);
+/// a surface pad joins its own layer, a through pad every layer. Copper is
+/// taken at 25 °C plus the allowed rise. Zones are not modelled.
+fn voltage_drop(
+    net: &str,
+    n: &NetIntent,
+    copper: &NetCopper,
+    pads: &[CopperPad],
+    vias: &[konnect_sexp::board::Via],
+    layers: &LayerStack,
+) -> Result<DropResult, String> {
     let (src_ref, src_pad) = n.source.as_deref().and_then(|s| s.split_once('.')).ok_or("no source")?;
     let current = n.current_a.ok_or("no current_a")?;
+    let temp_c = 25.0 + n.max_temp_rise_c.unwrap_or(10.0);
+    let oz = |layer: &str| layers.index(layer).map_or(1.0, |i| layers.copper[i].1 / eecalc::MM_PER_OZ);
     let snap = |p: (f64, f64)| ((p.0 * 100.0).round() as i64, (p.1 * 100.0).round() as i64);
-    let mut ids: HashMap<(i64, i64), usize> = HashMap::new();
-    let id = |p: (f64, f64), ids: &mut HashMap<(i64, i64), usize>| {
-        let n = ids.len();
-        *ids.entry(snap(p)).or_insert(n)
+    type NodeKey = (String, (i64, i64));
+    let mut ids: HashMap<NodeKey, usize> = HashMap::new();
+    let node = |layer: &str, p: (f64, f64), ids: &mut HashMap<NodeKey, usize>| {
+        let next = ids.len();
+        *ids.entry((layer.to_string(), snap(p))).or_insert(next)
     };
+    let net_pads: Vec<&CopperPad> = pads.iter().filter(|p| p.net.as_deref() == Some(net)).collect();
+    let net_vias: Vec<&konnect_sexp::board::Via> = vias.iter().filter(|v| v.net.as_deref() == Some(net)).collect();
+    // The layers a via spans, in stack order.
+    let span = |v: &konnect_sexp::board::Via| -> Vec<String> {
+        let idx: Vec<usize> = v.layers.iter().filter_map(|l| layers.index(l)).collect();
+        match (idx.iter().min(), idx.iter().max()) {
+            (Some(&a), Some(&b)) => (a..=b).map(|i| layers.copper[i].0.clone()).collect(),
+            _ => Vec::new(),
+        }
+    };
+    // Points that split a segment on a layer: other track ends, vias, pad centres.
+    let mut splits: HashMap<&str, Vec<(f64, f64)>> = HashMap::new();
+    for (a, b, _, layer) in &copper.segments {
+        splits.entry(layer.as_str()).or_default().extend([*a, *b]);
+    }
+    for pad in &net_pads {
+        let centre = (
+            pad.corners.iter().map(|c| c.0).sum::<f64>() / 4.0,
+            pad.corners.iter().map(|c| c.1).sum::<f64>() / 4.0,
+        );
+        for (layer, list) in splits.iter_mut() {
+            if !pad.smd || *layer == pad.layer {
+                list.push(centre);
+            }
+        }
+    }
+    let via_spans: Vec<Vec<String>> = net_vias.iter().map(|v| span(v)).collect();
+    for (v, layers_of) in net_vias.iter().zip(&via_spans) {
+        for l in layers_of {
+            if let Some(list) = splits.get_mut(l.as_str()) {
+                list.push((v.x, v.y));
+            }
+        }
+    }
     let mut edges: Vec<(usize, usize, f64)> = Vec::new();
     for (a, b, w, layer) in &copper.segments {
-        let oz = if layer.starts_with("In") { stack.inner_copper_oz } else { stack.outer_copper_oz };
         let len = (b.0 - a.0).hypot(b.1 - a.1);
-        let r = eecalc::trace_resistance(len, *w, oz, 25.0, None).result.resistance_ohm;
-        let (ia, ib) = (id(*a, &mut ids), id(*b, &mut ids));
-        edges.push((ia, ib, r));
+        if len < 1e-9 {
+            continue;
+        }
+        let (ux, uy) = ((b.0 - a.0) / len, (b.1 - a.1) / len);
+        let mut cuts: Vec<f64> = vec![0.0, len];
+        for p in splits.get(layer.as_str()).into_iter().flatten() {
+            let t = (p.0 - a.0) * ux + (p.1 - a.1) * uy;
+            let off = ((p.0 - a.0) * uy - (p.1 - a.1) * ux).abs();
+            if t > 1e-3 && t < len - 1e-3 && off <= w / 2.0 {
+                cuts.push(t);
+            }
+        }
+        cuts.sort_by(f64::total_cmp);
+        cuts.dedup_by(|x, y| (*x - *y).abs() < 1e-3);
+        for pair in cuts.windows(2) {
+            let (t0, t1) = (pair[0], pair[1]);
+            let p0 = (a.0 + ux * t0, a.1 + uy * t0);
+            let p1 = (a.0 + ux * t1, a.1 + uy * t1);
+            let r = eecalc::trace_resistance(t1 - t0, *w, oz(layer), temp_c, None).result.resistance_ohm;
+            let (i0, i1) = (node(layer, p0, &mut ids), node(layer, p1, &mut ids));
+            edges.push((i0, i1, r));
+        }
     }
-    // Pads join every segment end that lies on them (zero resistance).
-    let net_pads: Vec<&CopperPad> = pads.iter().filter(|p| p.net.as_deref() == Some(net)).collect();
-    let endpoint_list: Vec<((i64, i64), usize)> = ids.iter().map(|(k, v)| (*k, *v)).collect();
+    // Via barrels between consecutive spanned layers.
+    for (v, layers_of) in net_vias.iter().zip(&via_spans) {
+        for pair in layers_of.windows(2) {
+            let (i, j) = (layers.index(&pair[0]).unwrap_or(0), layers.index(&pair[1]).unwrap_or(0));
+            let height = layers.gaps.get(i.min(j)).map_or(0.2, |g| g.thickness_mm);
+            let circumference = std::f64::consts::PI * (v.drill + VIA_PLATING_MM);
+            let r = eecalc::trace_resistance(height, circumference, VIA_PLATING_MM / eecalc::MM_PER_OZ, temp_c, None).result.resistance_ohm;
+            let (a, b) = (node(&pair[0], (v.x, v.y), &mut ids), node(&pair[1], (v.x, v.y), &mut ids));
+            edges.push((a, b, r));
+        }
+    }
+    // Pads join every node on their layers that lies on them.
+    let endpoint_list: Vec<(NodeKey, usize)> = ids.iter().map(|(k, v)| (k.clone(), *v)).collect();
     let mut pad_nodes: Vec<(String, usize)> = Vec::new();
     for pad in &net_pads {
-        let node = ids.len() + pad_nodes.len();
-        pad_nodes.push((format!("{}.{}", pad.reference, pad.number), node));
-        for (key, endpoint) in &endpoint_list {
+        let pad_node = ids.len() + pad_nodes.len();
+        pad_nodes.push((format!("{}.{}", pad.reference, pad.number), pad_node));
+        for ((layer, key), endpoint) in &endpoint_list {
+            if pad.smd && layer != pad.layer {
+                continue;
+            }
             let p = (key.0 as f64 / 100.0, key.1 as f64 / 100.0);
             if polygon_distance(&[p, p, p], &pad.corners) <= 0.02 {
-                edges.push((node, *endpoint, 0.0));
+                edges.push((pad_node, *endpoint, 0.0));
             }
         }
     }
@@ -637,21 +858,175 @@ fn voltage_drop(net: &str, n: &NetIntent, copper: &NetCopper, pads: &[CopperPad]
             }
         }
     }
-    let (worst, r) = pad_nodes
+    let loads: Vec<&(String, usize)> = pad_nodes.iter().filter(|(_, node)| *node != start).collect();
+    let unreachable: Vec<String> = loads.iter().filter(|(_, node)| !dist[*node].is_finite()).map(|(name, _)| name.clone()).collect();
+    if loads.is_empty() {
+        return Err("the net has no load pad besides the source".to_string());
+    }
+    // No reachable load still reports which loads are cut off.
+    let (worst, r) = loads
         .iter()
-        .filter(|(_, node)| *node != start && dist[*node].is_finite())
+        .filter(|(_, node)| dist[*node].is_finite())
         .map(|(name, node)| (name.clone(), dist[*node]))
         .max_by(|a, b| a.1.total_cmp(&b.1))
-        .ok_or("no load pad is reachable from the source through routed copper")?;
-    Ok((current * r * 1000.0, worst))
+        .unwrap_or_default();
+    Ok(DropResult { drop_mv: current * r * 1000.0, worst_pad: worst, unreachable, temp_c })
+}
+
+/// How much of a net's routed length meets its impedance target.
+#[derive(Debug, Default, Serialize)]
+struct ImpedanceProfile {
+    total_mm: f64,
+    in_tolerance_mm: f64,
+    out_of_tolerance_mm: f64,
+    /// No reference model for the layer, or no plane under the segment.
+    unmodelled_mm: f64,
+    /// Pair segments with no parallel partner segment beside them.
+    uncoupled_mm: f64,
+    /// Modelled, but outside the formula's fitted range.
+    outside_fit_mm: f64,
+    z_min_ohm: Option<f64>,
+    z_max_ohm: Option<f64>,
+    gap_min_mm: Option<f64>,
+    gap_max_mm: Option<f64>,
+    reasons: Vec<String>,
+}
+
+impl ImpedanceProfile {
+    fn status(&self) -> &'static str {
+        let modelled = self.in_tolerance_mm + self.out_of_tolerance_mm;
+        if modelled < 0.5 * self.total_mm || modelled <= 0.0 {
+            "unverified"
+        } else if self.out_of_tolerance_mm > 0.1 * modelled {
+            "fail"
+        } else {
+            "pass"
+        }
+    }
+}
+
+/// The partner segment running beside `(a, b)` on the same layer: parallel
+/// within 5° and overlapping in projection. Returns (edge-to-edge gap,
+/// overlap length).
+fn coupled_gap(a: (f64, f64), b: (f64, f64), w: f64, layer: &str, partner: &NetCopper) -> Option<(f64, f64)> {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len = dx.hypot(dy);
+    if len < 1e-6 {
+        return None;
+    }
+    let (ux, uy) = (dx / len, dy / len);
+    let mut best: Option<(f64, f64)> = None;
+    for (p, q, pw, pl) in &partner.segments {
+        if pl != layer {
+            continue;
+        }
+        let (ex, ey) = (q.0 - p.0, q.1 - p.1);
+        let plen = ex.hypot(ey);
+        if plen < 1e-6 || (ux * ey - uy * ex).abs() / plen > (5.0_f64).to_radians().sin() {
+            continue;
+        }
+        let along = |pt: (f64, f64)| (pt.0 - a.0) * ux + (pt.1 - a.1) * uy;
+        let (s0, s1) = { let (x, y) = (along(*p), along(*q)); (x.min(y), x.max(y)) };
+        let overlap = s1.min(len) - s0.max(0.0);
+        if overlap <= 1e-6 {
+            continue;
+        }
+        let mid = ((p.0 + q.0) / 2.0, (p.1 + q.1) / 2.0);
+        let distance = ((mid.0 - a.0) * uy - (mid.1 - a.1) * ux).abs();
+        let gap = distance - (w + pw) / 2.0;
+        if gap > 0.0 && best.is_none_or(|(g, _)| gap < g) {
+            best = Some((gap, overlap));
+        }
+    }
+    best
+}
+
+#[allow(clippy::too_many_arguments)]
+fn impedance_profile(
+    layers: &LayerStack,
+    planes: &BTreeSet<String>,
+    zones: &[konnect_sexp::board::ZoneOutline],
+    copper: &NetCopper,
+    partner: Option<&NetCopper>,
+    target: f64,
+    tol: f64,
+) -> ImpedanceProfile {
+    let mut p = ImpedanceProfile::default();
+    let note = |p: &mut ImpedanceProfile, reason: String| {
+        if !p.reasons.contains(&reason) && p.reasons.len() < 6 {
+            p.reasons.push(reason);
+        }
+    };
+    let covered = |layer: &str, point: (f64, f64)| {
+        zones.iter().any(|z| z.net.is_some() && z.layers.iter().any(|l| l == layer) && point_in_polygon(point, &z.points))
+    };
+    for (a, b, w, layer) in &copper.segments {
+        let len = (b.0 - a.0).hypot(b.1 - a.1);
+        p.total_mm += len;
+        let model = match layers.model(layer, planes) {
+            Ok(m) => m,
+            Err(reason) => {
+                p.unmodelled_mm += len;
+                note(&mut p, reason);
+                continue;
+            }
+        };
+        // The plane must actually lie under (and over) the segment.
+        let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        let idx = layers.index(layer).unwrap_or(0);
+        let refs: Vec<&str> = [idx.checked_sub(1), Some(idx + 1)]
+            .into_iter()
+            .flatten()
+            .filter_map(|j| layers.copper.get(j))
+            .map(|c| c.0.as_str())
+            .filter(|l| planes.contains(*l))
+            .collect();
+        if let Some(missing) = refs.iter().find(|l| !covered(l, mid)) {
+            p.unmodelled_mm += len;
+            note(&mut p, format!("no plane zone on {missing} under the segment at ({:.2}, {:.2})", mid.0, mid.1));
+            continue;
+        }
+        let (gap, modelled_len) = match partner {
+            Some(other) => match coupled_gap(*a, *b, *w, layer, other) {
+                Some((g, overlap)) => {
+                    p.uncoupled_mm += (len - overlap).max(0.0);
+                    p.gap_min_mm = Some(p.gap_min_mm.map_or(g, |m: f64| m.min(g)));
+                    p.gap_max_mm = Some(p.gap_max_mm.map_or(g, |m: f64| m.max(g)));
+                    (Some(g), overlap.min(len))
+                }
+                None => {
+                    p.uncoupled_mm += len;
+                    continue;
+                }
+            },
+            None => (None, len),
+        };
+        let z = model.impedance(*w, gap);
+        if !z.in_range {
+            p.outside_fit_mm += modelled_len;
+        }
+        p.z_min_ohm = Some(p.z_min_ohm.map_or(z.z_ohm, |m: f64| m.min(z.z_ohm)));
+        p.z_max_ohm = Some(p.z_max_ohm.map_or(z.z_ohm, |m: f64| m.max(z.z_ohm)));
+        if (z.z_ohm - target).abs() <= target * tol {
+            p.in_tolerance_mm += modelled_len;
+        } else {
+            p.out_of_tolerance_mm += modelled_len;
+        }
+    }
+    for v in [&mut p.total_mm, &mut p.in_tolerance_mm, &mut p.out_of_tolerance_mm, &mut p.unmodelled_mm, &mut p.uncoupled_mm, &mut p.outside_fit_mm] {
+        *v = r3(*v);
+    }
+    p
 }
 
 fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
     let mut checks = Vec::new();
     let pads = copper_pads(tree);
     let copper = board_copper(tree);
-    let stack = intent.stackup();
-    let reqs = requirements(intent);
+    let reqs = requirements_on(intent, Some(tree));
+    let (layers, planes, stack_note) = stack_and_planes(intent, Some(tree));
+    let zones = konnect_sexp::board::zones(tree).items;
+    let vias = konnect_sexp::board::vias(tree).items;
     let empty = NetCopper { segments: vec![], has_zone: false };
 
     for tie in &intent.ties {
@@ -704,20 +1079,32 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
             });
             continue;
         }
-        if let Some(required) = r.track_width_mm {
+        if let (Some(outer_min), true) = (r.current_width_mm, r.impedance_widths.is_empty()) {
             if routed {
-                let narrowest = net_copper.segments.iter().map(|s| s.2).fold(f64::INFINITY, f64::min);
-                let inner_runs = net_copper.segments.iter().filter(|s| s.3.starts_with("In")).count();
+                // Each segment against its own layer's minimum, rounded as the
+                // DRC rule is, so this check and KiCad's DRC agree.
+                let inner_min = r.inner_current_width_mm.unwrap_or(outer_min);
+                let rounded = |w: f64| (w * 10_000.0).round() / 10_000.0;
+                let (mut under, mut total, mut narrowest) = (0.0, 0.0, f64::INFINITY);
+                for (a, b, w, layer) in &net_copper.segments {
+                    let len = (b.0 - a.0).hypot(b.1 - a.1);
+                    let need = rounded(if layers.is_outer(layer) { outer_min } else { inner_min });
+                    total += len;
+                    narrowest = narrowest.min(*w);
+                    if *w + 1e-6 < need {
+                        under += len;
+                    }
+                }
                 checks.push(Check {
                     kind: "track_width",
                     subject: r.net.clone(),
-                    status: if narrowest + 1e-6 >= required * 0.95 { "pass" } else { "fail" },
-                    measured: json!({"narrowest_mm": r3(narrowest), "inner_layer_segments": inner_runs}),
-                    required: json!({"min_mm": r3(required)}),
-                    detail: if n.impedance_ohm.is_some() { "width for the impedance target".to_string() } else { "width for the current (IPC-2221, outer layer)".to_string() },
+                    status: if under <= 1.0 { "pass" } else { "fail" },
+                    measured: json!({"undersized_length_mm": r3(under), "routed_length_mm": r3(total), "narrowest_mm": r3(narrowest)}),
+                    required: json!({"outer_min_mm": r3(outer_min), "inner_min_mm": r.inner_current_width_mm.map(r3)}),
+                    detail: "IPC-2221 width for the current on each segment's layer (inner layers from the inner copper weight); up to 1 mm of narrower copper (pad necks) passes here, DRC still lists it".to_string(),
                 });
             } else if !net_copper.has_zone {
-                checks.push(Check { kind: "track_width", subject: r.net.clone(), status: "unverified", measured: Value::Null, required: json!({"min_mm": r3(required)}), detail: "net not routed yet".to_string() });
+                checks.push(Check { kind: "track_width", subject: r.net.clone(), status: "unverified", measured: Value::Null, required: json!({"outer_min_mm": r3(outer_min)}), detail: "net not routed yet".to_string() });
             }
         }
         if let Some(max) = r.max_length_mm {
@@ -750,32 +1137,47 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
             let check = if !routed && net_copper.has_zone {
                 Check { kind: "voltage_drop", subject: r.net.clone(), status: "unverified", measured: Value::Null, required: json!({"max_mv": max_mv}), detail: "carried by a zone; zone resistance is not computed".to_string() }
             } else {
-                match voltage_drop(&r.net, n, net_copper, &pads, stack) {
-                    Ok((mv, worst)) => Check {
-                        kind: "voltage_drop",
-                        subject: r.net.clone(),
-                        status: if mv <= max_mv { "pass" } else { "fail" },
-                        measured: json!({"drop_mv": r3(mv), "worst_pad": worst}),
-                        required: json!({"max_mv": max_mv}),
-                        detail: "I × routed-copper resistance from the source to the farthest pad (full current on every path, 25 °C)".to_string(),
-                    },
+                match voltage_drop(&r.net, n, net_copper, &pads, &vias, &layers) {
+                    Ok(d) => {
+                        let zone_note = if net_copper.has_zone { "; a zone on this net may carry part of the current, so this track-only drop is an upper bound" } else { "" };
+                        let status = if !d.unreachable.is_empty() {
+                            "unverified"
+                        } else if d.drop_mv <= max_mv {
+                            "pass"
+                        } else if net_copper.has_zone {
+                            "unverified"
+                        } else {
+                            "fail"
+                        };
+                        Check {
+                            kind: "voltage_drop",
+                            subject: r.net.clone(),
+                            status,
+                            measured: json!({"drop_mv": r3(d.drop_mv), "worst_pad": d.worst_pad, "unreachable_pads": d.unreachable, "copper_temp_c": d.temp_c, "tracks_only": true}),
+                            required: json!({"max_mv": max_mv}),
+                            detail: format!(
+                                "I × resistance of routed tracks and via barrels ({VIA_PLATING_MM} mm plating) from the source to the farthest reachable pad, full current on every path{}{zone_note}",
+                                if d.unreachable.is_empty() { String::new() } else { format!("; {} load pad(s) are not reached by routed copper, so the net is not verified", d.unreachable.len()) }
+                            ),
+                        }
+                    }
                     Err(reason) => Check { kind: "voltage_drop", subject: r.net.clone(), status: "unverified", measured: Value::Null, required: json!({"max_mv": max_mv}), detail: reason },
                 }
             };
             checks.push(check);
         }
         if let (Some(target), true) = (n.impedance_ohm, routed) {
-            let width = net_copper.segments.iter().map(|s| s.2).fold(f64::INFINITY, f64::min);
-            let geometry = LineGeometry { width_mm: width, height_mm: stack.outer_dielectric_mm, thickness_mm: stack.outer_copper_oz * eecalc::MM_PER_OZ, er: stack.er, gap_mm: r.diff_pair_gap_mm };
-            let calc = eecalc::microstrip(geometry);
-            let z = calc.result.zdiff_ohm.unwrap_or(calc.result.z0_ohm);
+            let partner = n.pair.as_ref().map(|p| copper.get(p).unwrap_or(&empty));
+            let z = impedance_profile(&layers, &planes, &zones, net_copper, partner, target, n.impedance_tolerance_pct.unwrap_or(10.0) / 100.0);
             checks.push(Check {
                 kind: "impedance",
                 subject: r.net.clone(),
-                status: if (z - target).abs() <= target * 0.1 { "pass" } else { "fail" },
-                measured: json!({"estimate_ohm": z, "from_width_mm": r3(width), "assumed_gap_mm": r.diff_pair_gap_mm}),
-                required: json!({"target_ohm": target, "tolerance": "±10 %"}),
-                detail: "estimated from the narrowest routed width on an outer layer; the pair gap is the rule's, enforced by DRC".to_string(),
+                status: z.status(),
+                measured: serde_json::to_value(&z).unwrap_or(Value::Null),
+                required: json!({"target_ohm": target, "tolerance_pct": n.impedance_tolerance_pct.unwrap_or(10.0), "pair_with": n.pair}),
+                detail: format!(
+                    "per segment on its own layer's model ({stack_note}); a pair is measured edge to edge against the partner's parallel overlapping segments; fails when over 10 % of the modelled length is out of tolerance, unverified when under half the length can be modelled"
+                ),
             });
         }
     }
@@ -793,6 +1195,8 @@ const FAB_PREFIX: &str = "fab: ";
 /// track/space; inner layers JLCPCB's multilayer 0.09 mm.
 fn jlcpcb_rules() -> Vec<(&'static str, &'static str)> {
     vec![
+        // The board-wide hole range first: the NPTH rule below must override it.
+        ("hole diameter", "(constraint hole_size (min 0.2mm) (max 6.3mm))"),
         ("track width, outer", "(layer outer)\n  (condition \"A.Type == 'track'\")\n  (constraint track_width (min 0.127mm))"),
         ("track spacing, outer", "(layer outer)\n  (condition \"A.Type == 'track' && B.Type == A.Type\")\n  (constraint clearance (min 0.127mm))"),
         ("track width, inner", "(layer inner)\n  (condition \"A.Type == 'track'\")\n  (constraint track_width (min 0.09mm))"),
@@ -800,19 +1204,23 @@ fn jlcpcb_rules() -> Vec<(&'static str, &'static str)> {
         ("silkscreen text", "(layer \"?.Silkscreen\")\n  (condition \"A.Type == 'Text' || A.Type == 'Text Box'\")\n  (constraint text_thickness (min 0.15mm))\n  (constraint text_height (min 1mm))"),
         ("pad to silkscreen", "(layer outer)\n  (condition \"A.Type == 'pad' && B.Layer == '?.Silkscreen'\")\n  (constraint silk_clearance (min 0.15mm))"),
         ("routed edge to track", "(condition \"A.Type == 'track'\")\n  (constraint edge_clearance (min 0.3mm))"),
-        ("hole diameter", "(constraint hole_size (min 0.2mm) (max 6.3mm))"),
-        ("NPTH diameter", "(layer outer)\n  (condition \"!A.isPlated()\")\n  (constraint hole_size (min 0.5mm))"),
+        // `!A.isPlated()` never matches an NPTH pad in KiCad 10 (found by the
+        // DRC oracle test); the pad type does.
+        ("NPTH diameter", "(condition \"A.Pad_Type == 'NPTH, mechanical'\")\n  (constraint hole_size (min 0.5mm))"),
         ("annular ring, via and PTH", "(layer outer)\n  (condition \"A.isPlated()\")\n  (constraint annular_width (min 0.075mm))"),
         ("hole to hole, different nets", "(layer outer)\n  (condition \"A.Net != B.Net\")\n  (constraint hole_to_hole (min 0.5mm))"),
         ("hole to hole, same net", "(layer outer)\n  (condition \"A.Net == B.Net\")\n  (constraint hole_to_hole (min 0.254mm))"),
-        ("track to NPTH", "(condition \"!A.isPlated() && B.Type == 'track' && A.Net != B.Net\")\n  (constraint hole_clearance (min 0.254mm))"),
+        ("track to NPTH", "(condition \"A.Pad_Type == 'NPTH, mechanical' && B.Type == 'track'\")\n  (constraint hole_clearance (min 0.254mm))"),
+        // Bites where the hole has no copper on the track's layer (an inner
+        // layer with unused via pads removed); elsewhere copper clearance governs.
         ("track to PTH hole", "(condition \"A.isPlated() && B.Type == 'track' && A.Net != B.Net\")\n  (constraint hole_clearance (min 0.33mm))"),
         ("track to pad", "(condition \"A.Type == 'pad' && B.Type == 'track' && A.Net != B.Net\")\n  (constraint clearance (min 0.2mm))"),
         ("pad/via to pad/via", "(layer outer)\n  (condition \"A.isPlated() && B.isPlated() && A.Net != B.Net\")\n  (constraint clearance (min 0.127mm))"),
     ]
 }
 
-fn fab_rules(fab: &str) -> Option<BTreeMap<String, String>> {
+/// The fab's rules in the order they must be written, general first.
+fn fab_rules(fab: &str) -> Option<Vec<(String, String)>> {
     let table = match fab {
         "jlcpcb" => jlcpcb_rules(),
         _ => return None,
@@ -844,7 +1252,7 @@ fn handle_apply_fab_rules(args: &Value) -> anyhow::Result<CallToolResult> {
     let plan = json!({
         "fab": fab,
         "dry_run": dry_run,
-        "rules": rules.keys().collect::<Vec<_>>(),
+        "rules": rules.iter().map(|(name, _)| name).collect::<Vec<_>>(),
         "source": "document database: labtroll-jlcpcb-kicad-dru (community rules annotated against jlcpcb.com/capabilities); standard process, 1 oz outer",
         "path": dru_path,
         "dru_text": if dry_run { Value::String(merged.clone()) } else { Value::Null },
@@ -1217,6 +1625,22 @@ fn handle_engineering_calc(args: &Value) -> anyhow::Result<CallToolResult> {
     let num = |key: &str| args[key].as_f64();
     let need = |key: &str| num(key).ok_or_else(|| invalid(key, "required for this calculation"));
     let calc = args["calculation"].as_str().unwrap_or("");
+    // Physical inputs must be finite and in range: the formulas otherwise
+    // return infinities or NaN that read like answers.
+    for (key, lower, inclusive) in [
+        ("current_a", 0.0, false), ("temp_rise_c", 0.0, false), ("copper_oz", 0.0, false),
+        ("length_mm", 0.0, false), ("width_mm", 0.0, false), ("height_mm", 0.0, false),
+        ("thickness_mm", 0.0, true), ("er", 1.0, true), ("gap_mm", 0.0, false),
+        ("target_ohm", 0.0, false), ("total_ohm", 0.0, false), ("temp_c", -273.15, false),
+    ] {
+        if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
+            let ok = v.as_f64().is_some_and(|x| x.is_finite() && if inclusive { x >= lower } else { x > lower });
+            if !ok {
+                let bound = if inclusive { "≥" } else { ">" };
+                return Ok(invalid(key, &format!("must be a finite number {bound} {lower}")));
+            }
+        }
+    }
     let value = (|| -> Result<Value, CallToolResult> {
         Ok(match calc {
             "width_for_current" => serde_json::to_value(eecalc::width_for_current(
@@ -1382,7 +1806,10 @@ fn handle_apply_design_intent(args: &Value) -> anyhow::Result<CallToolResult> {
     if text.is_none() {
         return Ok(invalid("project", "no design intent yet; call set_design_intent first"));
     }
-    let reqs = requirements(&intent);
+    let board_tree = std::fs::read_to_string(stem.with_extension("kicad_pcb"))
+        .ok()
+        .and_then(|text| konnect_sexp::parse_sexp(&text).ok());
+    let reqs = requirements_on(&intent, board_tree.as_ref());
     let rules = dru_rules(&intent, &reqs);
     let pro_path = stem.with_extension("kicad_pro");
     let dru_path = stem.with_extension("kicad_dru");
@@ -1659,12 +2086,357 @@ mod tests {
         assert_eq!(skew.status, "fail");
         assert!((skew.measured["skew_mm"].as_f64().unwrap() - 2.0).abs() < 1e-6);
         let drop = get("voltage_drop");
-        // 30 mm of 0.2 mm 1 oz copper ≈ 75.6 mΩ at 25 °C; × 1 A ≈ 76 mV.
+        // 30 mm of 0.2 mm 1 oz copper ≈ 75.6 mΩ at 25 °C, ≈ 78.6 mΩ at
+        // 35 °C (25 °C + the default 10 °C rise); × 1 A. C1 sits on the
+        // trace mid-segment (a T), so it is reached, not silently dropped.
         assert_eq!(drop.status, "pass", "{drop:?}");
+        assert_eq!(drop.measured["unreachable_pads"], json!([]));
         let mv = drop.measured["drop_mv"].as_f64().unwrap();
-        assert!((mv - 75.6).abs() < 2.0, "{mv}");
+        assert!((mv - 78.6).abs() < 1.0, "{mv}");
         let width = checks.iter().find(|c| c.kind == "track_width" && c.subject == "+5V").unwrap();
         assert_eq!(width.status, "fail", "0.2 mm is under the IPC-2221 width for 1 A (≈0.3 mm): {width:?}");
         assert_eq!(get("plane").status, "pass");
+    }
+}
+
+#[cfg(test)]
+mod per_layer_tests {
+    use super::*;
+
+    fn intent() -> DesignIntent {
+        let mut intent = DesignIntent { schema: 1, ..Default::default() };
+        for (net, pair) in [("USB_D_P", "USB_D_N"), ("USB_D_N", "USB_D_P")] {
+            intent.nets.insert(net.into(), NetIntent { role: "diff_pair".into(), pair: Some(pair.into()), impedance_ohm: Some(90.0), ..Default::default() });
+        }
+        intent.nets.insert("+5V".into(), NetIntent { role: "power".into(), current_a: Some(2.0), ..Default::default() });
+        intent.nets.insert("GND".into(), NetIntent { role: "plane".into(), ..Default::default() });
+        intent.nets.insert("+3V3".into(), NetIntent { role: "plane".into(), ..Default::default() });
+        intent
+    }
+
+    /// GND on In1 covers x 0–30 only; +3V3 on In2 covers the board.
+    fn board(segments: &str) -> SexpNode {
+        konnect_sexp::parse_sexp(&format!(
+            r#"(kicad_pcb (general (thickness 1.6))
+              (layers (0 "F.Cu" signal) (4 "In1.Cu" signal) (6 "In2.Cu" signal) (2 "B.Cu" signal))
+              (zone (net "GND") (layer "In1.Cu") (polygon (pts (xy 0 0) (xy 30 0) (xy 30 50) (xy 0 50))))
+              (zone (net "+3V3") (layer "In2.Cu") (polygon (pts (xy 0 0) (xy 60 0) (xy 60 50) (xy 0 50))))
+              {segments})"#
+        ))
+        .unwrap()
+    }
+
+    fn seg(net: &str, layer: &str, w: f64, (x1, y1): (f64, f64), (x2, y2): (f64, f64)) -> String {
+        format!(r#"(segment (start {x1} {y1}) (end {x2} {y2}) (width {w}) (layer "{layer}") (net "{net}"))"#)
+    }
+
+    #[test]
+    fn rules_are_per_layer_and_power_has_an_inner_minimum() {
+        let tree = board("");
+        let reqs = requirements_on(&intent(), Some(&tree));
+        let pair = reqs.iter().find(|r| r.net == "USB_D_P").unwrap();
+        let layers: Vec<&str> = pair.impedance_widths.iter().map(|w| w.layer.as_str()).collect();
+        assert_eq!(layers, ["F.Cu", "B.Cu"], "inner layers are planes here");
+        let rules = dru_rules(&intent(), &reqs);
+        assert!(rules.contains_key("intent: impedance USB_D_N/USB_D_P F.Cu"));
+        assert!(rules.contains_key("intent: impedance USB_D_N/USB_D_P B.Cu"));
+        assert!(rules["intent: impedance USB_D_N/USB_D_P F.Cu"].contains("(layer \"F.Cu\")"));
+        let power = reqs.iter().find(|r| r.net == "+5V").unwrap();
+        let (outer, inner) = (power.current_width_mm.unwrap(), power.inner_current_width_mm.unwrap());
+        // Inner: half the k and half the copper (0.5 oz) — several times wider.
+        assert!(inner > 3.0 * outer, "{outer} vs {inner}");
+        assert_eq!(power.track_width_mm, Some(inner), "net class carries the width valid on every layer");
+        assert!(rules["intent: width +5V"].contains("(layer outer)"));
+        assert!(rules["intent: width +5V inner"].contains("(layer inner)"));
+    }
+
+    #[test]
+    fn impedance_is_measured_per_segment_with_the_real_gap_and_plane_coverage() {
+        let tree = board("");
+        let reqs = requirements_on(&intent(), Some(&tree));
+        let w = reqs.iter().find(|r| r.net == "USB_D_P").unwrap().impedance_widths[0].opt_mm;
+        let pitch = w + 0.15;
+        let routed = |gap_pitch: f64| {
+            board(&[
+                seg("USB_D_P", "F.Cu", w, (1.0, 10.0), (20.0, 10.0)),
+                seg("USB_D_N", "F.Cu", w, (1.0, 10.0 + gap_pitch), (20.0, 10.0 + gap_pitch)),
+                // Beyond x = 30 there is no GND under F.Cu.
+                seg("USB_D_P", "F.Cu", w, (31.0, 10.0), (40.0, 10.0)),
+                seg("USB_D_N", "F.Cu", w, (31.0, 10.0 + gap_pitch), (40.0, 10.0 + gap_pitch)),
+            ]
+            .join("\n"))
+        };
+        let good = check_board(&routed(pitch), &intent());
+        let z = good.iter().find(|c| c.kind == "impedance" && c.subject == "USB_D_P").unwrap();
+        assert_eq!(z.status, "pass", "{:?}", z.measured);
+        assert!((z.measured["in_tolerance_mm"].as_f64().unwrap() - 19.0).abs() < 1e-6);
+        assert!((z.measured["unmodelled_mm"].as_f64().unwrap() - 9.0).abs() < 1e-6);
+        assert!((z.measured["gap_min_mm"].as_f64().unwrap() - 0.15).abs() < 1e-6);
+        // The same widths 0.6 mm apart: the rule's gap no longer stands in for
+        // the routed one, so Zdiff is out of tolerance.
+        let wide = check_board(&routed(w + 0.6), &intent());
+        let z = wide.iter().find(|c| c.kind == "impedance" && c.subject == "USB_D_P").unwrap();
+        assert_eq!(z.status, "fail", "{:?}", z.measured);
+    }
+
+    #[test]
+    fn an_inner_run_at_the_outer_width_fails() {
+        let tree = board("");
+        let reqs = requirements_on(&intent(), Some(&tree));
+        let outer = reqs.iter().find(|r| r.net == "+5V").unwrap().current_width_mm.unwrap();
+        let ok = check_board(&board(&seg("+5V", "F.Cu", outer, (0.0, 0.0), (5.0, 0.0))), &intent());
+        assert_eq!(ok.iter().find(|c| c.kind == "track_width").unwrap().status, "pass");
+        let bad = check_board(&board(&seg("+5V", "In1.Cu", outer, (0.0, 0.0), (5.0, 0.0))), &intent());
+        let c = bad.iter().find(|c| c.kind == "track_width").unwrap();
+        assert_eq!(c.status, "fail");
+        assert!((c.measured["undersized_length_mm"].as_f64().unwrap() - 5.0).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod calc_input_tests {
+    use super::handle_engineering_calc;
+    use serde_json::json;
+
+    #[test]
+    fn non_physical_inputs_are_refused() {
+        for args in [
+            json!({"calculation": "impedance", "width_mm": 0.2, "height_mm": 0.0, "er": 4.4}),
+            json!({"calculation": "impedance", "width_mm": 0.2, "height_mm": 0.2, "er": 0.5}),
+            json!({"calculation": "width_for_current", "current_a": 1.0, "temp_rise_c": -5.0}),
+            json!({"calculation": "trace_resistance", "length_mm": 10.0, "width_mm": -1.0}),
+            json!({"calculation": "width_for_current", "current_a": "lots"}),
+        ] {
+            assert!(handle_engineering_calc(&args).unwrap().is_error, "{args}");
+        }
+        assert!(!handle_engineering_calc(&json!({"calculation": "impedance", "width_mm": 0.2, "height_mm": 0.2, "er": 4.4})).unwrap().is_error);
+    }
+}
+
+#[cfg(test)]
+mod voltage_drop_tests {
+    use super::*;
+
+    fn intent() -> DesignIntent {
+        let mut intent = DesignIntent { schema: 1, ..Default::default() };
+        intent.nets.insert("+5V".into(), NetIntent { role: "power".into(), current_a: Some(1.0), max_drop_mv: Some(500.0), source: Some("J1.1".into()), ..Default::default() });
+        intent
+    }
+
+    const PADS: &str = r#"
+      (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+      (footprint "J" (layer "F.Cu") (at 0 0) (property "Reference" "J1")
+        (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "+5V")))
+      (footprint "U" (layer "F.Cu") (at 20 0) (property "Reference" "U1")
+        (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "+5V")))"#;
+
+    fn drop(extra: &str) -> Check {
+        let tree = konnect_sexp::parse_sexp(&format!("(kicad_pcb (general (thickness 1.6)) {PADS} {extra})")).unwrap();
+        check_board(&tree, &intent()).into_iter().find(|c| c.kind == "voltage_drop").unwrap()
+    }
+
+    #[test]
+    fn a_layer_change_needs_a_via() {
+        let tracks = r#"(segment (start 0 0) (end 10 0) (width 0.5) (layer "F.Cu") (net "+5V"))
+                        (segment (start 10 0) (end 20 0) (width 0.5) (layer "B.Cu") (net "+5V"))"#;
+        // Without a via the B.Cu half does not join: U1 is unreachable.
+        let no_via = drop(tracks);
+        assert_eq!(no_via.status, "unverified", "{no_via:?}");
+        assert_eq!(no_via.measured["unreachable_pads"], json!(["U1.1"]));
+        // An SMD pad on F.Cu does not touch B.Cu either: a via is needed at U1 too.
+        let with_vias = drop(&format!(
+            r#"{tracks}
+               (via (at 10 0) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net "+5V"))
+               (via (at 20 0) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net "+5V"))"#
+        ));
+        assert_eq!(with_vias.status, "pass", "{with_vias:?}");
+        // Two barrels add a little over the 20 mm of 0.5 mm track.
+        let tracks_only = eecalc::trace_resistance(20.0, 0.5, 1.0, 35.0, None).result.resistance_ohm * 1000.0;
+        let mv = with_vias.measured["drop_mv"].as_f64().unwrap();
+        assert!(mv > tracks_only && mv < tracks_only * 1.2, "{mv} vs {tracks_only}");
+    }
+
+    #[test]
+    fn a_tee_into_the_middle_of_a_segment_conducts() {
+        let tracks = r#"(segment (start 0 0) (end 20 0) (width 0.5) (layer "F.Cu") (net "+5V"))
+                        (footprint "C" (layer "F.Cu") (at 10 5) (property "Reference" "C1")
+                          (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "+5V")))
+                        (segment (start 10 5) (end 10 0) (width 0.3) (layer "F.Cu") (net "+5V"))"#;
+        let d = drop(tracks);
+        assert_eq!(d.status, "pass", "{d:?}");
+        assert_eq!(d.measured["unreachable_pads"], json!([]));
+    }
+}
+
+/// KiCad's own DRC as the oracle for the generated rules: each fab rule fires
+/// on a seeded violation and stays silent on a near-miss at least 10 µm clear
+/// of its limit; an intent rule still wins over the fab floor. Needs
+/// kicad-cli (KICAD_CLI or PATH): `cargo test -p konnect-core --lib -- --ignored drc_oracle`.
+#[cfg(test)]
+mod drc_oracle {
+    use super::*;
+
+    fn kicad_cli() -> String {
+        std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string())
+    }
+
+    /// The nets used: A, B and +5V.
+    const HEADER: &str = r#"(kicad_pcb (version 20241229) (generator "konnect-test") (generator_version "9.0")
+  (general (thickness 1.6) (legacy_teardrops no))
+  (paper "A4")
+  (layers (0 "F.Cu" signal) (1 "In1.Cu" signal) (2 "In2.Cu" signal) (31 "B.Cu" signal)
+    (37 "F.SilkS" user "F.Silkscreen") (39 "F.Mask" user) (44 "Edge.Cuts" user))
+  (setup (pad_to_mask_clearance 0))
+  (net 0 "") (net 1 "A") (net 2 "B") (net 3 "+5V")
+  (gr_rect (start 0 0) (end 100 100) (stroke (width 0.1) (type default)) (fill no) (layer "Edge.Cuts"))
+"#;
+
+    fn seg(x1: f64, y1: f64, x2: f64, y2: f64, w: f64, layer: &str, net: u32) -> String {
+        format!("  (segment (start {x1} {y1}) (end {x2} {y2}) (width {w}) (layer \"{layer}\") (net {net}))\n")
+    }
+
+    fn via(x: f64, y: f64, size: f64, drill: f64, net: u32) -> String {
+        format!("  (via (at {x} {y}) (size {size}) (drill {drill}) (layers \"F.Cu\" \"B.Cu\") (net {net}))\n")
+    }
+
+    fn footprint(r: &str, x: f64, y: f64, pads: &str) -> String {
+        format!("  (footprint \"T:{r}\" (layer \"F.Cu\") (at {x} {y}) (property \"Reference\" \"{r}\" (at 0 -3) (layer \"F.Fab\")) {pads})\n")
+    }
+
+    /// One board seeding every fab rule; `e` is how far each item sits from
+    /// the limit: negative violates it, positive clears it.
+    fn seeded(e: f64) -> String {
+        let mut b = HEADER.to_string();
+        // Track width, outer (0.127) and inner (0.09).
+        b += &seg(10.0, 10.0, 20.0, 10.0, 0.127 + e, "F.Cu", 1);
+        b += &seg(10.0, 20.0, 20.0, 20.0, 0.09 + e, "In1.Cu", 1);
+        // Track spacing, outer (0.127) and inner (0.09): 0.2 / 0.1 wide tracks.
+        b += &seg(30.0, 10.0, 40.0, 10.0, 0.2, "F.Cu", 1);
+        b += &seg(30.0, 10.0 + 0.2 + 0.127 + e, 40.0, 10.0 + 0.2 + 0.127 + e, 0.2, "F.Cu", 2);
+        b += &seg(30.0, 20.0, 40.0, 20.0, 0.1, "In1.Cu", 1);
+        b += &seg(30.0, 20.0 + 0.1 + 0.09 + e, 40.0, 20.0 + 0.1 + 0.09 + e, 0.1, "In1.Cu", 2);
+        // Routed edge to track (0.3): a 0.2 mm track along the top edge.
+        b += &seg(50.0, 0.1 + 0.3 + e, 60.0, 0.1 + 0.3 + e, 0.2, "F.Cu", 1);
+        // Hole diameter (0.2 min) and annular ring (0.075).
+        b += &via(10.0, 40.0, 0.2 + e + 0.3, 0.2 + e, 1);
+        b += &via(15.0, 40.0, 0.3 + 2.0 * (0.075 + e), 0.3, 1);
+        // Hole to hole: different nets 0.5, same net 0.254 (0.3 drills).
+        b += &via(30.0, 40.0, 0.6, 0.3, 1);
+        b += &via(30.0 + 0.3 + 0.5 + e, 40.0, 0.6, 0.3, 2);
+        b += &via(40.0, 40.0, 0.6, 0.3, 1);
+        b += &via(40.0 + 0.3 + 0.254 + e, 40.0, 0.6, 0.3, 1);
+        // Track to PTH hole (0.33): hole edge to track edge, on an inner layer
+        // where the via's unused pad is removed so the hole is bare.
+        b += "  (via (at 50 40) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (remove_unused_layers yes) (keep_end_layers yes) (net 2))\n";
+        b += &seg(45.0, 40.0 + 0.15 + 0.33 + e + 0.1, 55.0, 40.0 + 0.15 + 0.33 + e + 0.1, 0.2, "In1.Cu", 1);
+        // NPTH diameter (0.5) and track to NPTH (0.254).
+        b += &footprint("H1", 10.0, 60.0, &format!("(pad \"\" np_thru_hole circle (at 0 0) (size {d} {d}) (drill {d}) (layers \"*.Cu\" \"*.Mask\"))", d = 0.5 + e));
+        b += &footprint("H2", 20.0, 60.0, "(pad \"\" np_thru_hole circle (at 0 0) (size 1 1) (drill 1) (layers \"*.Cu\" \"*.Mask\"))");
+        b += &seg(15.0, 60.0 + 0.5 + 0.254 + e + 0.1, 25.0, 60.0 + 0.5 + 0.254 + e + 0.1, 0.2, "F.Cu", 1);
+        // Track to pad (0.2): a 1 × 1 mm SMD pad on B.
+        b += &footprint("P1", 30.0, 60.0, "(pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\" \"F.Mask\") (net 2 \"B\"))");
+        b += &seg(25.0, 60.0 + 0.5 + 0.2 + e + 0.1, 35.0, 60.0 + 0.5 + 0.2 + e + 0.1, 0.2, "F.Cu", 1);
+        // Pad to pad, plated (0.127): two 1 mm through pads with 0.3 drills.
+        let th = |n: u32, name: &str| format!("(pad \"1\" thru_hole circle (at 0 0) (size 1 1) (drill 0.3) (layers \"*.Cu\" \"*.Mask\") (net {n} \"{name}\"))");
+        b += &footprint("P2", 50.0, 60.0, &th(1, "A"));
+        b += &footprint("P3", 50.0 + 1.0 + 0.127 + e, 60.0, &th(2, "B"));
+        // Silkscreen text (1 mm high, 0.15 thick) and pad to silkscreen (0.15).
+        b += &format!("  (gr_text \"T\" (at 10 80) (layer \"F.SilkS\") (effects (font (size {h} {h}) (thickness {t}))))\n", h = 1.0 + e, t = 0.15 + e);
+        b += &footprint("P4", 30.0, 80.0, "(pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\" \"F.Mask\") (net 1 \"A\"))");
+        let y = 80.0 + 0.5 + 0.15 + e + 0.06;
+        b += &format!("  (gr_line (start 28 {y}) (end 32 {y}) (stroke (width 0.12) (type default)) (layer \"F.SilkS\"))\n");
+        b += ")\n";
+        b
+    }
+
+    /// kicad-cli instances share a lock file; run them one at a time.
+    static KICAD_CLI: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn drc(board: &str, dru: &str) -> Vec<String> {
+        let _one_at_a_time = KICAD_CLI.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let pcb = dir.path().join("o.kicad_pcb");
+        std::fs::write(&pcb, board).unwrap();
+        std::fs::write(dir.path().join("o.kicad_dru"), dru).unwrap();
+        let out = dir.path().join("o.json");
+        let run = std::process::Command::new(kicad_cli())
+            .args(["pcb", "drc", "--format", "json", "-o"])
+            .arg(&out)
+            .arg(&pcb)
+            .output()
+            .expect("kicad-cli");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let errors: Vec<&str> = stderr.lines().filter(|l| l.to_lowercase().contains("error") && !l.contains("lock file")).collect();
+        assert!(errors.is_empty(), "kicad-cli reported: {errors:?}");
+        let report: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        report["violations"].as_array().unwrap().iter().map(|v| v["description"].as_str().unwrap_or("").to_string()).collect()
+    }
+
+    fn fired<'a>(descriptions: &'a [String], rule: &str) -> Vec<&'a String> {
+        let needle = format!("rule '{rule}'");
+        descriptions.iter().filter(|d| d.contains(&needle)).collect()
+    }
+
+    #[test]
+    #[ignore = "needs kicad-cli"]
+    fn every_fab_rule_fires_on_its_violation_and_not_on_a_near_miss() {
+        let rules = fab_rules("jlcpcb").unwrap();
+        let dru = merge_fab_rules(None, &rules);
+        let bad = drc(&seeded(-0.02), &dru);
+        let near = drc(&seeded(0.01), &dru);
+        // Silkscreen thresholds clear by 50 µm: KiCad compares text sizes in
+        // integer nm after its own rounding.
+        let mut missing = Vec::new();
+        for (name, _) in &rules {
+            if fired(&bad, name).is_empty() {
+                missing.push(name.clone());
+            }
+            let false_alarms = fired(&near, name);
+            assert!(false_alarms.is_empty(), "'{name}' fired on a near-miss: {false_alarms:?}");
+        }
+        assert!(missing.is_empty(), "rules that did not fire on their seeded violation: {missing:?}\nall: {bad:#?}");
+    }
+
+    #[test]
+    #[ignore = "needs kicad-cli"]
+    fn an_intent_rule_wins_over_the_fab_floor_only_when_written_after_it() {
+        let mut intent = DesignIntent { schema: 1, ..Default::default() };
+        intent.nets.insert("+5V".into(), NetIntent { role: "power".into(), current_a: Some(3.0), ..Default::default() });
+        let reqs = requirements_on(&intent, None);
+        let intent_rules = dru_rules(&intent, &reqs);
+        let fab = fab_rules("jlcpcb").unwrap();
+        let board = format!("{HEADER}{}\n)\n", seg(10.0, 10.0, 20.0, 10.0, 0.5, "F.Cu", 3));
+        // As written by the tools: fab floors first, intent after.
+        let good = merge_dru(Some(&merge_fab_rules(None, &fab)), &intent_rules);
+        assert!(!fired(&drc(&board, &good), "intent: width +5V").is_empty(), "the 3 A width rule must flag a 0.5 mm track");
+        // The order the review warned about: fab last masks the intent rule.
+        let masked = merge_managed_rules(Some(&merge_dru(None, &intent_rules)), &fab.into_iter().collect(), FAB_PREFIX);
+        assert!(fired(&drc(&board, &masked), "intent: width +5V").is_empty(), "KiCad's later-rule-wins order changed");
+    }
+
+    #[test]
+    #[ignore = "needs kicad-cli"]
+    fn per_layer_intent_rules_fire_on_their_own_layer_only() {
+        let mut intent = DesignIntent { schema: 1, ..Default::default() };
+        intent.nets.insert("A".into(), NetIntent { role: "signal".into(), impedance_ohm: Some(50.0), ..Default::default() });
+        intent.nets.insert("+5V".into(), NetIntent { role: "power".into(), current_a: Some(1.0), ..Default::default() });
+        let reqs = requirements_on(&intent, None);
+        let a = reqs.iter().find(|r| r.net == "A").unwrap();
+        let f = a.impedance_widths.iter().find(|w| w.layer == "F.Cu").unwrap();
+        let p = reqs.iter().find(|r| r.net == "+5V").unwrap();
+        let (outer, inner) = (p.current_width_mm.unwrap(), p.inner_current_width_mm.unwrap());
+        let dru = merge_dru(Some(&merge_fab_rules(None, &fab_rules("jlcpcb").unwrap())), &dru_rules(&intent, &reqs));
+        // A at 20 µm under its F.Cu minimum; +5V at the outer width on F.Cu
+        // (fine) and on In2.Cu (too narrow for an inner layer).
+        let board = format!(
+            "{HEADER}{}{}{})\n",
+            seg(10.0, 10.0, 20.0, 10.0, f.min_mm - 0.02, "F.Cu", 1),
+            seg(10.0, 30.0, 20.0, 30.0, outer + 0.01, "F.Cu", 3),
+            seg(10.0, 50.0, 20.0, 50.0, outer + 0.01, "In2.Cu", 3),
+        );
+        let found = drc(&board, &dru);
+        assert_eq!(fired(&found, "intent: impedance A F.Cu").len(), 1, "{found:#?}");
+        assert!(fired(&found, "intent: width +5V").is_empty(), "outer width is enough on F.Cu: {found:#?}");
+        assert_eq!(fired(&found, "intent: width +5V inner").len(), 1, "inner {inner} mm: {found:#?}");
     }
 }

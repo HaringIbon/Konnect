@@ -2347,3 +2347,20 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
   - Without `bom_fields`, the BOM now has columns Comment, Designator, Footprint and LCSC Part #, grouped by Value, Footprint and LCSC. Before, it had KiCad's default columns.
   - BOM rows without a valid LCSC number make the package `complete: false`; list exempt references in `allow_unsourced`.
   - A `gerbers-<board>.zip` entry (`type: gerber_zip`) is added.
+
+## Unreleased (fork): review fixes
+
+- **`route_path` and `fanout_to_plane`:** they now run KiCad DRC before and after by default (`drc_gate`). They are refused, and undone, when DRC finds a new error or more unconnected items. Responses carry a `drc_gate` evidence object, and fan-out carries `plane_source`.
+- **`apply_specctra_ses`:** new errors are compared by identity. A new short now fails the import even when it is offset by a fixed error of the same rule.
+- **`apply_design_intent`:**
+  - Impedance nets get per-layer `intent: impedance <net> <layer>` rules instead of one width rule.
+  - Current nets get `intent: width <net>` restricted to `(layer outer)` on boards with inner layers, plus `intent: width <net> inner`.
+  - The `requirements` entries gain `current_width_mm`, `inner_current_width_mm`, `impedance_widths` and `impedance_unmodelled`. `track_width_mm` is now the net-class width.
+- **`check_design_intent`:**
+  - The `impedance` check's `measured` is a length profile (in/out of tolerance, unmodelled, uncoupled, Z range, measured gap).
+  - The `track_width` check reports `undersized_length_mm` against outer and inner minimums.
+  - The `voltage_drop` check adds `unreachable_pads`, `copper_temp_c` and `tracks_only`, and can be `unverified` where it used to pass.
+- **`diff_board`:** adds `other_changes`, `project_files`, `renamed_from`, and `length_by_layer_and_width` per net.
+- **`restore_checkpoint`:** also restores the project, rules and intent files saved with the checkpoint. It refuses ids that are not plain names, and checkpoints whose stored sha256 does not match.
+- **`engineering_calc`:** refuses non-physical inputs with `invalid_argument`.
+- **`apply_fab_rules` (JLCPCB):** the NPTH rules now match on the pad type, and the rules are written in authored order.

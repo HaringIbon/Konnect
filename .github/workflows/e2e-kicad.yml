@@ -81,6 +81,11 @@ jobs:
       - name: Variant-grammar adjudication (kicad-cli acceptance)
         run: cargo test -p konnect-sexp --test variant_fixture_test -- --ignored --nocapture
 
+      # KiCad's DRC is the oracle for the generated fab and intent rules: each
+      # fires on a seeded violation and not on a near-miss, in the right order.
+      - name: DRC rule oracle (kicad-cli)
+        run: cargo test -p konnect-core --lib -- --ignored drc_oracle --test-threads=1
+
       - name: IPC wedge timeout regression
         run: cargo test -p konnect-ipc --test mock_server_test -- --ignored --nocapture
 

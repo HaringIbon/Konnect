@@ -69,9 +69,10 @@ pub(crate) struct WidthForCurrent {
 
 /// Minimum trace width for `current_a` with a `temp_rise_c` rise, by the
 /// IPC-2221 curve fit I = k·ΔT^0.44·A^0.725 (A in mil²; k = 0.048 outer,
-/// 0.024 inner). IPC-2152 replaced these charts; it gives *narrower* outer
-/// traces and similar or narrower inner ones for most boards, so this errs
-/// wide, which is the safe side for a decision.
+/// 0.024 inner). IPC-2152 replaced these charts. Its data show the IPC-2221
+/// internal chart is conservative, but the external chart is *not* always:
+/// an outer trace on a thin board with no nearby copper plane can run hotter
+/// than 2221 predicts. Keep margin on outer power traces near the limit.
 pub(crate) fn width_for_current(current_a: f64, temp_rise_c: f64, copper_oz: f64, inner: bool) -> Calc<WidthForCurrent> {
     let k = if inner { 0.024 } else { 0.048 };
     let area_mil2 = (current_a / (k * temp_rise_c.powf(0.44))).powf(1.0 / 0.725);
