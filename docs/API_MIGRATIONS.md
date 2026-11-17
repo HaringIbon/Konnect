@@ -2373,3 +2373,7 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
 - **`export_specctra_dsn`:** adds edge-clearance keep-outs, so routes keep the `.kicad_dru` edge clearance.
 - **`export_manufacturing_package` (JLCPCB):** the CPL leaves out footprints marked `exclude_from_bom`.
 - **`assign_lcsc_parts`:** an explicit `parts` choice already present on the symbol reports `ok`, not `assign`.
+
+## Unreleased (fork): delete_zones
+
+- **New tool:** `delete_zones` (`pcb_routing`).

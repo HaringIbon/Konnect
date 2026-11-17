@@ -131,6 +131,27 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
+            "delete_zones",
+            "Delete copper zones (pours, planes) and rule-area keep-outs from the live board in one \
+             undo step, selected by net, layer and/or name (all three filters must match; no \
+             filter selects every zone). Dry run by default: lists what would go. KiCad's zone \
+             API does not expose nets, so zones are matched in the board's own saved text and \
+             deleted by UUID.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "nets": { "type": "array", "items": { "type": "string" } },
+                    "layers": { "type": "array", "items": { "type": "string" } },
+                    "names": { "type": "array", "items": { "type": "string" } },
+                    "dry_run": { "type": "boolean", "default": true }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_delete_zones(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "route_path",
             "Route one net as polylines in one KiCad undo step: each path is a layer and a list \
              of points, each point {x, y} (mm) or {ref, pad} to land exactly on a pad; plus \
@@ -964,6 +985,88 @@ async fn handle_fanout_to_plane(
                 reason: failure.message().to_string(),
             },
             format!("fanout_to_plane failed: {}", failure.message()),
+        )),
+    }
+}
+
+/// A zone as the board file records it.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ZoneRecord {
+    uuid: String,
+    net: Option<String>,
+    layers: Vec<String>,
+    name: Option<String>,
+    keepout: bool,
+}
+
+fn zone_records(tree: &konnect_sexp::SexpNode) -> Vec<ZoneRecord> {
+    tree.find_all("zone")
+        .into_iter()
+        .filter_map(|zone| {
+            let uuid = zone.find_str("uuid")?.to_string();
+            let mut layers = Vec::new();
+            for tag in ["layers", "layer"] {
+                if let Some(node) = zone.find(tag) {
+                    layers.extend(node.children().unwrap_or_default().iter().skip(1).filter_map(konnect_sexp::SexpNode::as_str).map(str::to_string));
+                }
+            }
+            Some(ZoneRecord {
+                uuid,
+                net: zone.find("net").and_then(konnect_sexp::net::net_name).filter(|n| !n.is_empty()).map(str::to_string),
+                layers,
+                name: zone.find_str("name").map(str::to_string),
+                keepout: zone.find("keepout").is_some(),
+            })
+        })
+        .collect()
+}
+
+fn zone_matches(zone: &ZoneRecord, nets: &[String], layers: &[String], names: &[String]) -> bool {
+    (nets.is_empty() || zone.net.as_ref().is_some_and(|n| nets.contains(n)))
+        && (layers.is_empty() || zone.layers.iter().any(|l| layers.contains(l)))
+        && (names.is_empty() || zone.name.as_ref().is_some_and(|n| names.contains(n)))
+}
+
+async fn handle_delete_zones(args: &serde_json::Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let list = |key: &str| -> Vec<String> {
+        args[key].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default()
+    };
+    let (nets, layers, names) = (list("nets"), list("layers"), list("names"));
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let result = with_board_ipc_classified(ctx, &board, move |client, document| {
+        let snapshot = client.save_document_to_string_in(document.clone())?;
+        let tree = konnect_sexp::parse_sexp(&snapshot).context("parse live board snapshot")?;
+        let selected: Vec<ZoneRecord> = zone_records(&tree).into_iter().filter(|z| zone_matches(z, &nets, &layers, &names)).collect();
+        if dry_run || selected.is_empty() {
+            return Ok((selected, false));
+        }
+        // The UUIDs must still be zones KiCad holds.
+        let live: BTreeSet<String> = client
+            .get_items_in(document.clone(), konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbZone)?
+            .iter()
+            .filter_map(|item| konnect_ipc::gen::kiapi::board::types::Zone::decode(item.value.as_slice()).ok())
+            .filter_map(|zone| zone.id.map(|id| id.value))
+            .collect();
+        if let Some(stale) = selected.iter().find(|z| !live.contains(&z.uuid)) {
+            anyhow::bail!("zone {} is in the saved text but not among KiCad's zones; retry", stale.uuid);
+        }
+        let ids: Vec<String> = selected.iter().map(|z| z.uuid.clone()).collect();
+        client.run_commit("Delete zones", |client| client.delete_items_in(document.clone(), ids))?;
+        Ok((selected, true))
+    })
+    .await?;
+    match result {
+        Ok((zones, deleted)) => Ok(CallToolResult::json(&json!({
+            "dry_run": dry_run,
+            "deleted": deleted,
+            "count": zones.len(),
+            "zones": zones,
+            "undo": if deleted { "one KiCad undo step ('Delete zones')" } else { "nothing changed" },
+        }))),
+        Err(failure) => Ok(CallToolResult::error_kind(
+            ToolErrorKind::HandlerError { reason: failure.message().to_string() },
+            format!("delete_zones refused: {}", failure.message()),
         )),
     }
 }
@@ -4616,5 +4719,33 @@ mod drc_identity_tests {
         assert!(new_drc_errors(&report(vec![v.clone()]), &report(vec![remeasured])).is_empty());
         assert!(new_drc_errors(&report(vec![v.clone()]), &report(vec![v.clone()])).is_empty());
         assert_eq!(new_drc_errors(&report(vec![v]), &report(vec![moved])).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod zone_selection_tests {
+    use super::{zone_matches, zone_records};
+
+    #[test]
+    fn zones_are_selected_by_net_layer_and_name() {
+        let tree = konnect_sexp::parse_sexp(
+            r#"(kicad_pcb
+              (zone (net "GND") (layer "In1.Cu") (uuid "a") (name "GND plane") (polygon (pts (xy 0 0) (xy 1 0) (xy 1 1))))
+              (zone (net "+3V3") (layer "In2.Cu") (uuid "b") (polygon (pts (xy 0 0) (xy 1 0) (xy 1 1))))
+              (zone (layers "F.Cu" "B.Cu") (uuid "c") (keepout (tracks not_allowed)) (polygon (pts (xy 0 0) (xy 1 0) (xy 1 1)))))"#,
+        )
+        .unwrap();
+        let zones = zone_records(&tree);
+        assert_eq!(zones.len(), 3);
+        let pick = |nets: &[&str], layers: &[&str], names: &[&str]| -> Vec<String> {
+            let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+            zones.iter().filter(|z| zone_matches(z, &s(nets), &s(layers), &s(names))).map(|z| z.uuid.clone()).collect()
+        };
+        assert_eq!(pick(&[], &[], &[]), ["a", "b", "c"]);
+        assert_eq!(pick(&["GND"], &[], &[]), ["a"]);
+        assert_eq!(pick(&[], &["B.Cu"], &[]), ["c"]);
+        assert_eq!(pick(&["GND"], &["In2.Cu"], &[]), Vec::<String>::new(), "filters combine");
+        assert_eq!(pick(&[], &[], &["GND plane"]), ["a"]);
+        assert!(zones[2].keepout && zones[2].net.is_none());
     }
 }

@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 10 categories
-- **243 registered tools** + **7 always-visible meta-tools** = **250 total**
+- **244 registered tools** + **7 always-visible meta-tools** = **251 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -282,7 +282,7 @@ and Windows servers do not.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
-### `pcb_routing` · 18 tools
+### `pcb_routing` · 19 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
@@ -294,6 +294,7 @@ and Windows servers do not.
 | `add_via` | Add a via at a position and assign it to a net via IPC: through by default, or blind/buried/micro with `start_layer`/`end_layer`/`via_type`. |
 | `lock_routing` | Lock or unlock existing tracks, arcs and vias, optionally only on named nets, in one undoable commit with read-back. Freeze hand-routed critical nets before autorouting. |
 | `fanout_to_plane` | Drop every SMD pad on a plane net to its plane with a short stub and a through via placed clear of other nets, keep-outs and the edge; locked by default; `dry_run` returns the plan. In-pad vias are checked against other-net copper on every layer; "reaches the plane" is judged on the zone fill when the file has one (`plane_source`). With `drc_gate` (default) KiCad DRC runs before and after with zones refilled and the fan-out is undone if it adds any error or unconnected item. |
+| `delete_zones` | Delete copper zones and rule-area keep-outs from the live board in one undo step, selected by net, layer and/or name; dry run by default. Zones are matched in the board's saved text (KiCad's zone API has no net) and deleted by UUID. |
 | `route_path` | Route one net as polylines in one undo step: points `{x, y}` or `{ref, pad}` (ends exactly on pads), plus through/blind/buried vias; net given or inferred from the pads; widths and via sizes default to the net class; optional lock. With `drc_gate` (default) it is undone, leaving the board byte-identical, if KiCad DRC finds any new error (compared by rule and item UUIDs; shorts and clearance block even if downgraded to warnings) or more unconnected items. `routes` takes several nets (each `{net, width, paths, vias}`) in one undo step and one gate, so a differential pair goes in together. |
 | `plan_specctra_ses_import` | Strictly validate a Freerouting SES against its revision-bound manifest and the exact live board, returning every planned route item and the preserved locked-track/via inventory without mutation. |
 | `apply_specctra_ses` | Preserve the manifest-bound locked straight tracks and through vias, apply a validated SES through KiCad IPC as one undo transaction, verify post-commit IPC read-back, create a separate candidate board, and report direct KiCad DRC evidence (including whether it is clean). New DRC errors are found by identity (rule + item UUIDs), so a new short cannot hide behind an error the routes fixed. |

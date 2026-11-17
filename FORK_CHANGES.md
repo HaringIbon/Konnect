@@ -556,3 +556,16 @@ The STM32F072 + Feather nRF52840 USB-C board (`~/Projects/kicad/stm32_demo/build
 - `update_pcb_from_schematic` doesn't copy custom fields (LCSC, MPN) to footprints: 37 DRC parity warnings. The BOM is built from the schematic, so the order is unaffected.
 - There is no keep-out area tool. The antenna keep-out was done by stopping the plane pours.
 - Footprint reference text is 0.12 mm thick, under JLCPCB's 0.15 mm guideline (47 DRC warnings).
+
+## Pass 11: `delete_zones`
+
+- **New tool, `delete_zones`** (`pcb_routing`): it deletes copper zones and rule-area keep-outs from the live board in one undo step.
+  - Zones are selected by net, layer and/or name; dry run by default.
+  - KiCad 10's zone protobuf has no net, so zones are matched in the live board's saved text, checked against KiCad's own zone list, and deleted by UUID.
+  - Shrinking the demo board needed it: the old plane pours had to go, and only `delete_graphics` existed, which doesn't cover zones.
+- **Demo board compacted:** from 76.5 × 58 mm to 55 × 46 mm (−43%).
+  - Low-profile parts sit under the Feather.
+  - The MCU turned back to 0°, so its GPIO side faces the headers and the USB pair runs straight with no length-matching bump.
+  - SWDIO is hand-routed before the fan-out.
+  - Results: DRC 0 errors / 0 unconnected; 27/27 intent checks (90.6 Ω pair, +5V drop 33 mV); JLCPCB package complete.
+- **Not fixed:** the DRC gate compares unconnected items by count. One import lowered the total from 64 to 8 while stranding two fan-out vias, so per-item comparison would be stricter. KiCad doesn't give unconnected items stable identities across refills, so this is noted, not changed.
