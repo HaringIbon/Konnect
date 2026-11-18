@@ -598,3 +598,33 @@ The STM32F072 + Feather nRF52840 USB-C board (`~/Projects/kicad/stm32_demo/build
   - An inner layer the board types `mixed` keeps its pour out of the DSN, but is no longer forced to `power`, so Freerouting can route on it.
   - Test: `a_mixed_inner_layer_stays_routable`.
   - **Limit, found on the module board:** a pour net that every pad already reaches through fan-out is still dropped from the routing job. Routes on the mixed layer then cut the pour into islands that nothing rejoins (five +3V3 islands). That board went back to a solid `power` plane. A fix would keep such nets in the job when their plane is on a `mixed` layer.
+
+## Pass 14: `delete_vias` and `set_footprint_text`
+
+Both tools are registered in `pcb_board`, which now has 18 tools. `pcb_routing` and `pcb_components` are at the 20-tool cap. The code lives in `pcb_routing.rs`. Totals are 247 registered and 254 with the meta-tools.
+
+- **`delete_vias`:**
+  - Deletes vias selected by UUID, or by position within a tolerance, optionally filtered by net.
+  - One undo step, dry run by default, and the vias are verified absent afterwards.
+  - `delete_trace` refuses vias, so before this a dangling via (the Ethernet board's ETH_TX_EN) or a via from a re-route could not be removed.
+- **`set_footprint_text`:**
+  - Restyles the reference or value field of placed footprints over IPC (`FootprintInstance.reference_field` / `value_field`): stroke thickness, character size and visibility.
+  - Footprints are selected by reference and/or side. One undo step.
+  - `update_pcb_from_schematic` writes reference text at KiCad's automatic 0.125 mm, under JLCPCB's 0.15 mm minimum (107 warnings on the Ethernet board), and no tool could change it.
+- **Tests:** `via_and_text_tool_tests` (via selection; field restyling).
+
+## Pass 15: Freerouting's own result in `route_specctra_dsn`
+
+- **Problem:**
+  - Freerouting 2.3.0 ends every job in state `COMPLETED` even with connections still open. That was the "COMPLETED but unrouted" trap on every board.
+  - Konnect also cut Freerouting's stderr at 64 KB. Under MCP that stream carries JSON-RPC traffic, so the router's final score lines were lost.
+- **Evidence:**
+  - The 2.3.0 jar logs its own counts: `BatchAutorouter` "Auto-routing pass #N … with the score of S (U unrouted and V violations)"; `RoutingJobSchedulerActionThread` "Auto-routing stage … started with N unrouted …, final score: …"; `BatchOptimizer` "Optimization stage completed … final score: …".
+  - A real run on the module board's DSN was captured as `tests/fixtures/freerouting_2_3_0_run.log`: 64 unrouted at the start, 12 at the end, and 52 router-side violations.
+- **Change:**
+  - The whole log is kept (cap raised to 16 MB).
+  - `parse_routing_log` reads the initial unrouted count, every pass's score, unrouted and violations, and the final figures (optimizer stage first, then auto-routing stage, then last pass).
+  - `route_specctra_dsn` now returns `routing: {complete, initial_unrouted, unrouted, violations, score, autoroute_passes}`, and a `warning` when the router reports anything unrouted or any violation, or when the log holds no score.
+  - `final_state` still reports the job state.
+- **Tests:** `routing_log_tests` (4 tests, on the real fixture).
+- **End-to-end check:** routing the module board through MCP (23 passes) returned `complete: false, initial_unrouted: 64, unrouted: 7, violations: 52`, with the warning.

@@ -26,7 +26,11 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_STDERR_BYTES: usize = 64 * 1024;
+// Freerouting's whole log is kept: it is the only place the router says how
+// many connections it left unrouted (see `RoutingSummary`). Under MCP its
+// stderr also carries JSON-RPC traffic, which overflowed the old 64 KB cap
+// before the final score lines were written.
+const MAX_STDERR_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SES_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Launch arguments for one run, with the API and MCP HTTP servers on the
@@ -90,6 +94,85 @@ pub(crate) struct RouteEvidence {
     pub ses_bytes: u64,
     pub server_protocol_version: String,
     pub diagnostics_path: Option<String>,
+    /// The router's own account of the result, parsed from its log. `None`
+    /// when the log holds no score line (an older or changed Freerouting).
+    pub routing: Option<RoutingSummary>,
+}
+
+/// One score as Freerouting 2.x logs it: "660.59 (12 unrouted and 52 violations)".
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub(crate) struct RouterScore {
+    pub score: f64,
+    pub unrouted: u32,
+    pub violations: u32,
+}
+
+/// What Freerouting reported about a job. The job state says only that the
+/// job ended ("COMPLETED" even with nets left open); these numbers are the
+/// router's own count of what it could not do.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct RoutingSummary {
+    /// "Auto-routing stage started on board … for N unrouted items."
+    pub initial_unrouted: Option<u32>,
+    /// One score per auto-routing pass, in order.
+    pub autoroute_passes: Vec<RouterScore>,
+    /// The last final score the log states (optimizer stage if it ran,
+    /// otherwise the auto-routing stage, otherwise the last pass).
+    pub final_score: Option<RouterScore>,
+}
+
+impl RoutingSummary {
+    /// Complete only when the router itself reports nothing unrouted and no
+    /// violations. `None` when the log said nothing either way.
+    pub fn complete(&self) -> Option<bool> {
+        self.final_score.map(|s| s.unrouted == 0 && s.violations == 0)
+    }
+}
+
+/// Parse "S (U unrouted and V violations)" at the start of `text`.
+fn parse_score(text: &str) -> Option<RouterScore> {
+    let (score, rest) = text.trim_start().split_once(" (")?;
+    let (unrouted, rest) = rest.split_once(" unrouted and ")?;
+    let (violations, _) = rest.split_once(" violations)")?;
+    Some(RouterScore {
+        score: score.trim().parse().ok()?,
+        unrouted: unrouted.trim().parse().ok()?,
+        violations: violations.trim().parse().ok()?,
+    })
+}
+
+/// Read Freerouting 2.x's log (format confirmed against 2.3.0's
+/// `BatchAutorouter`, `BatchOptimizer` and `RoutingJobSchedulerActionThread`
+/// messages; fixture `tests/fixtures/freerouting_2_3_0_run.log`). Lines that
+/// are not log messages (MCP JSON on the same stream) are ignored.
+pub(crate) fn parse_routing_log(log: &str) -> Option<RoutingSummary> {
+    let mut summary = RoutingSummary { initial_unrouted: None, autoroute_passes: Vec::new(), final_score: None };
+    let mut stage_final = None;
+    let mut optimizer_final = None;
+    for line in log.lines() {
+        if let Some(i) = line.find("Auto-routing stage started on board") {
+            if let Some(n) = line[i..].split(" for ").nth(1).and_then(|t| t.split_whitespace().next()) {
+                summary.initial_unrouted = n.parse().ok().or(summary.initial_unrouted);
+            }
+        } else if line.contains("Auto-routing pass #") {
+            if let Some(score) = line.split("with the score of ").nth(1).and_then(parse_score) {
+                summary.autoroute_passes.push(score);
+            }
+        } else if line.contains("Auto-routing stage completed") {
+            if summary.initial_unrouted.is_none() {
+                summary.initial_unrouted = line
+                    .split("started with ")
+                    .nth(1)
+                    .and_then(|t| t.split_whitespace().next())
+                    .and_then(|n| n.parse().ok());
+            }
+            stage_final = line.split("final score: ").nth(1).and_then(parse_score).or(stage_final);
+        } else if line.contains("Optimization stage completed") {
+            optimizer_final = line.split("final score: ").nth(1).and_then(parse_score).or(optimizer_final);
+        }
+    }
+    summary.final_score = optimizer_final.or(stage_final).or(summary.autoroute_passes.last().copied());
+    (summary.initial_unrouted.is_some() || summary.final_score.is_some()).then_some(summary)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -239,6 +322,7 @@ pub(crate) async fn route_local(
     Ok(RouteEvidence {
         ses_bytes: metadata.len(),
         diagnostics_path,
+        routing: parse_routing_log(&diagnostics),
         ..evidence
     })
 }
@@ -402,6 +486,7 @@ async fn run_state_machine(
         ses_bytes: 0,
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
+        routing: None,
     })
 }
 
@@ -1046,5 +1131,48 @@ mod tests {
             wait_for_process_exit(pid).await,
             "Freerouting child {pid} survived cancellation"
         );
+    }
+}
+
+#[cfg(test)]
+mod routing_log_tests {
+    use super::*;
+
+    const RUN: &str = include_str!("../tests/fixtures/freerouting_2_3_0_run.log");
+
+    /// A real Freerouting 2.3.0 run on the module board's DSN (5 passes):
+    /// the job ends "COMPLETED", but the router itself reports 12 unrouted
+    /// and 52 violations.
+    #[test]
+    fn a_real_log_yields_the_routers_own_counts() {
+        let summary = parse_routing_log(RUN).expect("score lines present");
+        assert_eq!(summary.initial_unrouted, Some(64));
+        assert_eq!(summary.autoroute_passes.len(), 5);
+        assert_eq!(summary.autoroute_passes[0], RouterScore { score: 478.78, unrouted: 24, violations: 52 });
+        assert_eq!(summary.autoroute_passes[4].unrouted, 14);
+        assert_eq!(summary.final_score, Some(RouterScore { score: 660.59, unrouted: 12, violations: 52 }));
+        assert_eq!(summary.complete(), Some(false));
+    }
+
+    #[test]
+    fn mcp_json_lines_between_log_lines_are_ignored() {
+        let mixed = format!("{{\"jsonrpc\":\"2.0\",\"result\":{{\"unrouted\":3}}}}\n{RUN}\n{{\"id\":9}}");
+        assert_eq!(parse_routing_log(&mixed), parse_routing_log(RUN));
+    }
+
+    #[test]
+    fn a_clean_finish_is_complete_and_a_silent_log_is_unknown() {
+        let clean = "x INFO Auto-routing stage completed: started with 3 unrouted nets, completed in 1.0 seconds, final score: 990.00 (0 unrouted and 0 violations), using 1 total CPU seconds";
+        let summary = parse_routing_log(clean).unwrap();
+        assert_eq!(summary.initial_unrouted, Some(3));
+        assert_eq!(summary.complete(), Some(true));
+        assert_eq!(parse_routing_log("Freerouting v2.3.0 started\nno scores here"), None);
+    }
+
+    #[test]
+    fn scores_parse_only_in_the_logged_shape() {
+        assert_eq!(parse_score("660.59 (12 unrouted and 52 violations), using"), Some(RouterScore { score: 660.59, unrouted: 12, violations: 52 }));
+        assert_eq!(parse_score("660.59"), None);
+        assert_eq!(parse_score("abc (1 unrouted and 2 violations)"), None);
     }
 }

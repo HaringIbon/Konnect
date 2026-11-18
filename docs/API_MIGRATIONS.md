@@ -2387,3 +2387,13 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
 - **New tool:** `add_keepout_area` (`pcb_routing`): `board`, `name` and `points` are required; `layers`, `tracks`, `vias`, `copper_pour`, `pads` and `footprints` are optional.
 - **`add_layer`:** an existing inner copper layer named with a different explicit `layer_type` is now retyped rather than refused. The response has `retyped_layer`, `from` and `type`.
 - **`export_specctra_dsn`:** a `mixed` inner layer that carries a pour stays a signal layer in the DSN. It used to be retyped to `power`.
+
+## Unreleased (fork): delete_vias, set_footprint_text
+
+- **New tools** (`pcb_board`):
+  - `delete_vias`: `board` plus `uuids` and/or `at` [{x, y, net?}]; optional `tolerance_mm`, `dry_run` (default true).
+  - `set_footprint_text`: `board`; optional `references`, `side`, `field` (reference|value), `thickness_mm`, `size_mm`, `visible`, `dry_run`.
+
+## Unreleased (fork): route_specctra_dsn reports the router's result
+
+- **`route_specctra_dsn`:** the response gains `routing` (`complete`, `initial_unrouted`, `unrouted`, `violations`, `score`, `autoroute_passes`, `source`) and `warning`. `final_state` is unchanged (job state only); read `routing.complete`, not `final_state`, to know whether the board was routed.

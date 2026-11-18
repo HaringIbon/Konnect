@@ -1158,6 +1158,213 @@ async fn handle_add_keepout_area(args: &serde_json::Value, ctx: &ToolContext) ->
     }
 }
 
+/// A via as `delete_vias` reports it.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ViaRecord {
+    uuid: String,
+    x: f64,
+    y: f64,
+    net: String,
+}
+
+/// Vias matching any UUID or any position (within `tol`, and the position's
+/// net when given). Pure, so it can be tested without KiCad.
+fn select_vias(vias: &[ViaRecord], uuids: &[String], at: &[(f64, f64, Option<String>)], tol: f64) -> Vec<ViaRecord> {
+    vias.iter()
+        .filter(|v| {
+            uuids.contains(&v.uuid)
+                || at.iter().any(|(x, y, net)| {
+                    (v.x - x).hypot(v.y - y) <= tol && net.as_ref().map_or(true, |n| n == &v.net)
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+pub(crate) async fn handle_delete_vias(args: &serde_json::Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi::board::types::Via;
+    use konnect_ipc::gen::kiapi::common::types::KiCadObjectType;
+    let board = get_path(args, "board")?;
+    let uuids: Vec<String> = args["uuids"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    let at: Vec<(f64, f64, Option<String>)> = args["at"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?, p["net"].as_str().map(str::to_string)))).collect())
+        .unwrap_or_default();
+    if uuids.is_empty() && at.is_empty() {
+        return Ok(CallToolResult::error("delete_vias needs 'uuids' or 'at'"));
+    }
+    let tol = args["tolerance_mm"].as_f64().unwrap_or(0.05);
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let result = with_board_ipc_classified(ctx, &board, move |client, document| {
+        let read = |client: &konnect_ipc::KiCadIpcClient| -> anyhow::Result<Vec<ViaRecord>> {
+            Ok(client
+                .get_items_in(document.clone(), KiCadObjectType::KotPcbVia)?
+                .iter()
+                .filter_map(|item| Via::decode(item.value.as_slice()).ok())
+                .filter_map(|via| {
+                    let p = via.position?;
+                    Some(ViaRecord {
+                        uuid: via.id?.value,
+                        x: konnect_ipc::builders::nm_to_mm(p.x_nm),
+                        y: konnect_ipc::builders::nm_to_mm(p.y_nm),
+                        net: via.net.map(|n| n.name).unwrap_or_default(),
+                    })
+                })
+                .collect())
+        };
+        let selected = select_vias(&read(client)?, &uuids, &at, tol);
+        if dry_run || selected.is_empty() {
+            return Ok((selected, false));
+        }
+        let ids: Vec<String> = selected.iter().map(|v| v.uuid.clone()).collect();
+        client.run_commit("Delete vias", |client| client.delete_items_in(document.clone(), ids.clone()))?;
+        let left: Vec<String> = read(client)?.into_iter().map(|v| v.uuid).filter(|u| ids.contains(u)).collect();
+        if !left.is_empty() {
+            anyhow::bail!("{} via(s) still present after the delete: {}", left.len(), left.join(", "));
+        }
+        Ok((selected, true))
+    })
+    .await?;
+    match result {
+        Ok((vias, deleted)) => Ok(CallToolResult::json(&json!({
+            "dry_run": dry_run,
+            "deleted": deleted,
+            "count": vias.len(),
+            "vias": vias,
+            "undo": if deleted { "one KiCad undo step ('Delete vias')" } else { "nothing changed" },
+        }))),
+        Err(failure) => Ok(CallToolResult::error_kind(
+            ToolErrorKind::HandlerError { reason: failure.message().to_string() },
+            format!("delete_vias refused: {}", failure.message()),
+        )),
+    }
+}
+
+/// Apply thickness/size/visibility to a footprint field. Pure, for tests.
+fn restyle_field(
+    field: &mut konnect_ipc::gen::kiapi::board::types::Field,
+    thickness_mm: Option<f64>,
+    size_mm: Option<f64>,
+    visible: Option<bool>,
+) {
+    if let Some(v) = visible {
+        field.visible = v;
+    }
+    let attributes = field
+        .text
+        .get_or_insert_with(Default::default)
+        .text
+        .get_or_insert_with(Default::default)
+        .attributes
+        .get_or_insert_with(Default::default);
+    if let Some(t) = thickness_mm {
+        attributes.stroke_width = Some(konnect_ipc::builders::distance(t));
+    }
+    if let Some(s) = size_mm {
+        let nm = (s * 1_000_000.0).round() as i64;
+        attributes.size = Some(konnect_ipc::gen::kiapi::common::types::Vector2 { x_nm: nm, y_nm: nm });
+    }
+}
+
+pub(crate) async fn handle_set_footprint_text(args: &serde_json::Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi::board::types::{BoardLayer, FootprintInstance};
+    use konnect_ipc::gen::kiapi::common::types::KiCadObjectType;
+    let board = get_path(args, "board")?;
+    let wanted: Option<Vec<String>> =
+        args["references"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
+    let side = args["side"].as_str().map(str::to_string);
+    let value_field = args["field"].as_str() == Some("value");
+    let thickness = args["thickness_mm"].as_f64();
+    let size = args["size_mm"].as_f64();
+    let visible = args["visible"].as_bool();
+    if thickness.is_none() && size.is_none() && visible.is_none() {
+        return Ok(CallToolResult::error("set_footprint_text needs thickness_mm, size_mm and/or visible"));
+    }
+    let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+    let result = with_board_ipc_classified(ctx, &board, move |client, document| {
+        let mut changed = Vec::new();
+        let mut items = Vec::new();
+        for item in client.get_items_in(document.clone(), KiCadObjectType::KotPcbFootprint)? {
+            let Ok(mut fp) = FootprintInstance::decode(item.value.as_slice()) else { continue };
+            let reference = fp
+                .reference_field
+                .as_ref()
+                .and_then(|f| f.text.as_ref())
+                .and_then(|t| t.text.as_ref())
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
+            if wanted.as_ref().is_some_and(|w| !w.contains(&reference)) {
+                continue;
+            }
+            let bottom = fp.layer == BoardLayer::BlBCu as i32;
+            if side.as_deref() == Some("top") && bottom || side.as_deref() == Some("bottom") && !bottom {
+                continue;
+            }
+            let field = if value_field { fp.value_field.as_mut() } else { fp.reference_field.as_mut() };
+            let Some(field) = field else { continue };
+            restyle_field(field, thickness, size, visible);
+            changed.push(reference);
+            items.push(konnect_ipc::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance"));
+        }
+        if let Some(w) = &wanted {
+            let missing: Vec<&String> = w.iter().filter(|r| !changed.contains(r)).collect();
+            if !missing.is_empty() {
+                anyhow::bail!("no footprint {missing:?} on this board (or not on the requested side)");
+            }
+        }
+        if !dry_run && !items.is_empty() {
+            client.run_commit("Restyle footprint text", |client| client.update_items_in(document.clone(), items.clone()))?;
+        }
+        Ok(changed)
+    })
+    .await?;
+    match result {
+        Ok(changed) => Ok(CallToolResult::json(&json!({
+            "dry_run": dry_run,
+            "field": if value_field { "value" } else { "reference" },
+            "count": changed.len(),
+            "references": changed,
+            "thickness_mm": thickness, "size_mm": size, "visible": visible,
+            "undo": if dry_run || changed.is_empty() { "nothing changed" } else { "one KiCad undo step ('Restyle footprint text')" },
+        }))),
+        Err(failure) => Ok(CallToolResult::error_kind(
+            ToolErrorKind::HandlerError { reason: failure.message().to_string() },
+            format!("set_footprint_text refused: {}", failure.message()),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod via_and_text_tool_tests {
+    use super::*;
+
+    fn via(uuid: &str, x: f64, y: f64, net: &str) -> ViaRecord {
+        ViaRecord { uuid: uuid.into(), x, y, net: net.into() }
+    }
+
+    #[test]
+    fn vias_are_selected_by_uuid_or_position_and_net() {
+        let vias = [via("a", 1.0, 1.0, "GND"), via("b", 5.0, 5.0, "ETH_TX_EN"), via("c", 5.02, 5.0, "GND")];
+        let by_uuid = select_vias(&vias, &["a".into()], &[], 0.05);
+        assert_eq!(by_uuid.iter().map(|v| v.uuid.as_str()).collect::<Vec<_>>(), ["a"]);
+        let by_pos = select_vias(&vias, &[], &[(5.0, 5.0, None)], 0.05);
+        assert_eq!(by_pos.len(), 2);
+        let by_pos_net = select_vias(&vias, &[], &[(5.0, 5.0, Some("ETH_TX_EN".into()))], 0.05);
+        assert_eq!(by_pos_net.iter().map(|v| v.uuid.as_str()).collect::<Vec<_>>(), ["b"]);
+        assert!(select_vias(&vias, &[], &[(9.0, 9.0, None)], 0.05).is_empty());
+    }
+
+    #[test]
+    fn a_field_takes_thickness_size_and_visibility() {
+        let mut field = konnect_ipc::gen::kiapi::board::types::Field::default();
+        restyle_field(&mut field, Some(0.15), Some(1.0), Some(false));
+        let attributes = field.text.unwrap().text.unwrap().attributes.unwrap();
+        assert_eq!(attributes.stroke_width.unwrap().value_nm, 150_000);
+        assert_eq!(attributes.size.unwrap().x_nm, 1_000_000);
+        assert!(!field.visible);
+    }
+}
+
 /// One resolved point of a path: where it is, and the pad it names (if any).
 #[derive(Debug, Clone)]
 struct PathPoint {

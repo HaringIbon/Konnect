@@ -2359,7 +2359,36 @@ async fn handle_route_specctra_dsn(
     let evidence = crate::freerouting_mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
         .map_err(|error| anyhow::anyhow!("Freerouting MCP routing failed: {error:#}"))?;
+    // "COMPLETED" is the job state only. Whether the board is routed is what
+    // the router logged (unrouted connections and its own clearance
+    // violations); report that, and say so plainly when it is not.
+    let routing = evidence.routing.as_ref();
+    let complete = routing.and_then(|r| r.complete());
+    let warning = match (routing.and_then(|r| r.final_score), complete) {
+        (Some(s), Some(false)) => Some(format!(
+            "Freerouting's job finished (state {}), but the router reports {} unrouted and {} \
+             violations in its final result. The board is not fully routed; import and check \
+             DRC's unconnected count.",
+            evidence.final_state, s.unrouted, s.violations
+        )),
+        (None, _) => Some(
+            "Freerouting's log holds no score line, so how much it routed is unknown; check \
+             DRC's unconnected count after import."
+                .to_string(),
+        ),
+        _ => None,
+    };
     Ok(CallToolResult::json(&json!({
+        "routing": {
+            "complete": complete,
+            "initial_unrouted": routing.and_then(|r| r.initial_unrouted),
+            "unrouted": routing.and_then(|r| r.final_score).map(|s| s.unrouted),
+            "violations": routing.and_then(|r| r.final_score).map(|s| s.violations),
+            "score": routing.and_then(|r| r.final_score).map(|s| s.score),
+            "autoroute_passes": routing.map(|r| r.autoroute_passes.len()),
+            "source": "Freerouting's own log (diagnostics_path)"
+        },
+        "warning": warning,
         "success": true,
         "method": "local_freerouting_native_mcp",
         "engine": {

@@ -1497,6 +1497,50 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_import_svg_logo(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
+        tool!(
+            "delete_vias",
+            "Delete vias from the live board in one undo step, selected by UUID and/or by \
+             position ({x, y} in mm, within tolerance_mm; optionally also by net). Dry run by \
+             default: lists what would go. Vias are verified absent afterwards. Use it to remove \
+             a dangling via or to rip up vias before re-routing.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuids": { "type": "array", "items": { "type": "string" } },
+                    "at": { "type": "array", "description": "Positions [{x, y, net?}] in mm", "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "net": { "type": "string" } }, "required": ["x", "y"] } },
+                    "tolerance_mm": { "type": "number", "default": 0.05 },
+                    "dry_run": { "type": "boolean", "default": true }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { super::pcb_routing::handle_delete_vias(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "set_footprint_text",
+            "Restyle the reference or value text of placed footprints on the live board in one \
+             undo step: stroke thickness, character size and visibility. Selects footprints by \
+             exact reference (omit for every footprint) and optionally by side. Use it to bring \
+             reference text up to a fab's silkscreen minimum or to hide references on dense \
+             sides. Position and rotation are left as they are.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "references": { "type": "array", "items": { "type": "string" }, "description": "Exact references; omit for all" },
+                    "side": { "type": "string", "enum": ["top", "bottom"], "description": "Only footprints on this side" },
+                    "field": { "type": "string", "enum": ["reference", "value"], "default": "reference" },
+                    "thickness_mm": { "type": "number", "exclusiveMinimum": 0 },
+                    "size_mm": { "type": "number", "exclusiveMinimum": 0, "description": "Character height and width" },
+                    "visible": { "type": "boolean" },
+                    "dry_run": { "type": "boolean", "default": false }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { super::pcb_routing::handle_set_footprint_text(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         super::board_stackup::tool(),
     ];
     tools.extend(super::board_history::tools());
