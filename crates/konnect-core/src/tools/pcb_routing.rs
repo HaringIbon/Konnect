@@ -152,6 +152,32 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
+            "add_keepout_area",
+            "Add a rule-area keep-out to the live board in one undo step: a polygon on the given \
+             copper layers (default all) that forbids tracks, vias and copper pours (and \
+             optionally pads and footprints). Use it for an antenna's no-copper zone or a \
+             probe's pad field when the footprint's own keep-out did not survive the sync. \
+             KiCad's DRC enforces it and its Specctra export hands it to the autorouter as a \
+             keep-out. Remove one with delete_zones(names=[…]).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "name": { "type": "string", "description": "Zone name, used to find or delete it later" },
+                    "points": { "type": "array", "description": "Polygon vertices [{x, y}] in mm", "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } } } },
+                    "layers": { "type": "array", "items": { "type": "string" }, "description": "Copper layers; default every copper layer of the board" },
+                    "tracks": { "type": "boolean", "default": true },
+                    "vias": { "type": "boolean", "default": true },
+                    "copper_pour": { "type": "boolean", "default": true },
+                    "pads": { "type": "boolean", "default": false },
+                    "footprints": { "type": "boolean", "default": false }
+                },
+                "required": ["board", "name", "points"]
+            }),
+            |args, ctx| async move { handle_add_keepout_area(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "route_path",
             "Route one net as polylines in one KiCad undo step: each path is a layer and a list \
              of points, each point {x, y} (mm) or {ref, pad} to land exactly on a pad; plus \
@@ -1067,6 +1093,67 @@ async fn handle_delete_zones(args: &serde_json::Value, ctx: &ToolContext) -> any
         Err(failure) => Ok(CallToolResult::error_kind(
             ToolErrorKind::HandlerError { reason: failure.message().to_string() },
             format!("delete_zones refused: {}", failure.message()),
+        )),
+    }
+}
+
+async fn handle_add_keepout_area(args: &serde_json::Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let name = args["name"].as_str().unwrap_or("").to_string();
+    if name.is_empty() {
+        return Ok(CallToolResult::error("add_keepout_area needs a 'name' (delete_zones finds it by name)"));
+    }
+    let points: Vec<(f64, f64)> = args["points"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?))).collect())
+        .unwrap_or_default();
+    if points.len() < 3 {
+        return Ok(CallToolResult::error("a keep-out needs at least 3 points"));
+    }
+    let flag = |key: &str, default: bool| args[key].as_bool().unwrap_or(default);
+    let rules = konnect_ipc::builders::KeepoutRules {
+        tracks: flag("tracks", true),
+        vias: flag("vias", true),
+        copper_pour: flag("copper_pour", true),
+        pads: flag("pads", false),
+        footprints: flag("footprints", false),
+    };
+    let requested: Option<Vec<String>> =
+        args["layers"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
+    let (name_ipc, points_ipc) = (name.clone(), points.clone());
+    let result = with_board_ipc_classified(ctx, &board, move |client, document| {
+        let snapshot = client.save_document_to_string_in(document.clone())?;
+        let tree = konnect_sexp::parse_sexp(&snapshot).context("parse live board snapshot")?;
+        let copper: Vec<String> =
+            konnect_sexp::layers::copper(&konnect_sexp::layers::layers(&tree)).into_iter().map(|l| l.name.clone()).collect();
+        let layers = match &requested {
+            Some(list) => {
+                if let Some(bad) = list.iter().find(|l| !copper.contains(l)) {
+                    anyhow::bail!("'{bad}' is not a copper layer of this board ({})", copper.join(", "));
+                }
+                list.clone()
+            }
+            None => copper,
+        };
+        let refs: Vec<&str> = layers.iter().map(String::as_str).collect();
+        let zone = konnect_ipc::builders::build_keepout(&points_ipc, &refs, &name_ipc, rules);
+        let any = konnect_ipc::builders::pack_any(&zone, "kiapi.board.types.Zone");
+        client.run_commit("Add keep-out area", |client| client.create_items_in(document.clone(), vec![any]))?;
+        client.refill_zones()?;
+        Ok(layers)
+    })
+    .await?;
+    match result {
+        Ok(layers) => Ok(CallToolResult::json(&json!({
+            "name": name,
+            "layers": layers,
+            "point_count": points.len(),
+            "forbids": { "tracks": rules.tracks, "vias": rules.vias, "copper_pour": rules.copper_pour, "pads": rules.pads, "footprints": rules.footprints },
+            "undo": "one KiCad undo step ('Add keep-out area')",
+        }))),
+        Err(failure) => Ok(CallToolResult::error_kind(
+            ToolErrorKind::HandlerError { reason: failure.message().to_string() },
+            format!("add_keepout_area refused: {}", failure.message()),
         )),
     }
 }

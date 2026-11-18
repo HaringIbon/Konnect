@@ -1336,7 +1336,9 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "add_layer",
-            "Add a new inner copper or technical layer to the board layer stack.",
+            "Add a new inner copper or technical layer to the board layer stack. Naming an inner \
+             copper layer that already exists with a different explicit layer_type retypes it \
+             in place (e.g. a 'power' plane layer opened to routing as 'mixed').",
             json!({
                 "type": "object",
                 "properties": {
@@ -2183,12 +2185,41 @@ async fn handle_add_layer(
     let legacy_numbering = konnect_sexp::layers::layers(&tree)
         .iter()
         .any(|l| l.name == "B.Cu" && l.id == 31);
-    let new_id = match inner_n {
-        _ if konnect_sexp::layers::layers(&tree).iter().any(|l| l.name == layer_name) => {
+    // An existing inner copper layer asked for with another explicit type is
+    // retyped in place (e.g. a `power` plane layer opened to routing as
+    // `mixed`); anything else that already exists is refused.
+    if let Some(existing) = konnect_sexp::layers::layers(&tree)
+        .into_iter()
+        .find(|l| l.name == layer_name)
+    {
+        let requested = args["layer_type"].as_str();
+        let retypable = inner_n.is_some()
+            && matches!(requested, Some("signal" | "power" | "mixed" | "jumper"));
+        if !retypable || requested == Some(existing.kind.as_str()) {
             return Ok(CallToolResult::error(format!(
                 "The board already has a {layer_name} layer"
-            )))
+            )));
         }
+        let entry = format!("({} \"{}\" {}", existing.id, existing.name, existing.kind);
+        let Some(offset) = content[layers_pos..].find(&entry) else {
+            return Ok(CallToolResult::error(format!(
+                "{layer_name} exists but its (layers) entry could not be located; refusing to write"
+            )));
+        };
+        let start = layers_pos + offset + entry.len() - existing.kind.len();
+        if let Some(conflict) = write_board_edits(
+            &board_path,
+            "add_layer",
+            content,
+            vec![SexpEdit::replace(start, start + existing.kind.len(), layer_type.to_string())],
+        )? {
+            return Ok(conflict);
+        }
+        return Ok(CallToolResult::json(&json!({
+            "retyped_layer": layer_name, "id": existing.id, "from": existing.kind, "type": layer_type
+        })));
+    }
+    let new_id = match inner_n {
         Some(n) if legacy_numbering => n,
         Some(n) => 2 * n + 2,
         None => match (1..=30).find(|id| !used_ids.contains(id)) {
@@ -6307,6 +6338,23 @@ mod add_layer_id_tests {
     async fn legacy_boards_keep_legacy_ids() {
         let (_, after) = add(LEGACY, "In2.Cu").await;
         assert!(after.contains("(2 \"In2.Cu\" signal)"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn an_existing_inner_layer_is_retyped_on_an_explicit_type() {
+        let board = KICAD_10.replace("\t)\n)", "\t\t(6 \"In2.Cu\" power)\n\t)\n)");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.kicad_pcb");
+        std::fs::write(&path, &board).unwrap();
+        let ctx = ctx_talking_to(String::new());
+        let args = json!({"board": path.display().to_string(), "layer_name": "In2.Cu", "layer_type": "mixed"});
+        let result = handle_add_layer(&args, &ctx).await.unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, board.replace("(6 \"In2.Cu\" power)", "(6 \"In2.Cu\" mixed)"));
+        // The same type again is still refused.
+        let result = handle_add_layer(&args, &ctx).await.unwrap();
+        assert!(result.is_error);
     }
 
     #[tokio::test]

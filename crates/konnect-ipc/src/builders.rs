@@ -440,6 +440,69 @@ pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zo
 }
 
 /// Pack a protobuf message into a prost_types::Any.
+/// What a rule-area keep-out forbids, as KiCad's zone properties name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepoutRules {
+    pub tracks: bool,
+    pub vias: bool,
+    pub pads: bool,
+    pub copper_pour: bool,
+    pub footprints: bool,
+}
+
+/// Build a rule-area (keep-out) `Zone` for `create_items`: no net, no fill,
+/// one outline over every layer named. KiCad's own Specctra exporter writes
+/// such an area as a `(keepout …)`, and its DRC enforces it.
+pub fn build_keepout(
+    points: &[(f64, f64)],
+    layers: &[&str],
+    name: &str,
+    rules: KeepoutRules,
+) -> kiapi::board::types::Zone {
+    use kiapi::board::types::{RuleAreaSettings, ZoneBorderSettings, ZoneBorderStyle, ZoneType};
+    let outline = kiapi::common::types::PolySet {
+        polygons: vec![kiapi::common::types::PolygonWithHoles {
+            outline: Some(kiapi::common::types::PolyLine {
+                nodes: points
+                    .iter()
+                    .map(|&(x, y)| kiapi::common::types::PolyLineNode {
+                        geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(vec2(x, y))),
+                    })
+                    .collect(),
+                closed: true,
+            }),
+            holes: vec![],
+        }],
+    };
+    kiapi::board::types::Zone {
+        id: None,
+        r#type: ZoneType::ZtRuleArea as i32,
+        layers: layers.iter().map(|layer| layer_from_name(layer) as i32).collect(),
+        outline: Some(outline),
+        name: name.to_string(),
+        priority: 0,
+        filled: false,
+        filled_polygons: vec![],
+        border: Some(ZoneBorderSettings {
+            style: ZoneBorderStyle::ZbsDiagonalEdge as i32,
+            pitch: Some(distance(ZONE_BORDER_PITCH_MM)),
+        }),
+        locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+        layer_properties: vec![],
+        settings: Some(kiapi::board::types::zone::Settings::RuleAreaSettings(RuleAreaSettings {
+            keepout_copper: rules.copper_pour,
+            keepout_vias: rules.vias,
+            keepout_tracks: rules.tracks,
+            keepout_pads: rules.pads,
+            keepout_footprints: rules.footprints,
+            placement_enabled: false,
+            placement_source_type: 0,
+            placement_source: String::new(),
+        })),
+        parent: None,
+    }
+}
+
 pub fn pack_any<M: prost::Message>(msg: &M, type_name: &str) -> prost_types::Any {
     let mut buf = Vec::new();
     msg.encode(&mut buf).expect("protobuf encode failed");
@@ -1232,5 +1295,25 @@ pub(crate) mod tests {
             "{what}: the single copper entry of a PST_NORMAL padstack must be \
              keyed to F_Cu (KiCad's ALL_LAYERS sentinel)"
         );
+    }
+}
+
+#[cfg(test)]
+mod keepout_builder_tests {
+    use super::*;
+
+    #[test]
+    fn a_keepout_is_a_netless_rule_area_on_every_layer_named() {
+        let rules = KeepoutRules { tracks: true, vias: true, pads: false, copper_pour: true, footprints: false };
+        let zone = build_keepout(&[(0.0, 0.0), (2.0, 0.0), (2.0, 1.0)], &["F.Cu", "In1.Cu", "B.Cu"], "antenna", rules);
+        assert_eq!(zone.r#type, kiapi::board::types::ZoneType::ZtRuleArea as i32);
+        assert_eq!(zone.layers.len(), 3);
+        assert_eq!(zone.name, "antenna");
+        let Some(kiapi::board::types::zone::Settings::RuleAreaSettings(settings)) = zone.settings else {
+            panic!("not a rule area");
+        };
+        assert!(settings.keepout_tracks && settings.keepout_vias && settings.keepout_copper);
+        assert!(!settings.keepout_pads && !settings.keepout_footprints);
+        assert_eq!(zone.outline.unwrap().polygons[0].outline.as_ref().unwrap().nodes.len(), 3);
     }
 }

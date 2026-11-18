@@ -581,3 +581,20 @@ The STM32F072 + Feather nRF52840 USB-C board (`~/Projects/kicad/stm32_demo/build
 - **Noted, not changed:**
   - `update_pcb_from_schematic` refuses every pad-net change on a board that has zones. KiCad 10's zone protobuf hides the net, so the check fails closed. Workaround: delete the pours first, sync, then pour again.
   - `add_board_outline` appends a second outline rather than replacing the old one; its description says so. Workaround: clear Edge.Cuts with `delete_graphics` first.
+
+## Pass 13: keep-out areas, layer retyping, `mixed` routing layers
+
+- **New tool, `add_keepout_area`** (`pcb_routing`, so it now has 20 tools; 245 registered and 252 with the meta-tools):
+  - It writes a KiCad rule area to the live board in one undo step: a polygon on chosen copper layers (default: all of them).
+  - The area can forbid tracks, vias and copper pour, and optionally pads and footprints.
+  - KiCad's DRC enforces it, and KiCad's Specctra export passes it to Freerouting as a `(keepout …)`. Remove it with `delete_zones(names=[…])`.
+  - Builder: `konnect_ipc::builders::build_keepout`, with a unit test.
+  - **Why:** `update_pcb_from_schematic` and the footprint pipeline drop zones embedded in a footprint. As a result the MDBT50Q's antenna keep-out and the TC2030 pad-field keep-outs were missing from the module board. The Fable review found that the planes and tracks ran under the antenna. Restoring embedded zones in the sync is the larger fix and has not been done.
+- **`add_layer` retypes:**
+  - Naming an existing inner copper layer with a different explicit `layer_type` (for example `power` → `mixed`) changes its type in place.
+  - Without a type, or with the same type, it still refuses as before.
+  - Test: `an_existing_inner_layer_is_retyped_on_an_explicit_type`.
+- **Specctra lowering keeps `mixed` layers routable:**
+  - An inner layer the board types `mixed` keeps its pour out of the DSN, but is no longer forced to `power`, so Freerouting can route on it.
+  - Test: `a_mixed_inner_layer_stays_routable`.
+  - **Limit, found on the module board:** a pour net that every pad already reaches through fan-out is still dropped from the routing job. Routes on the mixed layer then cut the pour into islands that nothing rejoins (five +3V3 islands). That board went back to a solid `power` plane. A fix would keep such nets in the job when their plane is on a `mixed` layer.

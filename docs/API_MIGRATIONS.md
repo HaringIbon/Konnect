@@ -2381,3 +2381,9 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
 ## Unreleased (fork): rotated pads in Specctra export
 
 - **`export_specctra_dsn`:** boards with pads rotated inside their footprint (common on two-sided boards) now export through KiCad's exporter. They used to fail with "DSN is missing pin name". No argument or response changes.
+
+## Unreleased (fork): keep-outs, layer retype, mixed layers
+
+- **New tool:** `add_keepout_area` (`pcb_routing`): `board`, `name` and `points` are required; `layers`, `tracks`, `vias`, `copper_pour`, `pads` and `footprints` are optional.
+- **`add_layer`:** an existing inner copper layer named with a different explicit `layer_type` is now retyped rather than refused. The response has `retyped_layer`, `from` and `type`.
+- **`export_specctra_dsn`:** a `mixed` inner layer that carries a pour stays a signal layer in the DSN. It used to be retyped to `power`.

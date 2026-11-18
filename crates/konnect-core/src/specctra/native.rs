@@ -147,9 +147,16 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
         bail!("KiCad IPC snapshot root is not 'kicad_pcb'");
     }
     let (dsn, removed_planes) = strip_planes(raw_dsn)?;
+    // A layer the board types `mixed` carries a pour *and* signals: it stays
+    // routable, and the pour refills around the routes after import.
+    let mixed = konnect_sexp::layers::layers(&board)
+        .into_iter()
+        .filter(|layer| layer.kind == "mixed")
+        .map(|layer| layer.name)
+        .collect::<BTreeSet<_>>();
     let plane_layers = removed_planes
         .iter()
-        .filter(|plane| plane.layer.starts_with("In"))
+        .filter(|plane| plane.layer.starts_with("In") && !mixed.contains(&plane.layer))
         .map(|plane| plane.layer.clone())
         .collect::<BTreeSet<_>>();
     let dsn = retype_as_power(&dsn, &plane_layers)?;
@@ -982,6 +989,26 @@ mod round_trip_tests {
             .find(|padstack| padstack["name"] == "Via[0-3]_600:300_um")
             .unwrap();
         assert_eq!((via["size_x_um"].as_i64(), via["drill_um"].as_i64()), (Some(600), Some(300)));
+    }
+
+    /// A `mixed` inner layer keeps its pour out of the DSN but stays a
+    /// routing layer for Freerouting.
+    #[test]
+    fn a_mixed_inner_layer_stays_routable() {
+        let (_dir, path) = board();
+        let line = BOARD
+            .lines()
+            .find(|line| line.contains("\"In2.Cu\""))
+            .expect("fixture has In2.Cu");
+        let kind = line.trim().trim_end_matches(')').rsplit(' ').next().unwrap();
+        let mixed_board = BOARD.replacen(line, &line.replacen(kind, "mixed", 1), 1);
+        // KiCad's exporter writes a `mixed` layer as `(type signal)`.
+        let dsn = DSN.replacen("(layer In2.Cu\n      (type power)", "(layer In2.Cu\n      (type signal)", 1);
+        assert_ne!(dsn, DSN);
+        let export = super::lower(&path, &mixed_board, &dsn).unwrap();
+        assert_eq!(export.power_layers, vec!["In1.Cu"]);
+        assert!(export.bundle.dsn.contains("(layer In2.Cu\n      (type signal)"));
+        assert!(!export.bundle.dsn.contains("(plane "));
     }
 
     /// A pad rotated within its footprint is written
