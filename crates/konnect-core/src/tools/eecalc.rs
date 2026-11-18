@@ -56,7 +56,7 @@ fn rho_cu(temp_c: f64) -> f64 {
     RHO_CU_20 * at(k) / at(293.15)
 }
 
-// ─── Current capacity (IPC-2221) ────────────────────────────────────────────
+// ─── Current capacity (IPC-2152, Brooks & Adam fit) ─────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WidthForCurrent {
@@ -67,26 +67,98 @@ pub(crate) struct WidthForCurrent {
     pub temp_rise_c: f64,
 }
 
-/// Minimum trace width for `current_a` with a `temp_rise_c` rise, by the
-/// IPC-2221 curve fit I = k·ΔT^0.44·A^0.725 (A in mil²; k = 0.048 outer,
-/// 0.024 inner). IPC-2152 replaced these charts. Its data show the IPC-2221
-/// internal chart is conservative, but the external chart is *not* always:
-/// an outer trace on a thin board with no nearby copper plane can run hotter
-/// than 2221 predicts. Keep margin on outer power traces near the limit.
+/// Brooks & Adam's fit ΔT = K·I^a·W^b·Th^c to the IPC-2152 data (W, Th in
+/// mil, I in A), as KiCad's calculator uses it since commit 7f558e2779
+/// (master, 2026-07; KiCad 10.0.x still uses IPC-2221). External: one fit for
+/// all copper weights. Internal: per weight, picked by the nearest nominal
+/// thickness (0.5/1/2/3 oz = 0.689/1.378/2.756/4.134 mil), exactly as KiCad.
+fn brooks_adam(inner: bool, thickness_mil: f64) -> (f64, f64, f64, f64) {
+    const HALF: f64 = 0.689;
+    const ONE: f64 = 1.378;
+    const TWO: f64 = 2.756;
+    const THREE: f64 = 4.134;
+    if !inner {
+        (215.3, 2.0, -1.15, -1.0)
+    } else if thickness_mil < (HALF + ONE) / 2.0 {
+        (120.0, 2.0, -1.10, -1.52)
+    } else if thickness_mil < (ONE + TWO) / 2.0 {
+        (200.0, 1.9, -1.10, -1.52)
+    } else if thickness_mil < (TWO + THREE) / 2.0 {
+        (300.0, 2.0, -1.15, -1.52)
+    } else {
+        (262.5, 1.9, -1.15, -1.52)
+    }
+}
+
+/// IPC-2152 width in mil for a copper thickness in mil.
+pub(crate) fn ipc2152_width_mil(current_a: f64, temp_rise_c: f64, thickness_mil: f64, inner: bool) -> f64 {
+    let (k, a, b, c) = brooks_adam(inner, thickness_mil);
+    (temp_rise_c / (k * current_a.powf(a) * thickness_mil.powf(c))).powf(1.0 / b)
+}
+
+/// IPC-2152 current in A that a `width_mil` trace carries for the rise.
+pub(crate) fn ipc2152_current_a(width_mil: f64, temp_rise_c: f64, thickness_mil: f64, inner: bool) -> f64 {
+    let (k, a, b, c) = brooks_adam(inner, thickness_mil);
+    (temp_rise_c / (k * width_mil.powf(b) * thickness_mil.powf(c))).powf(1.0 / a)
+}
+
+/// Minimum trace width for `current_a` with a `temp_rise_c` rise, by IPC-2152
+/// (Brooks & Adam closed-form fit). IPC-2152 (2009) replaced IPC-2221's
+/// 1956 NBS charts; its data show internal traces cool about as well as
+/// external ones, so there is no factor-of-two internal derating — an inner
+/// trace is wider only because its copper is usually thinner. The fit is the
+/// conservative IPC-2152 case (no copper plane near the trace, still air): a
+/// plane under the trace runs it cooler.
 pub(crate) fn width_for_current(current_a: f64, temp_rise_c: f64, copper_oz: f64, inner: bool) -> Calc<WidthForCurrent> {
+    let thickness_mil = copper_oz * MM_PER_OZ * MIL_PER_MM;
+    let width_mil = ipc2152_width_mil(current_a, temp_rise_c, thickness_mil, inner);
+    let width_mm = width_mil / MIL_PER_MM;
+    let mut warnings = Vec::new();
+    if !(0.0..=30.0).contains(&current_a) {
+        warnings.push(format!("current {current_a} A is beyond the IPC-2152 charts (≈30 A)"));
+    }
+    if !(1.0..=100.0).contains(&temp_rise_c) {
+        warnings.push(format!("temperature rise {temp_rise_c} °C is outside the IPC-2152 charts' 1–100 °C"));
+    }
+    if width_mil > 400.0 {
+        warnings.push("width exceeds 400 mil; use a plane or pour".to_string());
+    }
+    if inner && copper_oz < 0.75 {
+        warnings.push("0.5 oz inner copper: the half-ounce internal fit applies".to_string());
+    }
+    Calc {
+        result: WidthForCurrent {
+            width_mm: round(width_mm, 4),
+            cross_section_mil2: round(width_mil * thickness_mil, 2),
+            layer: if inner { "inner" } else { "outer" },
+            copper_oz,
+            temp_rise_c,
+        },
+        method: "IPC-2152 via the Brooks & Adam fit ΔT = K·I^a·W^b·Th^c (W, Th in mil); external K 215.3, a 2, b −1.15, c −1.0; internal per copper weight (0.5 oz: 120, 2, −1.10, −1.52; 1 oz: 200, 1.9, −1.10, −1.52; 2 oz: 300, 2, −1.15, −1.52; 3 oz: 262.5, 1.9, −1.15, −1.52) — the same equation and coefficients as KiCad's calculator (commit 7f558e2779)",
+        assumptions: vec![
+            "single trace, still air, no copper plane near it (the conservative IPC-2152 case); planes lower the rise".to_string(),
+            format!("copper thickness {copper_oz} oz = {:.1} µm", copper_oz * MM_PER_OZ * 1000.0),
+            "IPC-2152 found internal traces cool about as well as external ones: no internal derating factor".to_string(),
+        ],
+        valid_range: "IPC-2152 chart range: ΔT 1–100 °C, up to ≈30 A",
+        warnings,
+    }
+}
+
+/// The superseded IPC-2221 §6.2 curve fit I = k·ΔT^0.44·A^0.725 (A in mil²;
+/// k = 0.048 outer, 0.024 inner), kept for comparison with older tools
+/// (KiCad 10.0.x's calculator uses it).
+pub(crate) fn width_for_current_ipc2221(current_a: f64, temp_rise_c: f64, copper_oz: f64, inner: bool) -> Calc<WidthForCurrent> {
     let k = if inner { 0.024 } else { 0.048 };
     let area_mil2 = (current_a / (k * temp_rise_c.powf(0.44))).powf(1.0 / 0.725);
     let thickness_mil = copper_oz * MM_PER_OZ * MIL_PER_MM;
     let width_mm = area_mil2 / thickness_mil / MIL_PER_MM;
-    let mut warnings = Vec::new();
+    let mut warnings = vec!["IPC-2221's charts were superseded by IPC-2152 (2009); the internal chart is too conservative and the external one not always conservative".to_string()];
     if !(0.0..=35.0).contains(&current_a) {
         warnings.push(format!("current {current_a} A is outside the curve fit's 0–35 A"));
     }
     if !(10.0..=100.0).contains(&temp_rise_c) {
         warnings.push(format!("temperature rise {temp_rise_c} °C is outside the fit's 10–100 °C"));
-    }
-    if width_mm * MIL_PER_MM > 400.0 {
-        warnings.push("width exceeds the fit's 400 mil; use a plane or pour".to_string());
     }
     Calc {
         result: WidthForCurrent {
@@ -98,7 +170,7 @@ pub(crate) fn width_for_current(current_a: f64, temp_rise_c: f64, copper_oz: f64
         },
         method: "IPC-2221 §6.2 curve fit I = k·ΔT^0.44·A^0.725 (k 0.048 outer, 0.024 inner)",
         assumptions: vec![
-            "single isolated trace, still air, no nearby heat sources or planes".to_string(),
+            "single isolated trace, still air".to_string(),
             format!("copper thickness {copper_oz} oz = {:.1} µm", copper_oz * MM_PER_OZ * 1000.0),
         ],
         valid_range: "0–35 A, ΔT 10–100 °C, width ≤ 400 mil",
@@ -447,12 +519,44 @@ mod tests {
     fn ipc_2221_width_matches_the_published_chart() {
         // IPC-2221 chart: 1 A, 10 °C rise, 1 oz outer ≈ 0.3 mm (≈ 12 mil);
         // 2 A ≈ 0.76 mm (30 mil). Inner layers need ~2.6× the outer width.
-        let one = width_for_current(1.0, 10.0, 1.0, false).result.width_mm;
-        let two = width_for_current(2.0, 10.0, 1.0, false).result.width_mm;
+        let one = width_for_current_ipc2221(1.0, 10.0, 1.0, false).result.width_mm;
+        let two = width_for_current_ipc2221(2.0, 10.0, 1.0, false).result.width_mm;
         assert!((0.25..0.35).contains(&one), "{one}");
         assert!((0.65..0.85).contains(&two), "{two}");
-        let inner = width_for_current(1.0, 10.0, 1.0, true).result.width_mm;
+        let inner = width_for_current_ipc2221(1.0, 10.0, 1.0, true).result.width_mm;
         assert!(close(inner / one, 2f64.powf(1.0 / 0.725), 0.001));
+    }
+
+    #[test]
+    fn ipc_2152_matches_kicads_reference_values() {
+        // KiCad qa/tests/common/test_track_width_calculations.cpp (commit
+        // 7f558e2779), checked there to 1e-6 %: 20 mil, 1.378 mil (1 oz),
+        // ΔT 10 °C → 1.4164291025677085 A external, 1.513124408404138 A
+        // internal 1 oz; 2.756 mil (2 oz) internal → 2.208736063285966 A.
+        // Same equation here, so the tolerance is 1e-9 relative.
+        assert!(close(ipc2152_current_a(20.0, 10.0, 1.378, false), 1.416_429_102_567_708_5, 1e-9));
+        assert!(close(ipc2152_current_a(20.0, 10.0, 1.378, true), 1.513_124_408_404_138, 1e-9));
+        assert!(close(ipc2152_current_a(20.0, 10.0, 2.756, true), 2.208_736_063_285_966, 1e-9));
+        // Width and current are exact inverses (KiCad's RoundTrip tests).
+        for inner in [false, true] {
+            let i = ipc2152_current_a(25.0, 30.0, 1.378, inner);
+            assert!(close(ipc2152_width_mil(i, 30.0, 1.378, inner), 25.0, 1e-9));
+        }
+    }
+
+    #[test]
+    fn ipc_2152_does_not_derate_inner_layers_and_tracks_the_old_chart_outside() {
+        // At equal copper an inner trace is no wider than ~1.1× the outer one
+        // (IPC-2221 said 2.6×); with JLC04161H-7628's 0.5 oz inner copper it
+        // is wider only for the thinner copper.
+        let outer = width_for_current(1.0, 10.0, 1.0, false).result.width_mm;
+        let inner_1oz = width_for_current(1.0, 10.0, 1.0, true).result.width_mm;
+        assert!(inner_1oz < 1.1 * outer && inner_1oz > 0.8 * outer, "{outer} vs {inner_1oz}");
+        // External 1 A / 10 °C / 1 oz: within 15 % of the IPC-2221 chart's
+        // 0.3 mm — the two agree for small outer traces.
+        assert!(close(outer, width_for_current_ipc2221(1.0, 10.0, 1.0, false).result.width_mm, 0.15), "{outer}");
+        let half = width_for_current(1.5, 10.0, 0.5, true).result.width_mm;
+        assert!(half > width_for_current(1.5, 10.0, 1.0, false).result.width_mm, "{half}");
     }
 
     #[test]

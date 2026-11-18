@@ -29,6 +29,70 @@ use std::path::{Path, PathBuf};
 pub const INTENT_SCHEMA: u32 = 1;
 const RULE_PREFIX: &str = "intent: ";
 const ROLES: &[&str] = &["signal", "diff_pair", "power", "clock", "sensitive", "plane"];
+const STANDARDS: &[&str] = &["usb2_fs", "usb2_hs", "ethernet_100base_tx", "ethernet_1000base_t", "rmii"];
+const TIE_KINDS: &[&str] = &["crystal", "core_regulator_cap", "decoupling"];
+/// Layout skew budget as a fraction of the 10–90 % rise time. Johnson (EDN
+/// 2004-01-22, "Common Mode Analysis of Skew"): a skew of 20 % of tr makes a
+/// common-mode component of 10 %; Johnson (EDN 2002-04-18, "Your Layout is
+/// Skewed"): an unspecified driver already has ≥ 10 % — so the layout gets the
+/// other half.
+pub(crate) const EDGE_SKEW_FRACTION: f64 = 0.1;
+/// Default allowed temperature rise for current widths, °C (KiCad's calculator default).
+const DEFAULT_RISE_C: f64 = 10.0;
+
+/// Published defaults for an interface: (value, source) per field.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StandardDefaults {
+    pub pair: bool,
+    pub impedance_ohm: Option<(f64, &'static str)>,
+    pub tolerance_pct: Option<(f64, &'static str)>,
+    pub max_skew_mm: Option<(f64, &'static str)>,
+    pub max_length_mm: Option<(f64, &'static str)>,
+    pub rise_time_ns: Option<(f64, &'static str)>,
+}
+
+const TI_USB2: &str = "TI SPRAAR7J (2023) Table A-1: USB2.0 pair 81–99 Ω, skew within any USB2.0 pair ≤ 50 mil [docdb ti-spraar7j]";
+const TI_PHY: &str = "TI SNLA387 (2021) Ethernet PHY PCB Design Layout Checklist: MDI < 2 in, 100 Ω ±10 %, matched within 50 mil (10/100M) or 20 mil (1G) [docdb ti-snla387-ethernet-phy-layout]";
+
+pub(crate) fn standard_defaults(name: &str) -> Option<StandardDefaults> {
+    let usb = |rise: (f64, &'static str)| StandardDefaults {
+        pair: true,
+        impedance_ohm: Some((90.0, TI_USB2)),
+        tolerance_pct: Some((10.0, TI_USB2)),
+        max_skew_mm: Some((1.27, TI_USB2)),
+        max_length_mm: None,
+        rise_time_ns: Some(rise),
+    };
+    Some(match name {
+        "usb2_hs" => usb((0.5, "USB 2.0 spec §7.1.2.2: high-speed rise time ≥ 500 ps (not re-read: usb.org blocked from this host)")),
+        "usb2_fs" => usb((4.0, "USB 2.0 full-speed rise time 4–20 ns, as tabulated in STM32H563 DS14258 USB FS characteristics [docdb st-ds14258-stm32h563]")),
+        "ethernet_100base_tx" => StandardDefaults {
+            pair: true,
+            impedance_ohm: Some((100.0, TI_PHY)),
+            tolerance_pct: Some((10.0, TI_PHY)),
+            max_skew_mm: Some((1.27, TI_PHY)),
+            max_length_mm: Some((50.8, TI_PHY)),
+            rise_time_ns: Some((3.0, "LAN8742A datasheet 100BASE-TX TRF 3.0–5.0 ns [docdb microchip-lan8742a-ds]")),
+        },
+        "ethernet_1000base_t" => StandardDefaults {
+            pair: true,
+            impedance_ohm: Some((100.0, TI_PHY)),
+            tolerance_pct: Some((10.0, TI_PHY)),
+            max_skew_mm: Some((0.508, TI_PHY)),
+            max_length_mm: Some((50.8, TI_PHY)),
+            rise_time_ns: None,
+        },
+        "rmii" => StandardDefaults {
+            pair: false,
+            impedance_ohm: None,
+            tolerance_pct: None,
+            max_skew_mm: None,
+            max_length_mm: Some((152.4, "RMII/MII traces < 6 in: TI SNLA079D §5.2 and SNLA387; LAN8742 routing checklist (REF_CLK < 6.0 in, matched 0.10 in) [docdb ti-snla079d-phyter-layout, microchip-lan8742-routing-checklist]")),
+            rise_time_ns: None,
+        },
+        _ => return None,
+    })
+}
 
 // ─── Schema ─────────────────────────────────────────────────────────────────
 
@@ -118,6 +182,16 @@ pub struct NetIntent {
     /// Keep other nets at least this far away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clearance_mm: Option<f64>,
+    /// The interface the net belongs to (`usb2_fs`, `usb2_hs`,
+    /// `ethernet_100base_tx`, `ethernet_1000base_t`, `rmii`): fills the
+    /// impedance, tolerance, skew and length the user leaves unset with
+    /// published values. See [`standard_defaults`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standard: Option<String>,
+    /// 10–90 % edge time of the signal, ns: a pair without a published skew
+    /// limit gets one from it (see [`EDGE_SKEW_FRACTION`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rise_time_ns: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
 }
@@ -131,7 +205,20 @@ pub struct Tie {
     pub to: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<String>,
-    pub max_mm: f64,
+    /// Pad edge to pad edge, mm. Optional when `kind` supplies a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_mm: Option<f64>,
+    /// `crystal`, `core_regulator_cap` or `decoupling`: defaults for the
+    /// distance, routed path and via count. See [`tie_limits`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Routed copper from the part's pad to the pin, mm (tracks plus via
+    /// barrels), measured on the board's tracks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_path_mm: Option<f64>,
+    /// Vias on that routed path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_vias: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
 }
@@ -156,6 +243,7 @@ impl DesignIntent {
                 ("max_length_mm", intent.max_length_mm),
                 ("max_skew_mm", intent.max_skew_mm),
                 ("clearance_mm", intent.clearance_mm),
+                ("rise_time_ns", intent.rise_time_ns),
             ] {
                 positive(&format!("net '{net}': {name}"), value)?;
             }
@@ -168,6 +256,22 @@ impl DesignIntent {
                     _ => return Err(format!("net '{net}': its pair '{partner}' must also be a diff_pair naming '{net}'")),
                 }
             }
+            if let Some(standard) = &intent.standard {
+                let Some(d) = standard_defaults(standard) else {
+                    return Err(format!("net '{net}': standard must be one of {STANDARDS:?}"));
+                };
+                if d.pair != (intent.role == "diff_pair") {
+                    return Err(format!(
+                        "net '{net}': standard '{standard}' is for {}",
+                        if d.pair { "a diff_pair" } else { "single-ended nets, not a diff_pair" }
+                    ));
+                }
+                if let Some(other) = intent.pair.as_ref().and_then(|p| self.nets.get(p)) {
+                    if other.standard.is_some() && other.standard != intent.standard {
+                        return Err(format!("net '{net}': its pair has a different standard"));
+                    }
+                }
+            }
             if let Some(source) = &intent.source {
                 if source.split_once('.').is_none_or(|(r, p)| r.is_empty() || p.is_empty()) {
                     return Err(format!("net '{net}': source must be REF.PAD, e.g. U10.3"));
@@ -175,8 +279,18 @@ impl DesignIntent {
             }
         }
         for tie in &self.ties {
-            if tie.part.is_empty() || tie.to.is_empty() || !(tie.max_mm.is_finite() && tie.max_mm > 0.0) {
-                return Err(format!("tie {} → {}: part, to and max_mm > 0 are required", tie.part, tie.to));
+            if tie.part.is_empty() || tie.to.is_empty() {
+                return Err(format!("tie {} → {}: part and to are required", tie.part, tie.to));
+            }
+            if let Some(kind) = &tie.kind {
+                if !TIE_KINDS.contains(&kind.as_str()) {
+                    return Err(format!("tie {} → {}: kind must be one of {TIE_KINDS:?}", tie.part, tie.to));
+                }
+            } else if tie.max_mm.is_none() && tie.max_path_mm.is_none() {
+                return Err(format!("tie {} → {}: give max_mm (or max_path_mm), or a kind that supplies them", tie.part, tie.to));
+            }
+            for (name, value) in [("max_mm", tie.max_mm), ("max_path_mm", tie.max_path_mm)] {
+                positive(&format!("tie {} → {}: {name}", tie.part, tie.to), value)?;
             }
         }
         if let Some(s) = self.stackup {
@@ -268,7 +382,7 @@ struct NetRequirement {
     priority: Option<u8>,
     /// The net-class width: the autorouter routes every layer with it.
     track_width_mm: Option<f64>,
-    /// IPC-2221 minimum widths for the current, outer and inner layers.
+    /// IPC-2152 minimum widths for the current, outer and inner layers.
     current_width_mm: Option<f64>,
     inner_current_width_mm: Option<f64>,
     /// Impedance width bounds per layer that has a reference model.
@@ -281,7 +395,90 @@ struct NetRequirement {
     max_length_mm: Option<f64>,
     max_skew_mm: Option<f64>,
     basis: Vec<Value>,
+    /// Where each number came from: "user" or the default's citation.
+    sources: BTreeMap<String, String>,
+    /// The net's intent with defaults filled in; checks use this.
+    #[serde(skip)]
+    effective: NetIntent,
     warnings: Vec<String>,
+}
+
+/// The net's intent with defaults filled in for every field the user left
+/// unset, and the source of each value. User values always win.
+fn resolve_net(n: &NetIntent, layers: &LayerStack, planes: &BTreeSet<String>) -> (NetIntent, BTreeMap<String, String>, Vec<String>) {
+    let mut e = n.clone();
+    let mut src = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for (field, set) in [
+        ("impedance_ohm", n.impedance_ohm.is_some()),
+        ("impedance_tolerance_pct", n.impedance_tolerance_pct.is_some()),
+        ("max_skew_mm", n.max_skew_mm.is_some()),
+        ("max_length_mm", n.max_length_mm.is_some()),
+        ("current_a", n.current_a.is_some()),
+        ("max_temp_rise_c", n.max_temp_rise_c.is_some()),
+        ("rise_time_ns", n.rise_time_ns.is_some()),
+        ("gap_mm", n.gap_mm.is_some()),
+    ] {
+        if set {
+            src.insert(field.to_string(), "user".to_string());
+        }
+    }
+    let d = n.standard.as_deref().and_then(standard_defaults);
+    let mut fill = |slot: &mut Option<f64>, field: &str, value: Option<(f64, &str)>| {
+        if let (None, Some((v, why))) = (*slot, value) {
+            *slot = Some(v);
+            src.insert(field.to_string(), format!("default {}: {why}", n.standard.as_deref().unwrap_or("")));
+        }
+    };
+    if let Some(d) = d {
+        fill(&mut e.impedance_ohm, "impedance_ohm", d.impedance_ohm);
+        fill(&mut e.impedance_tolerance_pct, "impedance_tolerance_pct", d.tolerance_pct);
+        fill(&mut e.max_length_mm, "max_length_mm", d.max_length_mm);
+        fill(&mut e.rise_time_ns, "rise_time_ns", d.rise_time_ns);
+    }
+    if n.role == "diff_pair" && n.max_skew_mm.is_none() {
+        // Edge-rate bound: EDGE_SKEW_FRACTION of the rise time, as length at
+        // the outer layer's propagation velocity (εeff from the stack), or at
+        // c/√εr when no outer layer has a model (slower, so stricter).
+        let edge = e.rise_time_ns.map(|tr| {
+            let outer = layers.copper.first().map(|c| c.0.clone()).unwrap_or_default();
+            let (delay, how) = match layers.model(&outer, planes) {
+                Ok(m) => (m.per_mm(0.2).delay_ps_per_mm, format!("{outer} microstrip εeff")),
+                Err(_) => {
+                    let er = layers.gaps.first().map_or(4.4, |g| g.er);
+                    (er.sqrt() / crate::tools::layer_stack::C0_MM_PER_PS, format!("c/√εr, εr {er}"))
+                }
+            };
+            let mm = EDGE_SKEW_FRACTION * tr * 1000.0 / delay;
+            (mm, format!("{:.0} % of tr {tr} ns = {:.0} ps at {:.2} ps/mm ({how}); Johnson, EDN 2004 'Common Mode Analysis of Skew' (20 % of tr → 10 % common mode) and EDN 2002 'Your Layout is Skewed' (driver skew ≥ 10 % of tr) [docdb johnson-edn-2004-cm-analysis-of-skew, johnson-edn-2002-your-layout-is-skewed]", EDGE_SKEW_FRACTION * 100.0, EDGE_SKEW_FRACTION * tr * 1000.0, delay))
+        });
+        let published = d.and_then(|d| d.max_skew_mm);
+        let chosen = match (published, edge) {
+            (Some((p, why)), Some((m, how))) if p <= m => Some((p, format!("default {}: {why}; tighter than the edge-rate bound {} mm ({how})", n.standard.as_deref().unwrap_or(""), r3(m)))),
+            (Some((p, why)), Some((m, how))) => Some((m, format!("edge-rate bound ({how}); tighter than the published {p} mm ({why})"))),
+            (Some((p, why)), None) => Some((p, format!("default {}: {why}", n.standard.as_deref().unwrap_or("")))),
+            (None, Some((m, how))) => Some((m, format!("edge-rate bound: {how}"))),
+            (None, None) => None,
+        };
+        match chosen {
+            Some((v, why)) => {
+                e.max_skew_mm = Some(r3(v));
+                src.insert("max_skew_mm".to_string(), why);
+            }
+            None => warnings.push("no skew limit: give max_skew_mm, a standard, or rise_time_ns".to_string()),
+        }
+    }
+    if e.current_a.is_some() && e.max_temp_rise_c.is_none() {
+        e.max_temp_rise_c = Some(DEFAULT_RISE_C);
+        src.insert("max_temp_rise_c".to_string(), "default 10 °C rise (KiCad pcb_calculator default; IPC-2152 conservative no-plane case)".to_string());
+    }
+    if n.role == "power" && e.current_a.is_none() {
+        warnings.push("power net without current_a: no width is derived; give current_a (e.g. the fuse or PTC trip current)".to_string());
+    }
+    if n.role == "diff_pair" && e.impedance_ohm.is_some() && e.gap_mm.is_none() {
+        src.insert("gap_mm".to_string(), "default 0.15 mm (Konnect): the impedance width is solved for this gap".to_string());
+    }
+    (e, src, warnings)
 }
 
 fn requirements(intent: &DesignIntent) -> Vec<NetRequirement> {
@@ -346,7 +543,9 @@ fn requirements_on(intent: &DesignIntent, board: Option<&SexpNode>) -> Vec<NetRe
     // a board whose inner layers are all planes routes power on the outside.
     let has_inner = layers.copper.iter().skip(1).take(layers.copper.len().saturating_sub(2)).any(|(l, _)| !planes.contains(l));
     let mut out = Vec::new();
-    for (net, n) in &intent.nets {
+    for (net, user) in &intent.nets {
+        let (resolved, sources, resolve_warnings) = resolve_net(user, &layers, &planes);
+        let n = &resolved;
         let mut r = NetRequirement {
             net: net.clone(),
             role: n.role.clone(),
@@ -361,10 +560,12 @@ fn requirements_on(intent: &DesignIntent, board: Option<&SexpNode>) -> Vec<NetRe
             max_length_mm: n.max_length_mm,
             max_skew_mm: n.max_skew_mm,
             basis: vec![],
-            warnings: vec![],
+            sources,
+            effective: resolved.clone(),
+            warnings: resolve_warnings,
         };
         if let Some(current) = n.current_a {
-            let rise = n.max_temp_rise_c.unwrap_or(10.0);
+            let rise = n.max_temp_rise_c.unwrap_or(DEFAULT_RISE_C);
             let outer = eecalc::width_for_current(current, rise, outer_oz, false);
             let inner = eecalc::width_for_current(current, rise, inner_oz, true);
             let (wo, wi) = (outer.result.width_mm.max(0.15), inner.result.width_mm.max(0.15));
@@ -668,6 +869,117 @@ fn merge_netclasses(project: &mut Value, intent: &DesignIntent, reqs: &[NetRequi
     new_patterns.append(patterns);
     *patterns = new_patterns;
     Ok(wanted.into_iter().map(|(_, class, _)| class).collect())
+}
+
+// ─── Tie limits ─────────────────────────────────────────────────────────────
+
+/// A tie's limits with defaults from its kind, and where each came from.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct TieLimits {
+    pub max_mm: f64,
+    pub max_path_mm: Option<f64>,
+    pub max_vias: Option<u32>,
+    pub sources: BTreeMap<String, String>,
+}
+
+/// Crystal: routed-trace capacitance budget per node, pF. AVR186 gives typical
+/// PCB parasitics of 1 pF XTALIN–GND (2 pF XTALOUT); about half goes to the
+/// crystal, load-capacitor and pin pads, leaving 0.5 pF for the trace.
+const CRYSTAL_TRACE_PF: f64 = 0.5;
+/// Core-regulator capacitor (VCAP, VDDCR): connection inductance budget, nH —
+/// about one MLCC's own mounted ESL, so the stabilising capacitor stays a
+/// capacitor (Konnect choice; ST and Microchip only say "as close as possible",
+/// "heavy, wide trace").
+const CORE_REG_NH: f64 = 1.0;
+/// Decoupling capacitor: connection inductance budget, nH (Konnect choice).
+const DECOUPLING_NH: f64 = 2.0;
+
+/// Defaults for a tie's kind on this stack; explicit tie values win.
+pub(crate) fn tie_limits(tie: &Tie, layers: &LayerStack, planes: &BTreeSet<String>) -> TieLimits {
+    let mut sources = BTreeMap::new();
+    let outer = layers.copper.first().map(|c| c.0.clone()).unwrap_or_default();
+    let model = layers.model(&outer, planes).ok();
+    let floor1 = |v: f64| (v * 10.0).floor() / 10.0;
+    let (path, vias): (Option<(f64, String)>, Option<(u32, String)>) = match tie.kind.as_deref() {
+        Some("crystal") => (
+            Some(match model {
+                Some(m) => {
+                    let pm = m.per_mm(0.2);
+                    (floor1(CRYSTAL_TRACE_PF / pm.c_pf_per_mm), format!(
+                        "crystal: {CRYSTAL_TRACE_PF} pF trace budget / {:.3} pF/mm (0.2 mm on {outer}, C' = √εeff/(c·Z0)); budget from Microchip AVR186 typical parasitics (XTALIN 1 pF) less the pads [docdb microchip-avr186-oscillator-layout]; ST AN5711 §3.1, TI AM67 §8.3.1, LAN8742 routing checklist: as short as possible, outer layer",
+                        pm.c_pf_per_mm
+                    ))
+                }
+                None => (6.0, "crystal: fallback 6 mm (no reference plane under the outer layer, so no line model); WORKFLOW.md §5 item 6".to_string()),
+            }),
+            Some((0, "crystal: route on the outer layer over the ground plane, no vias (TI AM67 §8.3.1; LAN8742 routing checklist)".to_string())),
+        ),
+        Some(kind @ ("core_regulator_cap" | "decoupling")) => {
+            let budget = if kind == "decoupling" { DECOUPLING_NH } else { CORE_REG_NH };
+            (
+                Some(match model {
+                    Some(m) => {
+                        let pm = m.per_mm(0.3);
+                        (floor1(budget / pm.l_nh_per_mm), format!(
+                            "{kind}: {budget} nH connection budget (Konnect choice, ≈ the capacitor's own ESL) / {:.3} nH/mm (0.3 mm on {outer}, L' = √εeff·Z0/c); ST AN5711 §7.4/§9.3 and LAN8742 checklist (VDDCR: heavy, wide trace) give no number [docdb st-an5711-stm32h5-hw, microchip-lan8742-routing-checklist]",
+                            pm.l_nh_per_mm
+                        ))
+                    }
+                    None => (if kind == "decoupling" { 6.0 } else { 3.0 }, format!("{kind}: fallback (no line model for {outer}); WORKFLOW.md §5 item 6")),
+                }),
+                Some((1, format!("{kind}: at most one via between the capacitor pad and the pin (the cap on the other side at the pin's via); ST AN5711 Fig. 20: fewer vias"))),
+            )
+        }
+        _ => (None, None),
+    };
+    let max_path_mm = match (tie.max_path_mm, path) {
+        (Some(v), _) => {
+            sources.insert("max_path_mm".into(), "user".into());
+            Some(v)
+        }
+        (None, Some((v, why))) => {
+            sources.insert("max_path_mm".into(), why);
+            Some(v)
+        }
+        _ => None,
+    };
+    let max_vias = match (tie.max_vias, vias) {
+        (Some(v), _) => {
+            sources.insert("max_vias".into(), "user".into());
+            Some(v)
+        }
+        (None, Some((v, why))) => {
+            sources.insert("max_vias".into(), why);
+            Some(v)
+        }
+        _ => None,
+    };
+    let max_mm = match tie.max_mm {
+        Some(v) => {
+            sources.insert("max_mm".into(), "user".into());
+            v
+        }
+        None => {
+            // The pad-edge distance can be no more than the routed path.
+            let v = max_path_mm.unwrap_or(f64::INFINITY);
+            sources.insert("max_mm".into(), "default: the path limit (placement distance ≤ routed path)".into());
+            v
+        }
+    };
+    TieLimits { max_mm, max_path_mm, max_vias, sources }
+}
+
+/// Every tie's resolved limits.
+fn tie_requirements(intent: &DesignIntent, board: Option<&SexpNode>) -> Vec<Value> {
+    let (layers, planes, _) = stack_and_planes(intent, board);
+    intent
+        .ties
+        .iter()
+        .map(|t| {
+            let l = tie_limits(t, &layers, &planes);
+            json!({"part": t.part, "to": t.to, "pin": t.pin, "kind": t.kind, "max_mm": r3(l.max_mm), "max_path_mm": l.max_path_mm, "max_vias": l.max_vias, "sources": l.sources})
+        })
+        .collect()
 }
 
 // ─── Checking the board ─────────────────────────────────────────────────────
@@ -1094,6 +1406,7 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
     let empty = NetCopper { segments: vec![], has_zone: false };
 
     for tie in &intent.ties {
+        let limits = tie_limits(tie, &layers, &planes);
         let subject = format!("{} → {}{}", tie.part, tie.to, tie.pin.as_deref().map(|p| format!(".{p}")).unwrap_or_default());
         let part: Vec<&CopperPad> = pads.iter().filter(|p| p.reference == tie.part).collect();
         let target: Vec<&CopperPad> = pads
@@ -1101,7 +1414,7 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
             .filter(|p| p.reference == tie.to && tie.pin.as_deref().is_none_or(|pin| p.number == pin))
             .collect();
         if part.is_empty() || target.is_empty() {
-            checks.push(Check { kind: "tie", subject, status: "unverified", measured: Value::Null, required: json!({"max_mm": tie.max_mm}), detail: "part or pin not on the board".to_string() });
+            checks.push(Check { kind: "tie", subject, status: "unverified", measured: Value::Null, required: json!({"max_mm": r3(limits.max_mm)}), detail: "part or pin not on the board".to_string() });
             continue;
         }
         // Measure from the part's pads on the pin's net (the pad that does
@@ -1120,12 +1433,25 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
         let same_side = from.iter().any(|a| target.iter().any(|b| a.layer == b.layer));
         checks.push(Check {
             kind: "tie",
-            subject,
-            status: if d <= tie.max_mm { "pass" } else { "fail" },
+            subject: subject.clone(),
+            status: if d <= limits.max_mm { "pass" } else { "fail" },
             measured: json!({"distance_mm": r3(d), "same_side": same_side}),
-            required: json!({"max_mm": tie.max_mm}),
+            required: json!({"max_mm": r3(limits.max_mm), "sources": limits.sources}),
             detail: tie.why.clone().map_or(note.to_string(), |w| format!("{w}; {note}")),
         });
+        if limits.max_path_mm.is_some() || limits.max_vias.is_some() {
+            // TODO(next session): measure the routed path (shortest track +
+            // via-barrel path from the part's pad to the pin on their shared
+            // net, reusing voltage_drop's graph) and count its vias.
+            checks.push(Check {
+                kind: "tie_path",
+                subject,
+                status: "unverified",
+                measured: Value::Null,
+                required: json!({"max_path_mm": limits.max_path_mm, "max_vias": limits.max_vias}),
+                detail: "routed path length and via count are not measured yet; placement distance is checked above".to_string(),
+            });
+        }
     }
 
     // An intent net the board does not have is a typo or a missing sheet
@@ -1150,7 +1476,7 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
         }
     }
     for r in &reqs {
-        let n = &intent.nets[&r.net];
+        let n = &r.effective;
         let net_copper = copper.get(&r.net).unwrap_or(&empty);
         let routed = !net_copper.segments.is_empty();
         if n.role == "plane" {
@@ -1186,7 +1512,7 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
                     status: if under <= 1.0 { "pass" } else { "fail" },
                     measured: json!({"undersized_length_mm": r3(under), "routed_length_mm": r3(total), "narrowest_mm": r3(narrowest)}),
                     required: json!({"outer_min_mm": r3(outer_min), "inner_min_mm": r.inner_current_width_mm.map(r3)}),
-                    detail: "IPC-2221 width for the current on each segment's layer (inner layers from the inner copper weight); up to 1 mm of narrower copper (pad necks) passes here, DRC still lists it".to_string(),
+                    detail: "IPC-2152 width for the current on each segment's layer (inner layers from the inner copper weight); up to 1 mm of narrower copper (pad necks) passes here, DRC still lists it".to_string(),
                 });
             } else if !net_copper.has_zone {
                 checks.push(Check { kind: "track_width", subject: r.net.clone(), status: "unverified", measured: Value::Null, required: json!({"outer_min_mm": r3(outer_min)}), detail: "net not routed yet".to_string() });
@@ -1405,7 +1731,9 @@ pub(crate) fn plan_ties(tree: &SexpNode, intent: &DesignIntent, clearance: f64) 
         .collect();
     let mut plans = Vec::new();
     let mut notes = Vec::new();
+    let (layers, planes, _) = stack_and_planes(intent, Some(tree));
     for tie in &intent.ties {
+        let max_mm = tie_limits(tie, &layers, &planes).max_mm;
         let label = format!("{} → {}{}", tie.part, tie.to, tie.pin.as_deref().map(|p| format!(".{p}")).unwrap_or_default());
         let target: Vec<&CopperPad> = pads.iter().filter(|p| p.reference == tie.to && tie.pin.as_deref().is_none_or(|pin| p.number == pin)).collect();
         let part: Vec<&CopperPad> = pads.iter().filter(|p| p.reference == tie.part).collect();
@@ -1424,7 +1752,7 @@ pub(crate) fn plan_ties(tree: &SexpNode, intent: &DesignIntent, clearance: f64) 
         let net_pads: Vec<&&CopperPad> = part.iter().filter(|p| p.net.as_deref().is_some_and(|n| nets.contains(n))).collect();
         let job: Vec<&&CopperPad> = if net_pads.is_empty() { part.iter().collect() } else { net_pads };
         let distance_now = job.iter().flat_map(|a| target.iter().map(move |b| polygon_distance(&a.corners, &b.corners))).fold(f64::INFINITY, f64::min);
-        if distance_now <= tie.max_mm {
+        if distance_now <= max_mm {
             notes.push(json!({"tie": label, "status": "already_met", "distance_mm": r3(distance_now)}));
             continue;
         }
@@ -1450,7 +1778,7 @@ pub(crate) fn plan_ties(tree: &SexpNode, intent: &DesignIntent, clearance: f64) 
         for rotation in [0.0, 90.0, 180.0, 270.0] {
             let offset = to_board(work_center, (0.0, 0.0), rotation);
             let mut s = 0.0;
-            while s <= tie.max_mm + 4.0 {
+            while s <= max_mm + 4.0 {
                 s += 0.1;
                 let mut t = -3.0;
                 while t <= 3.0 + 1e-9 {
@@ -1494,8 +1822,8 @@ pub(crate) fn plan_ties(tree: &SexpNode, intent: &DesignIntent, clearance: f64) 
                     rotation,
                     tie: label,
                     distance_mm: r3(d),
-                    max_mm: tie.max_mm,
-                    meets: d <= tie.max_mm,
+                    max_mm: max_mm,
+                    meets: d <= max_mm,
                 });
             }
             None => notes.push(json!({"tie": label, "status": "no_site", "reason": "no position clears the other courtyards inside the outline"})),
@@ -1511,7 +1839,7 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "engineering_calc",
             "Engineering numbers for design decisions, as JSON with method, assumptions, valid \
-             range and warnings. calculation: width_for_current (IPC-2221), trace_resistance \
+             range and warnings. calculation: width_for_current (IPC-2152; method: ipc2221 for the old chart), trace_resistance \
              (with voltage drop), impedance (microstrip/stripline, differential with gap_mm), \
              width_for_impedance, standard_value (E12/E24/E96), divider. Lengths mm, current A, \
              temperature °C.",
@@ -1523,6 +1851,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "temp_rise_c": { "type": "number", "default": 10, "description": "Allowed rise, °C" },
                     "copper_oz": { "type": "number", "default": 1 },
                     "layer": { "type": "string", "enum": ["outer", "inner"], "default": "outer" },
+                    "method": { "type": "string", "enum": ["ipc2152", "ipc2221"], "default": "ipc2152", "description": "width_for_current only" },
                     "length_mm": { "type": "number" },
                     "width_mm": { "type": "number" },
                     "temp_c": { "type": "number", "default": 25 },
@@ -1561,8 +1890,10 @@ pub fn tools() -> Vec<ToolDef> {
             "set_design_intent",
             "Merge into the project's design intent. nets: {NET: {role: signal|diff_pair|power|clock|sensitive|plane, \
              priority, pair, impedance_ohm, gap_mm, current_a, max_temp_rise_c, max_drop_mv, source: 'REF.PAD', \
-             max_length_mm, max_skew_mm, clearance_mm, why}}; a null value removes the net. ties: \
-             [{part, to, pin, max_mm, why}] replace ties with the same part/to/pin. stackup: \
+             max_length_mm, max_skew_mm, clearance_mm, standard, rise_time_ns, why}}; a null value removes the net; \
+             unset values are filled from `standard` and physics, and `requirements[].sources` names each \
+             number's origin. ties: [{part, to, pin, max_mm, kind: crystal|core_regulator_cap|decoupling, \
+             max_path_mm, max_vias, why}] replace ties with the same part/to/pin. stackup: \
              {outer_copper_oz, inner_copper_oz, outer_dielectric_mm, er}. Validated before writing; \
              revision-checked write.",
             json!({
@@ -1587,6 +1918,8 @@ pub fn tools() -> Vec<ToolDef> {
                                 "max_length_mm": { "type": ["number", "null"] },
                                 "max_skew_mm": { "type": ["number", "null"] },
                                 "clearance_mm": { "type": ["number", "null"] },
+                                "standard": { "type": ["string", "null"], "enum": ["usb2_fs", "usb2_hs", "ethernet_100base_tx", "ethernet_1000base_t", "rmii", null], "description": "Fills unset impedance, tolerance, skew, length and rise time with published values" },
+                                "rise_time_ns": { "type": ["number", "null"], "description": "10–90 % edge; a pair without a published skew gets 10 % of it as length" },
                                 "why": { "type": ["string", "null"] }
                             },
                             "additionalProperties": false
@@ -1598,10 +1931,13 @@ pub fn tools() -> Vec<ToolDef> {
                             "part": { "type": "string" },
                             "to": { "type": "string" },
                             "pin": { "type": "string" },
-                            "max_mm": { "type": "number" },
+                            "max_mm": { "type": "number", "description": "Pad edge to pad edge; optional with a kind" },
+                            "kind": { "type": "string", "enum": ["crystal", "core_regulator_cap", "decoupling"], "description": "Defaults for max_mm, max_path_mm and max_vias from the stack-up" },
+                            "max_path_mm": { "type": "number" },
+                            "max_vias": { "type": "integer", "minimum": 0 },
                             "why": { "type": "string" }
                         },
-                        "required": ["part", "to", "max_mm"],
+                        "required": ["part", "to"],
                         "additionalProperties": false
                     } },
                     "remove_nets": { "type": "array", "items": { "type": "string" }, "description": "Net names to delete from the intent" },
@@ -1730,7 +2066,7 @@ fn handle_engineering_calc(args: &Value) -> anyhow::Result<CallToolResult> {
     }
     let value = (|| -> Result<Value, CallToolResult> {
         Ok(match calc {
-            "width_for_current" => serde_json::to_value(eecalc::width_for_current(
+            "width_for_current" => serde_json::to_value((if args["method"].as_str() == Some("ipc2221") { eecalc::width_for_current_ipc2221 } else { eecalc::width_for_current })(
                 need("current_a")?,
                 num("temp_rise_c").unwrap_or(10.0),
                 num("copper_oz").unwrap_or(1.0),
@@ -1809,6 +2145,7 @@ fn handle_get_design_intent(args: &Value) -> anyhow::Result<CallToolResult> {
         "intent": intent,
         "stackup_used": intent.stackup(),
         "requirements": requirements(&intent),
+        "tie_requirements": tie_requirements(&intent, None),
     })))
 }
 
@@ -1891,6 +2228,7 @@ fn handle_set_design_intent(args: &Value) -> anyhow::Result<CallToolResult> {
         "nets": intent.nets.len(),
         "ties": intent.ties.len(),
         "requirements": requirements(&intent),
+        "tie_requirements": tie_requirements(&intent, None),
     })))
 }
 
@@ -1923,6 +2261,7 @@ fn handle_apply_design_intent(args: &Value) -> anyhow::Result<CallToolResult> {
         "dru_rules": rules.keys().collect::<Vec<_>>(),
         "dru_text": if dry_run { Value::String(new_dru.clone()) } else { Value::Null },
         "requirements": reqs,
+        "tie_requirements": tie_requirements(&intent, board_tree.as_ref()),
         "warnings": warnings,
     });
     if dry_run {
@@ -2034,7 +2373,7 @@ mod tests {
         intent.nets.insert("USB_D_N".into(), NetIntent { role: "diff_pair".into(), pair: Some("USB_D_P".into()), impedance_ohm: Some(90.0), max_skew_mm: Some(1.0), priority: Some(1), ..Default::default() });
         intent.nets.insert("+5V".into(), NetIntent { role: "power".into(), current_a: Some(1.0), max_drop_mv: Some(100.0), source: Some("J1.A4".into()), priority: Some(2), ..Default::default() });
         intent.nets.insert("GND".into(), NetIntent { role: "plane".into(), ..Default::default() });
-        intent.ties.push(Tie { part: "C1".into(), to: "U1".into(), pin: Some("1".into()), max_mm: 2.0, why: None });
+        intent.ties.push(Tie { part: "C1".into(), to: "U1".into(), pin: Some("1".into()), max_mm: Some(2.0), ..Default::default() });
         intent
     }
 
@@ -2150,7 +2489,7 @@ mod tests {
         )
         .unwrap();
         let mut intent = DesignIntent { schema: 1, ..Default::default() };
-        intent.ties.push(Tie { part: "C1".into(), to: "U1".into(), pin: Some("1".into()), max_mm: 2.0, why: None });
+        intent.ties.push(Tie { part: "C1".into(), to: "U1".into(), pin: Some("1".into()), max_mm: Some(2.0), ..Default::default() });
         let (plans, notes) = plan_ties(&board, &intent, 0.2);
         assert_eq!(plans.len(), 1, "{notes:?}");
         let p = &plans[0];
@@ -2259,8 +2598,9 @@ mod per_layer_tests {
         let rules = dru_rules(&signal_in2, &reqs);
         let power = reqs.iter().find(|r| r.net == "+5V").unwrap();
         let (outer, inner) = (power.current_width_mm.unwrap(), power.inner_current_width_mm.unwrap());
-        // Inner: half the k and half the copper (0.5 oz) — several times wider.
-        assert!(inner > 3.0 * outer, "{outer} vs {inner}");
+        // IPC-2152 does not derate inner layers; the 0.5 oz inner copper alone
+        // makes the inner width ≈ 1.5× the 1 oz outer one.
+        assert!(inner > 1.3 * outer && inner < 2.0 * outer, "{outer} vs {inner}");
         assert_eq!(power.track_width_mm, Some(inner), "net class carries the width valid on every layer");
         assert!(rules["intent: width +5V"].contains("(layer outer)"));
         assert!(rules["intent: width +5V inner"].contains("(layer inner)"));
@@ -2616,5 +2956,160 @@ mod drc_oracle {
         assert_eq!(fired(&found, "intent: impedance A F.Cu").len(), 1, "{found:#?}");
         assert!(fired(&found, "intent: width +5V").is_empty(), "outer width is enough on F.Cu: {found:#?}");
         assert_eq!(fired(&found, "intent: width +5V inner").len(), 1, "inner {inner} mm: {found:#?}");
+    }
+}
+
+#[cfg(test)]
+mod default_tests {
+    use super::*;
+
+    fn pair(standard: Option<&str>, skew: Option<f64>, rise: Option<f64>) -> DesignIntent {
+        let mut intent = DesignIntent { schema: 1, ..Default::default() };
+        for (net, other) in [("D_P", "D_N"), ("D_N", "D_P")] {
+            intent.nets.insert(
+                net.into(),
+                NetIntent { role: "diff_pair".into(), pair: Some(other.into()), standard: standard.map(str::to_string), max_skew_mm: skew, rise_time_ns: rise, ..Default::default() },
+            );
+        }
+        intent
+    }
+
+    fn req(intent: &DesignIntent, net: &str) -> NetRequirement {
+        requirements(intent).into_iter().find(|r| r.net == net).unwrap()
+    }
+
+    #[test]
+    fn a_standard_fills_impedance_skew_and_length_with_cited_sources() {
+        let i = pair(Some("ethernet_100base_tx"), None, None);
+        assert!(i.validate().is_ok());
+        let r = req(&i, "D_P");
+        assert_eq!(r.effective.impedance_ohm, Some(100.0));
+        assert_eq!(r.max_skew_mm, Some(1.27), "TI SNLA387: 50 mil");
+        assert_eq!(r.max_length_mm, Some(50.8), "TI SNLA387: 2 in");
+        assert!(r.sources["max_skew_mm"].contains("SNLA387"), "{:?}", r.sources);
+        assert!(r.sources["impedance_ohm"].contains("SNLA387"));
+        let usb = req(&pair(Some("usb2_hs"), None, None), "D_P");
+        assert_eq!((usb.effective.impedance_ohm, usb.max_skew_mm), (Some(90.0), Some(1.27)));
+        assert!(usb.sources["max_skew_mm"].contains("SPRAAR7J"));
+        // The published 50 mil is tighter than 10 % of 500 ps (≈ 8 mm).
+        assert!(usb.sources["max_skew_mm"].contains("tighter than the edge-rate bound"), "{}", usb.sources["max_skew_mm"]);
+        assert_eq!(req(&pair(Some("ethernet_1000base_t"), None, None), "D_P").max_skew_mm, Some(0.508));
+    }
+
+    #[test]
+    fn explicit_user_values_override_every_default() {
+        let mut i = pair(Some("ethernet_100base_tx"), Some(12.0), None);
+        for n in i.nets.values_mut() {
+            n.impedance_ohm = Some(95.0);
+            n.max_length_mm = Some(30.0);
+        }
+        let r = req(&i, "D_N");
+        assert_eq!((r.max_skew_mm, r.max_length_mm, r.effective.impedance_ohm), (Some(12.0), Some(30.0), Some(95.0)));
+        for f in ["max_skew_mm", "max_length_mm", "impedance_ohm"] {
+            assert_eq!(r.sources[f], "user", "{f}");
+        }
+        // The unset tolerance still comes from the standard.
+        assert_eq!(r.effective.impedance_tolerance_pct, Some(10.0));
+    }
+
+    #[test]
+    fn a_pair_without_a_standard_gets_skew_from_its_edge_rate_and_the_stackup_velocity() {
+        // 1 ns edge, 10 % → 100 ps; default 4-layer stack: F.Cu microstrip
+        // over In1. Length = 100 ps / delay(ps/mm) from the line model.
+        let i = pair(None, None, Some(1.0));
+        let (layers, planes, _) = stack_and_planes(&i, None);
+        let delay = layers.model("F.Cu", &planes).unwrap().per_mm(0.2).delay_ps_per_mm;
+        // FR-4 (εr 4.4) microstrip, w/h ≈ 1: εeff ≈ 2.9–3.5 → 5.7–6.2 ps/mm
+        // (≈ 145–158 ps/in, the usual "≈150 ps/in outer layer" figure).
+        assert!((5.6..6.3).contains(&delay), "{delay}");
+        let r = req(&i, "D_P");
+        assert!((r.max_skew_mm.unwrap() - r3(100.0 / delay)).abs() < 1e-9, "{:?}", r.max_skew_mm);
+        assert!(r.sources["max_skew_mm"].contains("edge-rate bound"));
+        // Nothing to go on: no limit, and a warning says so.
+        let none = req(&pair(None, None, None), "D_P");
+        assert_eq!(none.max_skew_mm, None);
+        assert!(none.warnings.iter().any(|w| w.contains("no skew limit")));
+    }
+
+    #[test]
+    fn standards_are_validated_against_the_role() {
+        let mut i = pair(Some("rmii"), None, None);
+        assert!(i.validate().is_err(), "rmii is single-ended");
+        i = DesignIntent { schema: 1, ..Default::default() };
+        i.nets.insert("RXD0".into(), NetIntent { role: "signal".into(), standard: Some("rmii".into()), ..Default::default() });
+        assert!(i.validate().is_ok());
+        assert_eq!(req(&i, "RXD0").max_length_mm, Some(152.4));
+        i.nets.get_mut("RXD0").unwrap().standard = Some("usb2_hs".into());
+        assert!(i.validate().is_err());
+        i.nets.get_mut("RXD0").unwrap().standard = Some("hdmi".into());
+        assert!(i.validate().is_err());
+    }
+
+    #[test]
+    fn power_rise_defaults_to_10c_and_a_power_net_without_current_is_flagged() {
+        let mut i = DesignIntent { schema: 1, ..Default::default() };
+        i.nets.insert("+5V".into(), NetIntent { role: "power".into(), current_a: Some(1.5), ..Default::default() });
+        i.nets.insert("+3V3".into(), NetIntent { role: "power".into(), ..Default::default() });
+        let r = req(&i, "+5V");
+        assert_eq!(r.effective.max_temp_rise_c, Some(10.0));
+        assert!(r.sources["max_temp_rise_c"].contains("10 °C"));
+        // IPC-2152 external 1 oz, 1.5 A, 10 °C: ≈ 0.56 mm (Brooks & Adam).
+        assert!((0.53..0.60).contains(&r.current_width_mm.unwrap()), "{:?}", r.current_width_mm);
+        assert!(req(&i, "+3V3").warnings.iter().any(|w| w.contains("without current_a")));
+    }
+
+    #[test]
+    fn tie_kinds_derive_path_limits_from_the_stackup_and_user_values_win() {
+        let intent = DesignIntent { schema: 1, ..Default::default() };
+        let (layers, planes, _) = stack_and_planes(&intent, None);
+        let tie = |kind: &str| Tie { part: "Y1".into(), to: "U1".into(), kind: Some(kind.into()), ..Default::default() };
+        let m = layers.model("F.Cu", &planes).unwrap();
+        let x = tie_limits(&tie("crystal"), &layers, &planes);
+        let want = (CRYSTAL_TRACE_PF / m.per_mm(0.2).c_pf_per_mm * 10.0).floor() / 10.0;
+        assert_eq!(x.max_path_mm, Some(want));
+        // JLC04161H-7628 outer layer: ≈ 0.09 pF/mm → ≈ 5.5 mm, near the 6 mm
+        // the reviewer asked for.
+        assert!((4.5..6.5).contains(&want), "{want}");
+        assert_eq!((x.max_vias, x.max_mm), (Some(0), want));
+        assert!(x.sources["max_path_mm"].contains("AVR186"));
+        let v = tie_limits(&tie("core_regulator_cap"), &layers, &planes);
+        // ≈ 0.33 nH/mm at 0.3 mm → 1 nH ≈ 3 mm, the WORKFLOW.md figure.
+        assert!((2.5..3.6).contains(&v.max_path_mm.unwrap()), "{:?}", v.max_path_mm);
+        assert_eq!(v.max_vias, Some(1));
+        let d = tie_limits(&tie("decoupling"), &layers, &planes);
+        assert!(d.max_path_mm.unwrap() > v.max_path_mm.unwrap());
+        // Explicit values override the kind.
+        let user = Tie { max_mm: Some(2.5), max_path_mm: Some(9.0), max_vias: Some(3), ..tie("crystal") };
+        let u = tie_limits(&user, &layers, &planes);
+        assert_eq!((u.max_mm, u.max_path_mm, u.max_vias), (2.5, Some(9.0), Some(3)));
+        assert!(u.sources.values().all(|s| s == "user"));
+        // A plain tie needs a limit; a kind supplies one.
+        let mut i = DesignIntent { schema: 1, ..Default::default() };
+        i.ties.push(Tie { part: "C1".into(), to: "U1".into(), ..Default::default() });
+        assert!(i.validate().is_err());
+        i.ties[0].kind = Some("decoupling".into());
+        assert!(i.validate().is_ok());
+        i.ties[0].kind = Some("ferrite".into());
+        assert!(i.validate().is_err());
+    }
+
+    #[test]
+    fn a_crystal_tie_fails_placement_beyond_its_derived_limit() {
+        let board = konnect_sexp::parse_sexp(
+            "(kicad_pcb (general (thickness 1.6)) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" signal) (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal))
+              (zone (net \"GND\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50))))
+              (footprint \"U\" (layer \"F.Cu\") (at 10 10) (property \"Reference\" \"U1\")
+                (pad \"5\" smd rect (at 0 0) (size 0.5 0.5) (layers \"F.Cu\") (net \"XI\")))
+              (footprint \"Y\" (layer \"F.Cu\") (at 19 10) (property \"Reference\" \"Y1\")
+                (pad \"1\" smd rect (at 0 0) (size 0.5 0.5) (layers \"F.Cu\") (net \"XI\"))))",
+        )
+        .unwrap();
+        let mut i = DesignIntent { schema: 1, ..Default::default() };
+        i.ties.push(Tie { part: "Y1".into(), to: "U1".into(), pin: Some("5".into()), kind: Some("crystal".into()), ..Default::default() });
+        let checks = check_board(&board, &i);
+        let tie = checks.iter().find(|c| c.kind == "tie").unwrap();
+        assert_eq!(tie.status, "fail", "8.5 mm apart: {tie:?}");
+        assert!(tie.required["sources"]["max_mm"].as_str().unwrap().contains("path limit"));
+        assert_eq!(checks.iter().find(|c| c.kind == "tie_path").unwrap().status, "unverified");
     }
 }

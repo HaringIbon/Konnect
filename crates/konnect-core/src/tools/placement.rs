@@ -821,8 +821,9 @@ async fn handle_place_decoupling(
                     part: reference.clone(),
                     to: ic_reference.clone(),
                     pin: Some(number),
-                    max_mm: cap_values.get(&reference).and_then(|v| decoupling_limit_mm(v)).unwrap_or(2.5),
+                    max_mm: Some(cap_values.get(&reference).and_then(|v| decoupling_limit_mm(v)).unwrap_or(2.5)),
                     why: Some("decoupling".into()),
+                    ..Default::default()
                 });
             }
             None => row_caps.push(cap),
