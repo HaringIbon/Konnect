@@ -55,17 +55,20 @@ const TI_USB2: &str = "TI SPRAAR7J (2023) Table A-1: USB2.0 pair 81–99 Ω, ske
 const TI_PHY: &str = "TI SNLA387 (2021) Ethernet PHY PCB Design Layout Checklist: MDI < 2 in, 100 Ω ±10 %, matched within 50 mil (10/100M) or 20 mil (1G) [docdb ti-snla387-ethernet-phy-layout]";
 
 pub(crate) fn standard_defaults(name: &str) -> Option<StandardDefaults> {
-    let usb = |rise: (f64, &'static str)| StandardDefaults {
+    // TI's 50 mil is a high-speed (480 Mb/s) layout number. A full-speed
+    // pair (4 ns edges) gets its skew from the edge-rate rule instead, which
+    // is tens of millimetres: applying 1.27 mm there fails good layouts.
+    let usb = |rise: (f64, &'static str), skew: Option<(f64, &'static str)>| StandardDefaults {
         pair: true,
         impedance_ohm: Some((90.0, TI_USB2)),
         tolerance_pct: Some((10.0, TI_USB2)),
-        max_skew_mm: Some((1.27, TI_USB2)),
+        max_skew_mm: skew,
         max_length_mm: None,
         rise_time_ns: Some(rise),
     };
     Some(match name {
-        "usb2_hs" => usb((0.5, "USB 2.0 spec §7.1.2.2: high-speed rise time ≥ 500 ps (not re-read: usb.org blocked from this host)")),
-        "usb2_fs" => usb((4.0, "USB 2.0 full-speed rise time 4–20 ns, as tabulated in STM32H563 DS14258 USB FS characteristics [docdb st-ds14258-stm32h563]")),
+        "usb2_hs" => usb((0.5, "USB 2.0 spec §7.1.2.2: high-speed rise time ≥ 500 ps (not re-read: usb.org blocked from this host)"), Some((1.27, TI_USB2))),
+        "usb2_fs" => usb((4.0, "USB 2.0 full-speed rise time 4–20 ns, as tabulated in STM32H563 DS14258 USB FS characteristics [docdb st-ds14258-stm32h563]"), None),
         "ethernet_100base_tx" => StandardDefaults {
             pair: true,
             impedance_ohm: Some((100.0, TI_PHY)),
@@ -645,6 +648,12 @@ fn load_intent(stem: &Path) -> anyhow::Result<(DesignIntent, Option<String>)> {
             if intent.schema != INTENT_SCHEMA {
                 bail!("{} is intent schema {}, this server reads {INTENT_SCHEMA}", path.display(), intent.schema);
             }
+            // A file edited by hand (or written by an older build) gets the
+            // same checks as `set_design_intent`: an unknown kind or standard,
+            // or a tie without a limit, must not resolve to "no limit".
+            if let Err(reason) = intent.validate() {
+                bail!("{} is not a valid design intent: {reason}; fix the file or rewrite it with set_design_intent", path.display());
+            }
             Ok((intent, Some(text)))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((DesignIntent { schema: INTENT_SCHEMA, ..Default::default() }, None)),
@@ -709,7 +718,7 @@ struct NetRequirement {
 }
 
 /// A diff pair's net with the pair-level fields (standard, rise time,
-/// impedance, tolerance, gap, skew) its partner sets and it leaves unset, so
+/// impedance, tolerance, gap, skew, length) its partner sets and it leaves unset, so
 /// both halves resolve to the same limits whichever net carries them. Also
 /// returns the fields taken from the partner.
 fn with_pair_fields(intent: &DesignIntent, n: &NetIntent) -> (NetIntent, Vec<&'static str>) {
@@ -728,6 +737,7 @@ fn with_pair_fields(intent: &DesignIntent, n: &NetIntent) -> (NetIntent, Vec<&'s
         ("impedance_tolerance_pct", &mut m.impedance_tolerance_pct, other.impedance_tolerance_pct),
         ("gap_mm", &mut m.gap_mm, other.gap_mm),
         ("max_skew_mm", &mut m.max_skew_mm, other.max_skew_mm),
+        ("max_length_mm", &mut m.max_length_mm, other.max_length_mm),
     ] {
         if slot.is_none() && theirs.is_some() {
             *slot = theirs;
@@ -1224,65 +1234,139 @@ fn merge_netclasses(project: &mut Value, intent: &DesignIntent, reqs: &[NetRequi
 
 // ─── Tie limits ─────────────────────────────────────────────────────────────
 
+/// The electrical budget a tie's routed connection is compared with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum TieBudget {
+    /// Per node (each shared net on its own): routed capacitance, pF.
+    CapacitancePf(f64),
+    /// Over the whole loop (supply leg + return leg): inductance, nH.
+    LoopInductanceNh(f64),
+}
+
 /// A tie's limits with defaults from its kind, and where each came from.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TieLimits {
-    pub max_mm: f64,
+    /// Pad edge to pad edge. `None` only when nothing resolves (an intent
+    /// that never passed validation): the checks then report `unverified`,
+    /// never a pass against "no limit".
+    pub max_mm: Option<f64>,
+    /// Routed track length per leg: the user's value, or the crystal guide.
     pub max_path_mm: Option<f64>,
     pub max_vias: Option<u32>,
+    #[serde(skip)]
+    pub budget: Option<TieBudget>,
+    /// Length guide for a leg whose tracks have no line model (no reference
+    /// plane), where the budget cannot be evaluated.
+    pub unmodelled_path_mm: Option<f64>,
     pub sources: BTreeMap<String, String>,
+}
+
+impl TieLimits {
+    fn budget_pf(&self) -> Option<f64> {
+        match self.budget {
+            Some(TieBudget::CapacitancePf(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn budget_nh(&self) -> Option<f64> {
+        match self.budget {
+            Some(TieBudget::LoopInductanceNh(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The limits as the tools report them.
+    fn to_json(&self) -> Value {
+        json!({
+            "max_mm": self.max_mm.map(r3),
+            "max_path_mm": self.max_path_mm,
+            "max_vias": self.max_vias,
+            "budget_pf": self.budget_pf(),
+            "budget_nh": self.budget_nh(),
+            "unmodelled_path_mm": self.unmodelled_path_mm,
+            "sources": self.sources,
+        })
+    }
 }
 
 /// Crystal: routed-trace capacitance budget per node, pF. AVR186 gives typical
 /// PCB parasitics of 1 pF XTALIN–GND (2 pF XTALOUT); about half goes to the
 /// crystal, load-capacitor and pin pads, leaving 0.5 pF for the trace.
 const CRYSTAL_TRACE_PF: f64 = 0.5;
-/// Core-regulator capacitor (VCAP, VDDCR): connection inductance budget, nH —
-/// about one MLCC's own mounted ESL, so the stabilising capacitor stays a
-/// capacitor (Konnect choice; ST and Microchip only say "as close as possible",
-/// "heavy, wide trace").
-const CORE_REG_NH: f64 = 1.0;
-/// Decoupling capacitor: connection inductance budget, nH (Konnect choice).
-const DECOUPLING_NH: f64 = 2.0;
+/// Crystal: routed length guide per node, mm, whatever the capacitance works
+/// out to (Konnect judgement, WORKFLOW.md §5 item 6; the app notes only say
+/// "as short as possible"). It also caps the budget on a board whose plane is
+/// far away: there C′ is small and the 0.5 pF alone would allow 12 mm.
+const CRYSTAL_PATH_MM: f64 = 6.0;
+/// Decoupling capacitor: budget for the inductance of the whole connection
+/// loop (supply leg + return leg: tracks, via barrels and the plane between
+/// the vias), nH.
+///
+/// A Konnect judgement, not a published limit. No cited source gives a
+/// number for the whole loop: Xilinx UG483 ch. 2 gives 0.3–4 nH for the
+/// capacitor's own lands, traces and vias [docdb xilinx-ug483-7series-pcb],
+/// which leaves out the pin's side and the plane. The figure is the 2 nH of
+/// supply track this check allowed before (about 6 mm of 0.3 mm track) plus
+/// the rest of a loop on a 1.6 mm four-layer board with a 1 mm core: two
+/// vias a leg and the plane between them come to 3–4 nH there however close
+/// the parts sit. On the three saved boards loops of capacitors placed at
+/// their pins measure 2.7–5.3 nH and the ones routed far away 6–11 nH.
+const DECOUPLING_LOOP_NH: f64 = 6.0;
+/// Core-regulator capacitor (VCAP, VDDCR): the same reasoning from the 1 nH
+/// of supply track allowed before (Konnect judgement; ST and Microchip only
+/// say "as close as possible", "heavy, wide trace").
+const CORE_REG_LOOP_NH: f64 = 5.0;
+/// Placement distance defaults, pad edge to pad edge, mm (Konnect judgement:
+/// `place_decoupling` puts a 100 nF bypass capacitor within 2.5 mm; no cited
+/// source gives a number).
+const DECOUPLING_PLACE_MM: f64 = 2.5;
+const CORE_REG_PLACE_MM: f64 = 2.5;
+/// Switching hot loop (`plane_exceptions`, Pass 18): track inductance budget
+/// that its default path limit is derived from, nH (Konnect judgement).
+const HOT_LOOP_NH: f64 = 1.0;
 
 /// Defaults for a tie's kind on this stack; explicit tie values win.
 pub(crate) fn tie_limits(tie: &Tie, layers: &LayerStack, planes: &BTreeSet<String>) -> TieLimits {
     let mut sources = BTreeMap::new();
     let outer = layers.copper.first().map(|c| c.0.clone()).unwrap_or_default();
     let model = layers.model(&outer, planes).ok();
-    let floor1 = |v: f64| (v * 10.0).floor() / 10.0;
     type Cited<T> = Option<(T, String)>;
-    let (path, vias): (Cited<f64>, Cited<u32>) = match tie.kind.as_deref() {
-        Some("crystal") => (
-            Some(match model {
-                Some(m) => {
-                    let pm = m.per_mm(0.2);
-                    (floor1(CRYSTAL_TRACE_PF / pm.c_pf_per_mm), format!(
-                        "crystal: {CRYSTAL_TRACE_PF} pF trace budget / {:.3} pF/mm (0.2 mm on {outer}, C' = √εeff/(c·Z0)); budget from Microchip AVR186 typical parasitics (XTALIN 1 pF) less the pads [docdb microchip-avr186-oscillator-layout]; ST AN5711 §3.1, TI AM67 §8.3.1, LAN8742 routing checklist: as short as possible, outer layer",
-                        pm.c_pf_per_mm
-                    ))
-                }
-                None => (6.0, "crystal: fallback 6 mm (no reference plane under the outer layer, so no line model); WORKFLOW.md §5 item 6".to_string()),
-            }),
-            Some((0, "crystal: route on the outer layer over the ground plane, no vias (TI AM67 §8.3.1; LAN8742 routing checklist)".to_string())),
-        ),
-        Some(kind @ ("core_regulator_cap" | "decoupling")) => {
-            let budget = if kind == "decoupling" { DECOUPLING_NH } else { CORE_REG_NH };
+    let mut budget = None;
+    let mut unmodelled_path_mm = None;
+    let (path, vias, place): (Cited<f64>, Cited<u32>, Cited<f64>) = match tie.kind.as_deref() {
+        Some("crystal") => {
+            budget = Some(TieBudget::CapacitancePf(CRYSTAL_TRACE_PF));
+            let equivalent = match model {
+                Some(m) => format!("≈ {:.1} mm of 0.2 mm track on {outer} at {:.3} pF/mm", CRYSTAL_TRACE_PF / m.per_mm(0.2).c_pf_per_mm, m.per_mm(0.2).c_pf_per_mm),
+                None => format!("no line model for {outer}: only the length guide applies"),
+            };
+            sources.insert(
+                "budget_pf".to_string(),
+                format!("crystal: {CRYSTAL_TRACE_PF} pF of routed track per node, compared with Σ C′·len of the routed path ({equivalent}); Microchip AVR186 typical parasitics (XTALIN 1 pF) less the pads [docdb microchip-avr186-oscillator-layout]"),
+            );
             (
-                Some(match model {
-                    Some(m) => {
-                        let pm = m.per_mm(0.3);
-                        (floor1(budget / pm.l_nh_per_mm), format!(
-                            "{kind}: {budget} nH connection budget (Konnect choice, ≈ the capacitor's own ESL) / {:.3} nH/mm (0.3 mm on {outer}, L' = √εeff·Z0/c); ST AN5711 §7.4/§9.3 and LAN8742 checklist (VDDCR: heavy, wide trace) give no number [docdb st-an5711-stm32h5-hw, microchip-lan8742-routing-checklist]",
-                            pm.l_nh_per_mm
-                        ))
-                    }
-                    None => (if kind == "decoupling" { 6.0 } else { 3.0 }, format!("{kind}: fallback (no line model for {outer}); WORKFLOW.md §5 item 6")),
-                }),
-                Some((1, format!("{kind}: at most one via between the capacitor pad and the pin (the cap on the other side at the pin's via); ST AN5711 Fig. 20: fewer vias"))),
+                Some((CRYSTAL_PATH_MM, format!("crystal: {CRYSTAL_PATH_MM} mm length guide per node (Konnect judgement, WORKFLOW.md §5 item 6); ST AN5711 §3.1, TI AM67 §8.3.1, LAN8742 routing checklist say only: as short as possible, outer layer"))),
+                Some((0, "crystal: route on the outer layer over the ground plane, no vias (TI AM67 §8.3.1; LAN8742 routing checklist)".to_string())),
+                Some((CRYSTAL_PATH_MM, "default: the crystal length guide (placement distance ≤ routed path)".to_string())),
             )
         }
-        _ => (None, None),
+        Some(kind @ ("core_regulator_cap" | "decoupling")) => {
+            let (nh, place_mm, guide) = if kind == "decoupling" { (DECOUPLING_LOOP_NH, DECOUPLING_PLACE_MM, 6.0) } else { (CORE_REG_LOOP_NH, CORE_REG_PLACE_MM, 3.0) };
+            budget = Some(TieBudget::LoopInductanceNh(nh));
+            unmodelled_path_mm = Some(guide);
+            sources.insert(
+                "budget_nh".to_string(),
+                format!("{kind}: {nh} nH for the whole loop, supply leg + return leg, tracks + via barrels + plane. A Konnect judgement, not a published limit: Xilinx UG483 gives 0.3–4 nH for a capacitor's own lands, traces and vias [docdb xilinx-ug483-7series-pcb], and ST AN5711 §7.4/§9.3 and the LAN8742 checklist give no number; read a result near the budget with its per-leg breakdown"),
+            );
+            sources.insert("unmodelled_path_mm".to_string(), format!("{kind}: length guide for a leg routed where no reference plane gives a line model (WORKFLOW.md §5 item 6); such a leg is never a pass"));
+            (
+                None,
+                Some((1, format!("{kind}: at most one via on a leg routed as tracks (the cap on the other side at the pin's via); ST AN5711 Fig. 20: fewer vias. Not applied to a leg carried by a plane, whose two vias are in the inductance"))),
+                Some((place_mm, format!("{kind}: default {place_mm} mm pad edge to pad edge (Konnect judgement, as place_decoupling's 100 nF default; give max_mm for a bulk capacitor)"))),
+            )
+        }
+        _ => (None, None, None),
     };
     let max_path_mm = match (tie.max_path_mm, path) {
         (Some(v), _) => {
@@ -1306,19 +1390,26 @@ pub(crate) fn tie_limits(tie: &Tie, layers: &LayerStack, planes: &BTreeSet<Strin
         }
         _ => None,
     };
-    let max_mm = match tie.max_mm {
-        Some(v) => {
+    let max_mm = match (tie.max_mm, place, max_path_mm) {
+        (Some(v), _, _) => {
             sources.insert("max_mm".into(), "user".into());
-            v
+            Some(v)
         }
-        None => {
+        (None, Some((v, why)), _) => {
+            sources.insert("max_mm".into(), why);
+            Some(v)
+        }
+        (None, None, Some(v)) => {
             // The pad-edge distance can be no more than the routed path.
-            let v = max_path_mm.unwrap_or(f64::INFINITY);
             sources.insert("max_mm".into(), "default: the path limit (placement distance ≤ routed path)".into());
-            v
+            Some(v)
+        }
+        (None, None, None) => {
+            sources.insert("max_mm".into(), "none: the tie gives no max_mm, max_path_mm or known kind".into());
+            None
         }
     };
-    TieLimits { max_mm, max_path_mm, max_vias, sources }
+    TieLimits { max_mm, max_path_mm, max_vias, budget, unmodelled_path_mm, sources }
 }
 
 /// Every tie's resolved limits.
@@ -1328,8 +1419,12 @@ fn tie_requirements(intent: &DesignIntent, board: Option<&SexpNode>) -> Vec<Valu
         .ties
         .iter()
         .map(|t| {
-            let l = tie_limits(t, &layers, &planes);
-            json!({"part": t.part, "to": t.to, "pin": t.pin, "kind": t.kind, "max_mm": r3(l.max_mm), "max_path_mm": l.max_path_mm, "max_vias": l.max_vias, "sources": l.sources})
+            let mut row = tie_limits(t, &layers, &planes).to_json();
+            row["part"] = json!(t.part);
+            row["to"] = json!(t.to);
+            row["pin"] = json!(t.pin);
+            row["kind"] = json!(t.kind);
+            row
         })
         .collect()
 }
@@ -1390,12 +1485,33 @@ fn board_copper(tree: &SexpNode) -> BTreeMap<String, NetCopper> {
     nets
 }
 
+/// Filled pieces of `net`'s zones per layer, as the board file holds them
+/// (`filled_polygon`). Empty when no zone of the net is filled: a file saved
+/// before the fill, or changed since. KiCad removes or keeps unconnected
+/// islands by the zone's own setting; every piece left counts.
+fn pour_pieces(tree: &SexpNode, net: &str) -> BTreeMap<String, usize> {
+    let mut pieces = BTreeMap::new();
+    for zone in tree.find_all("zone") {
+        let name = zone.find_str("net_name").or_else(|| zone.find("net").and_then(konnect_sexp::net::net_name));
+        if name != Some(net) {
+            continue;
+        }
+        for fill in zone.find_all("filled_polygon") {
+            if let Some(layer) = fill.find_str("layer") {
+                *pieces.entry(layer.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    pieces
+}
+
 fn length(segments: &[Segment]) -> f64 {
     segments.iter().map(|(a, b, _, _)| (b.0 - a.0).hypot(b.1 - a.1)).sum()
 }
 
 fn r3(v: f64) -> f64 {
-    (v * 1000.0).round() / 1000.0
+    // `+ 0.0` turns −0 (an empty sum) into 0.
+    (v * 1000.0).round() / 1000.0 + 0.0
 }
 
 /// Plating thickness assumed for via barrels (mm): JLCPCB's typical hole wall.
@@ -1601,8 +1717,7 @@ fn net_graph(net: &str, copper: &NetCopper, pads: &[CopperPad], vias: &[konnect_
     }
     // Copper that touches without sharing a snapped node (KiCad connects it;
     // the 0.01 mm snap does not): a track node inside a via's annulus (plus
-    // its half width) joins the via; a dangling track end joins the nearest
-    // node whose copper overlaps its own, (w1 + w2) / 2.
+    // its half width) joins the via; overlapping track nodes are joined below.
     let on_layer: Vec<(NodeKey, usize)> = ids.iter().map(|(k, v)| (k.clone(), *v)).collect();
     let mut node_width = vec![0.0f64; ids.len()];
     let mut track_degree = vec![0usize; ids.len()];
@@ -1626,20 +1741,39 @@ fn net_graph(net: &str, copper: &NetCopper, pads: &[CopperPad], vias: &[konnect_
             }
         }
     }
+    // Track nodes whose copper overlaps, (w1 + w2) / 2 apart or less, without
+    // an edge between them: joined by a `Track` edge as long as their
+    // distance. Every node takes part, not only a dangling end joined to its
+    // nearest node: an end's nearest node can be its own neighbour (a last
+    // piece shorter than the gap), and a corner can touch another track too.
+    // Because the join has its real length, joining the close nodes of one
+    // finely segmented track (an arc) cannot shorten a path below the
+    // straight line through copper that is there.
+    let mut linked: BTreeSet<(usize, usize)> = edges.iter().map(|(a, b, _)| (*a.min(b), *a.max(b))).collect();
+    let cell = node_width.iter().copied().fold(0.1_f64, f64::max);
+    let bucket = |p: (f64, f64)| ((p.0 / cell).floor() as i64, (p.1 / cell).floor() as i64);
+    /// Track nodes by (layer, grid cell): (position, node).
+    type Grid<'a> = HashMap<(&'a str, (i64, i64)), Vec<((f64, f64), usize)>>;
+    let mut grid: Grid = HashMap::new();
     for ((layer, key), n) in &on_layer {
-        if track_degree[*n] != 1 {
+        if track_degree[*n] > 0 {
+            let p = key_point(key);
+            grid.entry((layer.as_str(), bucket(p))).or_default().push((p, *n));
+        }
+    }
+    for ((layer, key), n) in &on_layer {
+        if track_degree[*n] == 0 {
             continue;
         }
         let p = key_point(key);
-        let nearest = on_layer
-            .iter()
-            .filter(|((l, _), m)| l == layer && m != n && track_degree[*m] > 0)
-            .map(|((_, k), m)| (key_point(k), *m))
-            .map(|(q, m)| ((q.0 - p.0).hypot(q.1 - p.1), m))
-            .filter(|(d, m)| *d <= (node_width[*n] + node_width[*m]) / 2.0 + 1e-6)
-            .min_by(|a, b| a.0.total_cmp(&b.0));
-        if let Some((_, m)) = nearest {
-            edges.push((*n, m, EdgeKind::Pad));
+        let (cx, cy) = bucket(p);
+        for (dx, dy) in (-1..=1).flat_map(|dx| (-1..=1).map(move |dy| (dx, dy))) {
+            for (q, m) in grid.get(&(layer.as_str(), (cx + dx, cy + dy))).into_iter().flatten() {
+                let d = (q.0 - p.0).hypot(q.1 - p.1);
+                if m > n && d <= (node_width[*n] + node_width[*m]) / 2.0 + 1e-6 && linked.insert((*n, *m)) {
+                    edges.push((*n, *m, EdgeKind::Track { len: d, width: node_width[*n].min(node_width[*m]), layer: layer.clone() }));
+                }
+            }
         }
     }
     // Pads join every node on their layers that lies on them.
@@ -1721,23 +1855,212 @@ fn voltage_drop(
     Ok(DropResult { drop_mv: current * r * 1000.0, worst_pad: worst, unreachable, temp_c })
 }
 
-/// The shortest routed path between a tied part and its pin.
-#[derive(Debug, Serialize)]
-struct TiePath {
-    from_pad: String,
-    to_pad: String,
-    net: String,
-    /// Track length along the path (via barrels excluded).
+// ─── Routed tie legs ────────────────────────────────────────────────────────
+
+/// μ/2π for a non-magnetic board, nH per mm (2·10⁻⁷ H/m).
+const MU_OVER_2PI_NH_PER_MM: f64 = 0.2;
+/// Capacitance one via adds to a node, pF: Johnson measured 0.37–0.40 pF for
+/// a 10 mil via with 24 mil pads through FR-4 planes [docdb
+/// johnson-sigcon-via-inductance-2]. One geometry, used as a round figure.
+const VIA_PF: f64 = 0.4;
+
+/// Inductance of `h` mm of via barrel of this drill, nH.
+///
+/// Johnson, "Via Inductance" [docdb johnson-sigcon-via-inductance]: a via
+/// and one return via `s` apart make a loop of (μ/2π)·h·2·ln(s/r), each via
+/// contributing half of the flux, so one barrel is (μ/2π)·h·ln(s/r). With no
+/// known return via the return is taken at s = 2e·h, which is formula [7.9]
+/// of *High-Speed Digital Design*, L = 5.08·h·[ln(4h/d) + 1] nH (inches) —
+/// "a gross approximation" in Johnson's words, and the larger of the two, so
+/// it is also the cap. "Via Inductance II" checks the first form against
+/// measurements [docdb johnson-sigcon-via-inductance-2].
+fn barrel_nh(h: f64, drill: f64, return_mm: Option<f64>) -> f64 {
+    let r = (drill / 2.0).max(0.01);
+    let far = 2.0 * std::f64::consts::E * h;
+    let s = return_mm.map_or(far, |s| s.min(far)).max(2.0 * r);
+    MU_OVER_2PI_NH_PER_MM * h * (s / r).ln()
+}
+
+/// Inductance of the plane between two vias `span` mm apart, for one leg of
+/// a loop whose other conductor is `h` mm away, nH: the same flux integral,
+/// (μ/2π)·h·ln(span/r) per leg. It agrees with the spreading inductance of a
+/// plane pair, μ0·h per square (Xilinx UG483 Table 2-10: 130 pH/square at
+/// 102 µm [docdb xilinx-ug483-7series-pcb]).
+fn plane_nh(h: f64, span: f64, drill: f64) -> f64 {
+    let r = (drill / 2.0).max(0.01);
+    if span <= r {
+        0.0
+    } else {
+        MU_OVER_2PI_NH_PER_MM * h * (span / r).ln()
+    }
+}
+
+/// A via used by a walk: its index in the net's vias, position, the barrel
+/// length traversed and its drill.
+#[derive(Debug, Clone, Copy)]
+struct BarrelUse {
+    via: usize,
+    at: (f64, f64),
+    height: f64,
+    drill: f64,
+}
+
+/// What a path over a net's graph adds up to.
+#[derive(Debug, Clone, Default)]
+struct Walk {
+    /// Track length (via barrels excluded).
     path_mm: f64,
-    vias: u32,
-    /// Copper layers in path order, from the part to the pin.
-    layers: Vec<String>,
-    /// Σ L′·len and Σ C′·len over the tracks whose layer has a line model,
-    /// at each track's own width; via barrels excluded.
-    est_inductance_nh: Option<f64>,
-    est_capacitance_pf: Option<f64>,
     /// Track length on layers without a line model (no reference plane).
     unmodelled_mm: f64,
+    /// Σ L′·len and Σ C′·len over the modelled tracks, each at its own width.
+    track_nh: f64,
+    track_pf: f64,
+    /// Copper layers in path order.
+    layers: Vec<String>,
+    barrels: Vec<BarrelUse>,
+}
+
+impl Walk {
+    /// Follow `pred` back from `end`: the start node and what the path holds.
+    fn of(graph: &NetGraph, pred: &[Option<usize>], end: usize, layers: &LayerStack, planes: &BTreeSet<String>) -> (usize, Walk) {
+        let (start, steps) = graph.path(pred, end);
+        let mut models: HashMap<&str, Option<crate::tools::layer_stack::LineModel>> = HashMap::new();
+        let mut w = Walk::default();
+        let barrel = |k: Option<&(&EdgeKind, usize)>| matches!(k, Some((EdgeKind::Barrel { .. }, _)));
+        for (i, &(e, reached)) in steps.iter().enumerate() {
+            // Copper layers in path order, including a layer a via lands on
+            // straight into a pad, but not the inner layers a via passes through.
+            let passing = barrel(Some(&steps[i])) && barrel(steps.get(i + 1));
+            if let (Some(l), false) = (&graph.layer[reached], passing) {
+                if w.layers.last() != Some(l) {
+                    w.layers.push(l.clone());
+                }
+            }
+            match e {
+                EdgeKind::Track { len, width, layer } => {
+                    w.path_mm += len;
+                    match models.entry(layer.as_str()).or_insert_with(|| layers.model(layer, planes).ok()) {
+                        Some(m) => {
+                            let pm = m.per_mm(*width);
+                            w.track_nh += pm.l_nh_per_mm * len;
+                            w.track_pf += pm.c_pf_per_mm * len;
+                        }
+                        None => w.unmodelled_mm += len,
+                    }
+                }
+                EdgeKind::Barrel { via, height, drill } => match w.barrels.iter_mut().find(|b| b.via == *via) {
+                    Some(b) => b.height += height,
+                    None => w.barrels.push(BarrelUse { via: *via, at: graph.pos[reached], height: *height, drill: *drill }),
+                },
+                EdgeKind::Pad => {}
+            }
+        }
+        (start, w)
+    }
+}
+
+/// One conductor of a tie between the tied part and its target on one net:
+/// routed tracks and vias all the way, or a stub and via at each end with
+/// the net's plane between them.
+#[derive(Debug, Clone, Serialize)]
+struct TiePath {
+    net: String,
+    /// `tracks` or `plane`.
+    carried_by: &'static str,
+    from_pad: String,
+    to_pad: String,
+    /// Track length along the leg (via barrels and plane excluded).
+    path_mm: f64,
+    vias: u32,
+    /// Via barrel length along the leg.
+    via_barrel_mm: f64,
+    /// Copper layers in path order, from the part to the pin.
+    layers: Vec<String>,
+    /// Plane leg: distance between the two vias that drop to the plane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plane_span_mm: Option<f64>,
+    /// Σ L′·len over the tracks whose layer has a line model.
+    track_inductance_nh: f64,
+    /// Σ over the via barrels, see [`barrel_nh`].
+    via_inductance_nh: f64,
+    /// Plane leg: see [`plane_nh`]. `None` on a plane leg when no second
+    /// plane fixes the loop height, and then the estimate is a lower bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plane_inductance_nh: Option<f64>,
+    /// Tracks + via barrels + plane. A lower bound when `unmodelled_mm` > 0.
+    est_inductance_nh: f64,
+    /// Σ C′·len over the modelled tracks plus [`VIA_PF`] per via.
+    est_capacitance_pf: f64,
+    /// Track length on layers without a line model (no reference plane),
+    /// left out of both estimates.
+    unmodelled_mm: f64,
+    #[serde(skip)]
+    barrels: Vec<BarrelUse>,
+    /// Plane leg: the plane's layer.
+    #[serde(skip)]
+    plane_layer: Option<String>,
+}
+
+impl TiePath {
+    fn new(net: &str, carried_by: &'static str, from_pad: String, to_pad: String, walk: Walk) -> Self {
+        let mut vias: Vec<usize> = walk.barrels.iter().map(|b| b.via).collect();
+        vias.sort_unstable();
+        vias.dedup();
+        let mut leg = TiePath {
+            net: net.to_string(),
+            carried_by,
+            from_pad,
+            to_pad,
+            path_mm: r3(walk.path_mm),
+            vias: vias.len() as u32,
+            via_barrel_mm: r3(walk.barrels.iter().map(|b| b.height).sum()),
+            layers: walk.layers,
+            plane_span_mm: None,
+            track_inductance_nh: walk.track_nh,
+            via_inductance_nh: 0.0,
+            plane_inductance_nh: None,
+            est_inductance_nh: 0.0,
+            est_capacitance_pf: r3(walk.track_pf + VIA_PF * vias.len() as f64),
+            unmodelled_mm: r3(walk.unmodelled_mm),
+            barrels: walk.barrels,
+            plane_layer: None,
+        };
+        leg.estimate(&[], None);
+        leg
+    }
+
+    /// Work out the inductance, given the vias of the tie's other legs (the
+    /// nearest one is each barrel's return) and, for a plane leg, the
+    /// distance to the conductor that closes the loop.
+    fn estimate(&mut self, return_vias: &[(f64, f64)], plane_height: Option<f64>) {
+        self.via_inductance_nh = self
+            .barrels
+            .iter()
+            .map(|b| {
+                let nearest = return_vias.iter().map(|v| (v.0 - b.at.0).hypot(v.1 - b.at.1)).filter(|d| *d > 1e-6).fold(f64::INFINITY, f64::min);
+                barrel_nh(b.height, b.drill, nearest.is_finite().then_some(nearest))
+            })
+            .sum();
+        let drill = self.barrels.iter().map(|b| b.drill).fold(f64::INFINITY, f64::min);
+        self.plane_inductance_nh = match (self.plane_span_mm, plane_height) {
+            (Some(span), Some(h)) => Some(plane_nh(h, span, if drill.is_finite() { drill } else { 0.3 })),
+            _ => None,
+        };
+        self.est_inductance_nh = self.track_inductance_nh + self.via_inductance_nh + self.plane_inductance_nh.unwrap_or(0.0);
+    }
+
+    /// The inductance estimate leaves something out, so it is a lower bound.
+    fn lower_bound_only(&self) -> bool {
+        self.unmodelled_mm > 0.0 || (self.carried_by == "plane" && self.plane_inductance_nh.is_none())
+    }
+
+    fn rounded(mut self) -> Self {
+        for v in [&mut self.track_inductance_nh, &mut self.via_inductance_nh, &mut self.est_inductance_nh] {
+            *v = r3(*v);
+        }
+        self.plane_inductance_nh = self.plane_inductance_nh.map(r3);
+        self
+    }
 }
 
 /// Shortest routed path (by length, barrels counted at their height) from any
@@ -1752,55 +2075,341 @@ fn tie_path_with(graph: &NetGraph, net: &str, from: &[&CopperPad], to: &[&Copper
     let name = |p: &CopperPad| format!("{}.{}", p.reference, p.number);
     let starts: Vec<(String, usize)> = from.iter().filter_map(|p| graph.pad(&name(p)).map(|n| (name(p), n))).collect();
     let start_nodes: Vec<usize> = starts.iter().map(|s| s.1).collect();
-    let (dist, via) = graph.shortest(&start_nodes, |e| match e {
-        EdgeKind::Track { len, .. } => *len,
+    let (dist, pred) = graph.shortest(&start_nodes, |e| match e {
         EdgeKind::Barrel { .. } if no_vias => f64::INFINITY,
-        EdgeKind::Barrel { height, .. } => *height,
-        EdgeKind::Pad => 0.0,
+        _ => length_weight(e),
     });
     let (to_pad, end) = to
         .iter()
         .filter_map(|p| graph.pad(&name(p)).map(|n| (name(p), n)))
         .filter(|(_, n)| dist[*n].is_finite())
         .min_by(|a, b| dist[a.1].total_cmp(&dist[b.1]))?;
-    let (at, steps) = graph.path(&via, end);
+    let (at, walk) = Walk::of(graph, &pred, end, layers, planes);
     let from_pad = starts.iter().find(|s| s.1 == at).map(|s| s.0.clone()).unwrap_or_default();
-    let mut lc = LcSum::new(layers, planes);
-    let mut path_mm = 0.0;
-    let mut used_vias = BTreeSet::new();
-    let mut used_layers: Vec<String> = Vec::new();
-    let barrel = |k: Option<&(&EdgeKind, usize)>| matches!(k, Some((EdgeKind::Barrel { .. }, _)));
-    for (i, &(e, reached)) in steps.iter().enumerate() {
-        // Copper layers in path order, including a layer a via lands on
-        // straight into a pad, but not the inner layers a via passes through.
-        let passing = barrel(Some(&steps[i])) && barrel(steps.get(i + 1));
-        if let (Some(l), false) = (&graph.layer[reached], passing) {
-            if used_layers.last() != Some(l) {
-                used_layers.push(l.clone());
+    Some(TiePath::new(net, "tracks", from_pad, to_pad, walk))
+}
+
+fn length_weight(e: &EdgeKind) -> f64 {
+    match e {
+        EdgeKind::Track { len, .. } => *len,
+        EdgeKind::Barrel { height, .. } => *height,
+        EdgeKind::Pad => 0.0,
+    }
+}
+
+/// The leg of a tie that a plane carries: from the part's pads to the
+/// nearest via that drops into the net's pour on an inner layer, across the
+/// plane, and from a via in the same plane to the target's pads. `None` when
+/// either end has no routed way to such a via. Zones are read by their
+/// outline, so a via must lie inside it to count.
+#[allow(clippy::too_many_arguments)]
+fn plane_leg(
+    graph: &NetGraph,
+    net: &str,
+    from: &[&CopperPad],
+    to: &[&CopperPad],
+    zones: &[konnect_sexp::board::ZoneOutline],
+    layers: &LayerStack,
+    planes: &BTreeSet<String>,
+) -> Option<TiePath> {
+    // Graph nodes where a via of the net sits in the net's pour on an inner layer.
+    let mut drops: Vec<(usize, usize, &str)> = Vec::new();
+    for (a, b, kind) in &graph.edges {
+        let EdgeKind::Barrel { via, .. } = kind else { continue };
+        for n in [*a, *b] {
+            let at = graph.pos[n];
+            let Some(layer) = graph.layer[n].as_deref() else { continue };
+            let poured = zones.iter().any(|z| z.net.as_deref() == Some(net) && z.layers.iter().any(|l| l == layer) && point_in_polygon(at, &z.points));
+            if poured && !layers.is_outer(layer) && !drops.iter().any(|d| d.0 == n) {
+                drops.push((n, *via, layer));
             }
-        }
-        match e {
-            EdgeKind::Track { len, width, layer } => {
-                path_mm += len;
-                lc.add(layer, *width, *len);
-            }
-            EdgeKind::Barrel { via, .. } => {
-                used_vias.insert(*via);
-            }
-            EdgeKind::Pad => {}
         }
     }
-    Some(TiePath {
-        from_pad,
-        to_pad,
-        net: net.to_string(),
-        path_mm: r3(path_mm),
-        vias: used_vias.len() as u32,
-        layers: used_layers,
-        est_inductance_nh: lc.modelled.then(|| r3(lc.l_nh)),
-        est_capacitance_pf: lc.modelled.then(|| r3(lc.c_pf)),
-        unmodelled_mm: r3(lc.unmodelled_mm),
-    })
+    let name = |p: &CopperPad| format!("{}.{}", p.reference, p.number);
+    // The nearest drop from a set of pads, optionally on one layer only.
+    // (pad name, the walk, the drop's node, the plane's layer).
+    let stub = |pads: &[&CopperPad], on: Option<&str>| -> Option<(String, Walk, usize, String)> {
+        let starts: Vec<(String, usize)> = pads.iter().filter_map(|p| graph.pad(&name(p)).map(|n| (name(p), n))).collect();
+        let (dist, pred) = graph.shortest(&starts.iter().map(|s| s.1).collect::<Vec<_>>(), length_weight);
+        let (node, _, layer) = drops
+            .iter()
+            .filter(|d| dist[d.0].is_finite() && on.is_none_or(|l| l == d.2))
+            .min_by(|x, y| dist[x.0].total_cmp(&dist[y.0]))?;
+        let (at, walk) = Walk::of(graph, &pred, *node, layers, planes);
+        let pad = starts.iter().find(|s| s.1 == at).map(|s| s.0.clone()).unwrap_or_default();
+        Some((pad, walk, *node, layer.to_string()))
+    };
+    let (from_pad, near, drop_a, plane_layer) = stub(from, None)?;
+    let (to_pad, far, drop_b, _) = stub(to, Some(&plane_layer))?;
+    let (a, b) = (graph.pos[drop_a], graph.pos[drop_b]);
+    let mut walk = near;
+    walk.path_mm += far.path_mm;
+    walk.unmodelled_mm += far.unmodelled_mm;
+    walk.track_nh += far.track_nh;
+    walk.track_pf += far.track_pf;
+    for l in far.layers.iter().rev() {
+        if walk.layers.last() != Some(l) {
+            walk.layers.push(l.clone());
+        }
+    }
+    // The same via from both ends is one barrel: its two runs, one from
+    // each side down to the plane's layer, do not overlap and add up.
+    for barrel in far.barrels {
+        match walk.barrels.iter_mut().find(|x| x.via == barrel.via) {
+            Some(x) => x.height += barrel.height,
+            None => walk.barrels.push(barrel),
+        }
+    }
+    let mut leg = TiePath::new(net, "plane", from_pad, to_pad, walk);
+    leg.plane_span_mm = Some(r3((a.0 - b.0).hypot(a.1 - b.1)));
+    leg.plane_layer = Some(plane_layer);
+    Some(leg)
+}
+
+/// Dielectric between two copper layers of the stack, mm.
+fn layer_distance(layers: &LayerStack, a: &str, b: &str) -> Option<f64> {
+    let (i, j) = (layers.index(a)?, layers.index(b)?);
+    Some(layers.gaps.get(i.min(j)..i.max(j))?.iter().map(|g| g.thickness_mm).sum())
+}
+
+/// One leg of a tie as judged: the measured path (when there is one) and the verdict.
+struct LegResult {
+    net: String,
+    /// `pass`, `fail`, `unverified`, or `not_judged` (a plane net of a tie
+    /// whose limit is not about it).
+    status: &'static str,
+    detail: String,
+    leg: Option<TiePath>,
+}
+
+impl LegResult {
+    fn to_json(&self) -> Value {
+        let mut v = self.leg.clone().map(|l| serde_json::to_value(l.rounded()).unwrap_or(Value::Null)).filter(Value::is_object).unwrap_or_else(|| json!({ "net": self.net }));
+        v["status"] = json!(self.status);
+        v["detail"] = json!(self.detail);
+        v
+    }
+}
+
+/// The routed-path check of one tie: every leg that matters, measured, and
+/// one verdict that no unmeasured leg can overturn.
+///
+/// - `decoupling`, `core_regulator_cap`: the loop. Every net of the part is a
+///   leg to the target (the pin's net to the pin, the others to any pad of the
+///   target). A leg is the lower-inductance of its routed track path and its
+///   path through the net's plane. The legs' inductances add up and are
+///   compared with the budget. A leg that cannot be measured leaves the check
+///   `unverified`, unless what was measured already exceeds the budget.
+/// - `crystal` and ties with only `max_path_mm` / `max_vias`: every shared
+///   net is a leg and each must meet the limits on its own (a crystal's two
+///   nodes each have their budget). Plane nets are not judged, unless the tie
+///   names a pin on one.
+#[allow(clippy::too_many_arguments)]
+fn tie_path_check(
+    tie: &Tie,
+    limits: &TieLimits,
+    subject: &str,
+    part: &[&CopperPad],
+    target: &[&CopperPad],
+    all_pads: &[CopperPad],
+    intent: &DesignIntent,
+    copper: &BTreeMap<String, NetCopper>,
+    vias: &[konnect_sexp::board::Via],
+    zones: &[konnect_sexp::board::ZoneOutline],
+    layers: &LayerStack,
+    planes: &BTreeSet<String>,
+    graphs: &mut HashMap<String, NetGraph>,
+) -> Check {
+    let empty = NetCopper { segments: vec![], has_zone: false };
+    let mut required = limits.to_json();
+    if let Some(o) = required.as_object_mut() {
+        o.remove("max_mm");
+    }
+    let done = |status: &'static str, measured: Value, detail: String| Check { kind: "tie_path", subject: subject.to_string(), status, measured, required: required.clone(), detail };
+    let pin_nets: BTreeSet<&str> = target.iter().filter_map(|p| p.net.as_deref()).collect();
+    let part_nets: BTreeSet<&str> = part.iter().filter_map(|p| p.net.as_deref()).collect();
+    if !part_nets.iter().any(|n| pin_nets.contains(n)) {
+        return done("unverified", Value::Null, "the part shares no net with the pin, so there is no path to measure".to_string());
+    }
+    let inductive = limits.budget_nh().is_some();
+    let inner_pour = |net: &str| zones.iter().any(|z| z.net.as_deref() == Some(net) && z.layers.iter().any(|l| layers.index(l).is_some() && !layers.is_outer(l)));
+    let is_plane_net = |net: &str| intent.nets.get(net).is_some_and(|n| n.role == "plane") || inner_pour(net);
+    fn on_net<'a>(pads: &[&'a CopperPad], net: &str) -> Vec<&'a CopperPad> {
+        pads.iter().copied().filter(|p| p.net.as_deref() == Some(net)).collect()
+    }
+    let mut results: Vec<LegResult> = Vec::new();
+    // Nets whose zone might carry a leg that was measured over tracks only.
+    let mut unmeasured_zone: Vec<String> = Vec::new();
+    for net in &part_nets {
+        let shared = pin_nets.contains(net);
+        if !inductive && !shared {
+            continue;
+        }
+        let from = on_net(part, net);
+        // The pin's own net goes to the pin; a return net to any pad of the target.
+        let to: Vec<&CopperPad> = if shared { on_net(target, net) } else { all_pads.iter().filter(|p| p.reference == tie.to && p.net.as_deref() == Some(*net)).collect() };
+        let c = copper.get(*net).unwrap_or(&empty);
+        if !inductive && tie.pin.is_none() && is_plane_net(net) {
+            results.push(LegResult { net: net.to_string(), status: "not_judged", detail: "a plane net: its connection is each pad's via to the plane, not a routed path between the two parts".to_string(), leg: None });
+            continue;
+        }
+        if to.is_empty() {
+            results.push(LegResult { net: net.to_string(), status: "unverified", detail: format!("{} has no pad on {net}, so this leg of the loop cannot be measured", tie.to), leg: None });
+            continue;
+        }
+        // One graph per net for the whole check: a plane net is a leg of many ties.
+        let graph = &*graphs.entry(net.to_string()).or_insert_with(|| net_graph(net, c, all_pads, vias, layers));
+        let tracks = tie_path(graph, net, &from, &to, layers, planes);
+        let plane = if inductive { plane_leg(graph, net, &from, &to, zones, layers, planes) } else { None };
+        // Copper that could carry the leg without being measured: any zone
+        // for a tie measured over tracks only; for a loop, a pour on an outer
+        // layer, or an inner pour a through-hole pad sits in directly (an
+        // inner pour is otherwise reached only through vias, which
+        // `plane_leg` follows).
+        let outer_pour = zones.iter().any(|z| z.net.as_deref() == Some(*net) && z.layers.iter().any(|l| layers.is_outer(l)));
+        let through_hole = from.iter().chain(&to).any(|p| !p.smd);
+        if c.has_zone && plane.is_none() && (!inductive || outer_pour || through_hole) {
+            unmeasured_zone.push(net.to_string());
+        }
+        let leg = match (tracks, plane) {
+            (Some(t), Some(p)) => Some(if p.est_inductance_nh < t.est_inductance_nh { p } else { t }),
+            (t, p) => t.or(p),
+        };
+        match leg {
+            Some(leg) => results.push(LegResult { net: net.to_string(), status: "pass", detail: String::new(), leg: Some(leg) }),
+            None if c.has_zone => results.push(LegResult {
+                net: net.to_string(),
+                status: "unverified",
+                detail: if inductive {
+                    format!("no routed track path, and no via of {net} inside its inner-layer pour is reached by tracks from both pads (an outer-layer pour or a through-hole pad in the plane is not measured)")
+                } else {
+                    format!("no routed track path joins the part and the pin; net {net} has a zone that may carry the connection (zone paths are not measured)")
+                },
+                leg: None,
+            }),
+            None => results.push(LegResult { net: net.to_string(), status: "unverified", detail: "no path found in the track graph between the part and the target (not routed, or joined in a way the graph does not model)".to_string(), leg: None }),
+        }
+    }
+
+    // Inductance of each leg, now that every leg's vias are known.
+    let via_sets: Vec<Vec<(f64, f64)>> = results.iter().map(|r| r.leg.as_ref().map(|l| l.barrels.iter().map(|b| b.at).collect()).unwrap_or_default()).collect();
+    let plane_layers: Vec<Option<String>> = results.iter().map(|r| r.leg.as_ref().and_then(|l| l.plane_layer.clone())).collect();
+    for (i, result) in results.iter_mut().enumerate() {
+        let Some(leg) = result.leg.as_mut() else { continue };
+        let others: Vec<(f64, f64)> = via_sets.iter().enumerate().filter(|(j, _)| *j != i).flat_map(|(_, v)| v.iter().copied()).collect();
+        // The loop height of a plane leg: to the nearest other plane, be it
+        // another leg's plane or a reference plane of the stack.
+        let height = leg.plane_layer.as_ref().and_then(|mine| {
+            plane_layers
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .filter_map(|(_, l)| l.as_deref())
+                .chain(planes.iter().map(String::as_str))
+                .filter(|l| *l != mine.as_str())
+                .filter_map(|l| layer_distance(layers, mine, l))
+                .min_by(f64::total_cmp)
+        });
+        leg.estimate(&others, height);
+    }
+
+    let mut over: Vec<String> = Vec::new();
+    let mut open: Vec<String> = Vec::new();
+    let mut measured = json!({});
+    if inductive {
+        let budget = limits.budget_nh().unwrap_or(f64::INFINITY);
+        let legs: Vec<&TiePath> = results.iter().filter_map(|r| r.leg.as_ref()).collect();
+        let total: f64 = legs.iter().map(|l| l.est_inductance_nh).sum();
+        if total > budget {
+            over.push(format!("loop inductance {} nH > {budget} nH", r3(total)));
+        }
+        for leg in &legs {
+            if let Some(max) = limits.max_path_mm.filter(|m| leg.path_mm > *m) {
+                over.push(format!("{}: path {} mm > {max} mm", leg.net, leg.path_mm));
+            }
+            if let Some(max) = limits.max_vias.filter(|m| leg.carried_by == "tracks" && leg.vias > *m) {
+                over.push(format!("{}: {} vias > {max}", leg.net, leg.vias));
+            }
+            if leg.unmodelled_mm > 0.0 {
+                match limits.unmodelled_path_mm.filter(|m| leg.path_mm > *m) {
+                    Some(guide) => over.push(format!("{}: {} mm of track has no reference plane and the path {} mm exceeds the {guide} mm guide", leg.net, leg.unmodelled_mm, leg.path_mm)),
+                    None => open.push(format!("{}: {} mm of track has no reference plane, so its inductance is not in the estimate", leg.net, leg.unmodelled_mm)),
+                }
+            } else if leg.lower_bound_only() {
+                open.push(format!("{}: no second plane fixes the loop height, so the plane between the vias is not in the estimate", leg.net));
+            }
+        }
+        for r in results.iter().filter(|r| r.leg.is_none()) {
+            open.push(format!("{}: {}", r.net, r.detail));
+        }
+        measured["loop_inductance_nh"] = json!(r3(total));
+    } else {
+        for r in results.iter_mut() {
+            let Some(leg) = r.leg.as_ref() else {
+                if r.status == "unverified" {
+                    open.push(format!("{}: {}", r.net, r.detail));
+                }
+                continue;
+            };
+            let mut leg_over = Vec::new();
+            if let Some(max) = limits.budget_pf().filter(|m| leg.est_capacitance_pf > *m) {
+                leg_over.push(format!("{} pF > {max} pF", leg.est_capacitance_pf));
+            }
+            if let Some(max) = limits.max_path_mm.filter(|m| leg.path_mm > *m) {
+                leg_over.push(format!("path {} mm > {max} mm", leg.path_mm));
+            }
+            if let Some(max) = limits.max_vias.filter(|m| leg.vias > *m) {
+                leg_over.push(format!("{} vias > {max}", leg.vias));
+            }
+            if !leg_over.is_empty() {
+                r.status = "fail";
+                r.detail = leg_over.join(", ");
+                over.push(format!("{}: {}", r.net, r.detail));
+            }
+        }
+        if !results.iter().any(|r| r.leg.is_some() || r.status == "unverified") {
+            open.push("every net the part shares with the target is a plane net; name a pin to check a routed path".to_string());
+        }
+    }
+    // The leg the top-level fields describe: the worst judged one, else the first measured.
+    let governing = results
+        .iter()
+        .filter(|r| r.leg.is_some())
+        .max_by(|a, b| (a.status == "fail").cmp(&(b.status == "fail")).then(a.leg.as_ref().map_or(0.0, |l| l.path_mm).total_cmp(&b.leg.as_ref().map_or(0.0, |l| l.path_mm))));
+    if let Some(leg) = governing.and_then(|r| r.leg.clone()) {
+        if let (Some(m), Value::Object(fields)) = (measured.as_object_mut(), serde_json::to_value(leg.rounded()).unwrap_or(Value::Null)) {
+            m.extend(fields);
+        }
+    }
+    // A zone could only shorten a leg, so a pass stands; a failure over a
+    // net whose zone was not measured is not proven.
+    let status = if !over.is_empty() {
+        if unmeasured_zone.is_empty() { "fail" } else { "unverified" }
+    } else if !open.is_empty() {
+        "unverified"
+    } else {
+        "pass"
+    };
+    if inductive {
+        for r in results.iter_mut().filter(|r| r.leg.is_some()) {
+            r.status = "measured";
+        }
+    }
+    measured["legs"] = Value::Array(results.iter().map(LegResult::to_json).collect());
+    let mut detail = match (inductive, status) {
+        (true, _) => "loop = every net of the part to the target; each leg is the lower-inductance of its routed tracks and its path through the net's plane; L = Σ L′·len of the tracks at their own width and layer + via barrels (Johnson: (μ/2π)·h·ln(s/r), return at the nearest via of another leg, at most 2e·h) + the plane between the vias".to_string(),
+        (false, _) => "every shared net is a leg and each must meet the limits; C = Σ C′·len of the tracks at their own width and layer + 0.4 pF per via".to_string(),
+    };
+    if !over.is_empty() {
+        detail.push_str(&format!("; exceeds the limit: {}", over.join("; ")));
+    }
+    if !open.is_empty() {
+        detail.push_str(&format!("; not verified: {}", open.join("; ")));
+    }
+    if !unmeasured_zone.is_empty() {
+        detail.push_str(&format!("; net {} also has a zone that is not measured and may join the pads more directly", unmeasured_zone.join(", ")));
+    }
+    done(status, measured, detail)
 }
 
 /// Σ L′·len and Σ C′·len over track runs, each at its own width on its
@@ -2105,8 +2714,9 @@ fn net_plane_layers(net: &str, z: &ZoneLayers, intent: &DesignIntent, board_area
     covering
 }
 
-/// Dielectric between two copper layers, mm (copper in between included).
-fn layer_distance(layers: &LayerStack, a: &str, b: &str) -> Option<f64> {
+/// Distance between two different copper layers, mm (dielectric plus the
+/// copper in between); `None` for the same layer.
+fn plane_distance(layers: &LayerStack, a: &str, b: &str) -> Option<f64> {
     let (i, j) = (layers.index(a)?, layers.index(b)?);
     let (lo, hi) = (i.min(j), i.max(j));
     if lo == hi {
@@ -2196,7 +2806,7 @@ fn plane_connection_checks(
         // Spacing to the nearest plane of another net (the return plane).
         let spacing = my_planes
             .iter()
-            .flat_map(|a| net_planes.iter().filter(|(n, _)| *n != net).flat_map(|(_, ls)| ls.iter()).filter_map(move |b| layer_distance(layers, a, b)))
+            .flat_map(|a| net_planes.iter().filter(|(n, _)| *n != net).flat_map(|(_, ls)| ls.iter()).filter_map(move |b| plane_distance(layers, a, b)))
             .fold(None, |m: Option<f64>, d| Some(m.map_or(d, |m| m.min(d))));
         let regime = match (spacing, stack_known) {
             (Some(s), true) => Regime { spacing_mm: Some(s), name: if s <= CLOSE_PLANES_MM { "closely_spaced" } else { "widely_spaced" }, note: format!("{} mm to the nearest other plane ({})", r3(s), layers.source) },
@@ -2409,7 +3019,18 @@ fn plane_connection_checks(
                     PlaneTarget::Via(k) => json!({"via": [r3(net_vias[k].x), r3(net_vias[k].y)], "lands_on": via_lands[k]}),
                     PlaneTarget::Pad(j) => json!({"through_hole_pad": format!("{}.{}", net_pads[j].reference, net_pads[j].number), "lands_on": pad_lands[j]}),
                 };
-                json!({"stub_mm": p.stub_mm, "vias": p.vias, "target": what, "est_inductance_nh": p.est_inductance_nh, "unmodelled_mm": p.unmodelled_mm, "through_pads": p.through_pads})
+                // Information only: the via barrel from the pad's layer down to
+                // the nearest plane layer it lands on (Johnson, [7.9] via
+                // barrel_nh; no return via known, so the cap value).
+                let via_nh = match p.target {
+                    PlaneTarget::Via(k) => via_lands[k]
+                        .iter()
+                        .filter_map(|l| plane_distance(layers, pad.layer, l))
+                        .fold(None, |m: Option<f64>, h| Some(m.map_or(h, |m| m.min(h))))
+                        .map(|h| r3(barrel_nh(h, net_vias[k].drill, None))),
+                    PlaneTarget::Pad(_) => None,
+                };
+                json!({"stub_mm": p.stub_mm, "vias": p.vias, "target": what, "est_inductance_nh": p.est_inductance_nh, "est_via_nh": via_nh, "unmodelled_mm": p.unmodelled_mm, "through_pads": p.through_pads})
             };
             let limit_ok = limit.is_finite() && limit > 0.0;
             let pour_ok = pour.as_ref().is_some_and(|(n, _)| only_layer || n.as_ref().is_some_and(|n| n.0 <= limit));
@@ -2797,7 +3418,7 @@ fn evaluate_plane_exceptions(intent: &DesignIntent, cx: &ExceptCtx) -> (BTreeMap
                         match cx.layers.model(&outer, cx.planes) {
                             Ok(m) => {
                                 let l = m.per_mm(0.3).l_nh_per_mm;
-                                (((CORE_REG_NH / l) * 10.0).floor() / 10.0, format!("default: {CORE_REG_NH} nH hot-loop budget / {l:.3} nH/mm (0.3 mm on {outer}); Konnect judgement, LMR33630: input caps \"as close as possible to the VIN and GND terminals\" [docdb ti-lmr33630-layout]"))
+                                (((HOT_LOOP_NH / l) * 10.0).floor() / 10.0, format!("default: {HOT_LOOP_NH} nH hot-loop budget / {l:.3} nH/mm (0.3 mm on {outer}); Konnect judgement, LMR33630: input caps \"as close as possible to the VIN and GND terminals\" [docdb ti-lmr33630-layout]"))
                             }
                             Err(_) => (3.0, "default: fallback 3 mm (no outer line model); Konnect judgement".to_string()),
                         }
@@ -3210,6 +3831,7 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
     let vias = konnect_sexp::board::vias(tree).items;
     let empty = NetCopper { segments: vec![], has_zone: false };
 
+    let mut tie_graphs: HashMap<String, NetGraph> = HashMap::new();
     for tie in &intent.ties {
         let limits = tie_limits(tie, &layers, &planes);
         let subject = format!("{} → {}{}", tie.part, tie.to, tie.pin.as_deref().map(|p| format!(".{p}")).unwrap_or_default());
@@ -3219,14 +3841,13 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
             .filter(|p| p.reference == tie.to && tie.pin.as_deref().is_none_or(|pin| p.number == pin))
             .collect();
         if part.is_empty() || target.is_empty() {
-            checks.push(Check { kind: "tie", subject, status: "unverified", measured: Value::Null, required: json!({"max_mm": r3(limits.max_mm)}), detail: "part or pin not on the board".to_string() });
+            checks.push(Check { kind: "tie", subject, status: "unverified", measured: Value::Null, required: json!({"max_mm": limits.max_mm.map(r3)}), detail: "part or pin not on the board".to_string() });
             continue;
         }
         // Measure from the part's pads on the pin's net (the pad that does
         // the job), falling back to any pad when the pin has no net.
         let nets: BTreeSet<&str> = target.iter().filter_map(|p| p.net.as_deref()).collect();
         let sharing: Vec<&&CopperPad> = part.iter().filter(|p| p.net.as_deref().is_some_and(|n| nets.contains(n))).collect();
-        let shares = !sharing.is_empty();
         let (from, note) = if sharing.is_empty() {
             (part.iter().collect::<Vec<_>>(), "part shares no net with the pin; measured from its nearest pad")
         } else {
@@ -3240,62 +3861,18 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
         checks.push(Check {
             kind: "tie",
             subject: subject.clone(),
-            status: if d <= limits.max_mm { "pass" } else { "fail" },
+            // No limit is never a pass.
+            status: match limits.max_mm {
+                Some(max) if d <= max => "pass",
+                Some(_) => "fail",
+                None => "unverified",
+            },
             measured: json!({"distance_mm": r3(d), "same_side": same_side}),
-            required: json!({"max_mm": r3(limits.max_mm), "sources": limits.sources}),
+            required: json!({"max_mm": limits.max_mm.map(r3), "sources": limits.sources}),
             detail: tie.why.clone().map_or(note.to_string(), |w| format!("{w}; {note}")),
         });
-        if limits.max_path_mm.is_some() || limits.max_vias.is_some() {
-            let required = json!({"max_path_mm": limits.max_path_mm, "max_vias": limits.max_vias, "sources": limits.sources});
-            let unverified = |detail: String| Check { kind: "tie_path", subject: subject.clone(), status: "unverified", measured: Value::Null, required: required.clone(), detail };
-            // The shortest routed path over each shared net; the best one counts.
-            let mut best: Option<TiePath> = None;
-            let mut zoned = Vec::new();
-            for net in &nets {
-                let from_net: Vec<&CopperPad> = part.iter().copied().filter(|p| p.net.as_deref() == Some(*net)).collect();
-                let to_net: Vec<&CopperPad> = target.iter().copied().filter(|p| p.net.as_deref() == Some(*net)).collect();
-                if from_net.is_empty() {
-                    continue;
-                }
-                let c = copper.get(*net).unwrap_or(&empty);
-                if c.has_zone {
-                    zoned.push(net.to_string());
-                }
-                let graph = net_graph(net, c, &pads, &vias, &layers);
-                if let Some(p) = tie_path(&graph, net, &from_net, &to_net, &layers, &planes) {
-                    if best.as_ref().is_none_or(|b| p.path_mm < b.path_mm) {
-                        best = Some(p);
-                    }
-                }
-            }
-            let zone_note = if zoned.is_empty() { String::new() } else { format!("; net {} also has a zone, which may join the pads more directly", zoned.join(", ")) };
-            let check = match best {
-                _ if !shares => unverified("the part shares no net with the pin, so there is no path to measure".to_string()),
-                None if !zoned.is_empty() => unverified(format!("no routed track path joins the part and the pin; net {} has a zone that may carry the connection (zone paths are not measured)", zoned.join(", "))),
-                None => unverified("no routed track path joins the part and the pin yet (not routed)".to_string()),
-                Some(p) => {
-                    let mut over = Vec::new();
-                    if let Some(max) = limits.max_path_mm.filter(|m| p.path_mm > *m) {
-                        over.push(format!("path {} mm > {max} mm", p.path_mm));
-                    }
-                    if let Some(max) = limits.max_vias.filter(|m| p.vias > *m) {
-                        over.push(format!("{} vias > {max}", p.vias));
-                    }
-                    let model_note = if p.unmodelled_mm > 0.0 { format!("; {} mm on layers without a reference plane is left out of the L/C estimates", p.unmodelled_mm) } else { String::new() };
-                    // A zone could only shorten the path, so a pass stands; a
-                    // failure over a zoned net is not proven.
-                    let status = if over.is_empty() { "pass" } else if zoned.is_empty() { "fail" } else { "unverified" };
-                    let detail = format!(
-                        "shortest routed track path {} → {} on {}{}; L/C = Σ L′·len, Σ C′·len per segment at its own width and layer (via barrels not included){model_note}{zone_note}",
-                        p.from_pad,
-                        p.to_pad,
-                        p.net,
-                        if over.is_empty() { String::new() } else { format!(" exceeds the limit: {}", over.join(", ")) }
-                    );
-                    Check { kind: "tie_path", subject: subject.clone(), status, measured: serde_json::to_value(&p).unwrap_or(Value::Null), required: required.clone(), detail }
-                }
-            };
-            checks.push(check);
+        if limits.max_path_mm.is_some() || limits.max_vias.is_some() || limits.budget.is_some() {
+            checks.push(tie_path_check(tie, &limits, &subject, &part, &target, &pads, intent, &copper, &vias, &zones, &layers, &planes, &mut tie_graphs));
         }
     }
 
@@ -3327,15 +3904,42 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
         let net_copper = copper.get(&r.net).unwrap_or(&empty);
         let routed = !net_copper.segments.is_empty();
         if n.role == "plane" {
+            // The pour as the board file holds it filled: pieces per layer.
+            let pieces = pour_pieces(tree, &r.net);
+            let cut: Vec<String> = pieces.iter().filter(|(l, n)| **n > 1 && layers.index(l).is_some() && !layers.is_outer(l)).map(|(l, n)| format!("{l}: {n} pieces")).collect();
+            let narrowest = net_copper.segments.iter().map(|s| s.2).fold(f64::INFINITY, f64::min);
+            let track_mm = length(&net_copper.segments);
+            let (status, detail) = if !net_copper.has_zone {
+                ("fail", "a plane net needs a zone".to_string())
+            } else if pieces.is_empty() {
+                ("unverified", "the zone is not filled in this board file, so it joins nothing yet: refill the zones, save, and check again".to_string())
+            } else if !cut.is_empty() {
+                (
+                    "unverified",
+                    format!(
+                        "the pour is cut into pieces on an inner layer ({}); the pieces are joined only through vias to another layer or by the net's tracks{}; whether they are joined at all is DRC's unconnected-items check, and the current those links carry is not computed",
+                        cut.join(", "),
+                        if routed { format!(" ({} mm of track, narrowest {} mm)", r3(track_mm), r3(narrowest)) } else { String::new() }
+                    ),
+                )
+            } else {
+                ("pass", "a zone of the net, filled in one piece on every inner layer it is on".to_string())
+            };
             checks.push(Check {
                 kind: "plane",
                 subject: r.net.clone(),
-                status: if net_copper.has_zone { "pass" } else { "fail" },
-                measured: json!({"has_zone": net_copper.has_zone}),
-                required: json!({"has_zone": true}),
-                detail: "a plane net needs a zone".to_string(),
+                status,
+                measured: json!({
+                    "has_zone": net_copper.has_zone,
+                    "filled_pieces": pieces,
+                    "track_length_mm": r3(track_mm),
+                    "narrowest_track_mm": routed.then(|| r3(narrowest)),
+                }),
+                required: json!({"has_zone": true, "inner_layer_pieces": 1}),
+                detail,
             });
-            continue;
+            // A plane net's tracks still carry its current where they are the
+            // only link: with `current_a` the width check below applies to them.
         }
         if let (Some(outer_min), true) = (r.current_width_mm, r.impedance_widths.is_empty()) {
             if routed {
@@ -3580,8 +4184,11 @@ pub(crate) fn plan_ties(tree: &SexpNode, intent: &DesignIntent, clearance: f64) 
     let mut notes = Vec::new();
     let (layers, planes, _) = stack_and_planes(intent, Some(tree));
     for tie in &intent.ties {
-        let max_mm = tie_limits(tie, &layers, &planes).max_mm;
         let label = format!("{} → {}{}", tie.part, tie.to, tie.pin.as_deref().map(|p| format!(".{p}")).unwrap_or_default());
+        let Some(max_mm) = tie_limits(tie, &layers, &planes).max_mm else {
+            notes.push(json!({"tie": label, "status": "skipped", "reason": "the tie has no distance limit"}));
+            continue;
+        };
         let target: Vec<&CopperPad> = pads.iter().filter(|p| p.reference == tie.to && tie.pin.as_deref().is_none_or(|pin| p.number == pin)).collect();
         let part: Vec<&CopperPad> = pads.iter().filter(|p| p.reference == tie.part).collect();
         let (Some(me), Some(ic)) = (
@@ -3791,9 +4398,9 @@ pub fn tools() -> Vec<ToolDef> {
                             "to": { "type": "string" },
                             "pin": { "type": "string" },
                             "max_mm": { "type": "number", "description": "Pad edge to pad edge; optional with a kind" },
-                            "kind": { "type": "string", "enum": ["crystal", "core_regulator_cap", "decoupling"], "description": "Defaults for max_mm, max_path_mm and max_vias from the stack-up" },
-                            "max_path_mm": { "type": "number", "description": "Routed track length, part pad to pin on their shared net, checked by check_design_intent" },
-                            "max_vias": { "type": "integer", "minimum": 0, "description": "Vias on that routed path" },
+                            "kind": { "type": "string", "enum": ["crystal", "core_regulator_cap", "decoupling"], "description": "crystal: 0.5 pF of routed track per shared net, 6 mm and no via; decoupling / core_regulator_cap: a loop-inductance budget (6 / 5 nH, Konnect judgement) over the supply and return legs, placement within 2.5 mm" },
+                            "max_path_mm": { "type": "number", "description": "Routed track length per leg, part pad to pin on each shared net, checked by check_design_intent" },
+                            "max_vias": { "type": "integer", "minimum": 0, "description": "Vias on each leg routed as tracks" },
                             "why": { "type": "string" }
                         },
                         "required": ["part", "to"],
@@ -3907,8 +4514,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "check_design_intent",
             "Measure the board against the design intent: part ties (pad-edge distance, and for \
-             ties with max_path_mm/max_vias the shortest routed path with its vias and estimated \
-             nH/pF), routed length, pair skew, track width against the current/impedance requirement, voltage \
+             ties with a kind, max_path_mm or max_vias a tie_path check over every leg: each \
+             shared net for a crystal (pF per net against its budget), the supply and return \
+             legs of a decoupling loop through tracks or the plane (loop nH against its budget, \
+             via barrels and plane included); unverified whenever a leg cannot be measured), routed length, pair skew, track width against the current/impedance requirement, voltage \
              drop from the source pad, impedance estimate, plane zones, and plane_connection: \
              every SMD pad on a plane net (inner-layer zone, or role plane) must reach a via to \
              a zone layer of its net within max_stub_mm of connecting trace (track outside the \
@@ -4482,7 +5091,8 @@ mod tests {
         assert!((mv - 78.6).abs() < 1.0, "{mv}");
         let width = checks.iter().find(|c| c.kind == "track_width" && c.subject == "+5V").unwrap();
         assert_eq!(width.status, "fail", "0.2 mm is under the IPC-2221 width for 1 A (≈0.3 mm): {width:?}");
-        assert_eq!(get("plane").status, "pass");
+        // The zone has no fill in this file: it joins nothing yet.
+        assert_eq!(get("plane").status, "unverified");
     }
 }
 
@@ -4997,30 +5607,43 @@ mod default_tests {
     }
 
     #[test]
-    fn tie_kinds_derive_path_limits_from_the_stackup_and_user_values_win() {
+    fn tie_kinds_give_budgets_and_placement_defaults_and_user_values_win() {
         let intent = DesignIntent { schema: 1, ..Default::default() };
         let (layers, planes, _) = stack_and_planes(&intent, None);
         let tie = |kind: &str| Tie { part: "Y1".into(), to: "U1".into(), kind: Some(kind.into()), ..Default::default() };
-        let m = layers.model("F.Cu", &planes).unwrap();
         let x = tie_limits(&tie("crystal"), &layers, &planes);
-        let want = (CRYSTAL_TRACE_PF / m.per_mm(0.2).c_pf_per_mm * 10.0).floor() / 10.0;
-        assert_eq!(x.max_path_mm, Some(want));
-        // JLC04161H-7628 outer layer: ≈ 0.09 pF/mm → ≈ 5.5 mm, near the 6 mm
-        // the reviewer asked for.
-        assert!((4.5..6.5).contains(&want), "{want}");
-        assert_eq!((x.max_vias, x.max_mm), (Some(0), want));
-        assert!(x.sources["max_path_mm"].contains("AVR186"));
+        assert_eq!(x.budget, Some(TieBudget::CapacitancePf(CRYSTAL_TRACE_PF)));
+        // The length guide is flat, not the budget turned into millimetres.
+        assert_eq!((x.max_path_mm, x.max_vias, x.max_mm), (Some(6.0), Some(0), Some(6.0)));
+        assert!(x.sources["budget_pf"].contains("AVR186"));
+        assert!(x.sources["max_path_mm"].contains("Konnect judgement"));
         let v = tie_limits(&tie("core_regulator_cap"), &layers, &planes);
-        // ≈ 0.33 nH/mm at 0.3 mm → 1 nH ≈ 3 mm, the WORKFLOW.md figure.
-        assert!((2.5..3.6).contains(&v.max_path_mm.unwrap()), "{:?}", v.max_path_mm);
-        assert_eq!(v.max_vias, Some(1));
+        assert_eq!(v.budget, Some(TieBudget::LoopInductanceNh(CORE_REG_LOOP_NH)));
+        // No length proxy: the loop inductance is compared directly.
+        assert_eq!((v.max_path_mm, v.max_vias, v.max_mm, v.unmodelled_path_mm), (None, Some(1), Some(2.5), Some(3.0)));
         let d = tie_limits(&tie("decoupling"), &layers, &planes);
-        assert!(d.max_path_mm.unwrap() > v.max_path_mm.unwrap());
+        assert_eq!(d.budget, Some(TieBudget::LoopInductanceNh(DECOUPLING_LOOP_NH)));
+        assert_eq!((d.max_mm, d.unmodelled_path_mm), (Some(2.5), Some(6.0)));
+        assert!(d.sources["max_mm"].contains("Konnect judgement"));
+        assert!(d.sources["budget_nh"].contains("xilinx-ug483-7series-pcb"));
         // Explicit values override the kind.
         let user = Tie { max_mm: Some(2.5), max_path_mm: Some(9.0), max_vias: Some(3), ..tie("crystal") };
         let u = tie_limits(&user, &layers, &planes);
-        assert_eq!((u.max_mm, u.max_path_mm, u.max_vias), (2.5, Some(9.0), Some(3)));
-        assert!(u.sources.values().all(|s| s == "user"));
+        assert_eq!((u.max_mm, u.max_path_mm, u.max_vias), (Some(2.5), Some(9.0), Some(3)));
+        assert!(["max_mm", "max_path_mm", "max_vias"].iter().all(|k| u.sources[*k] == "user"));
+        // A tie with only a path limit is placed within it.
+        let plain = Tie { part: "R1".into(), to: "U1".into(), max_path_mm: Some(4.0), ..Default::default() };
+        assert_eq!(tie_limits(&plain, &layers, &planes).max_mm, Some(4.0));
+        // Review D2: a plane 1.5 mm away gives a small C′, and the 0.5 pF
+        // alone would allow about 12 mm; the guide still says 6.
+        let two = LayerStack::from_intent(Stackup::default(), &["F.Cu".to_string(), "B.Cu".to_string()], 1.6);
+        let far: BTreeSet<String> = ["B.Cu".to_string()].into();
+        assert!(CRYSTAL_TRACE_PF / two.model("F.Cu", &far).unwrap().per_mm(0.2).c_pf_per_mm > 10.0);
+        assert_eq!(tie_limits(&tie("crystal"), &two, &far).max_path_mm, Some(6.0));
+        // Review B2: nothing resolves → no limit at all, not an infinite one.
+        let none = Tie { part: "C1".into(), to: "U1".into(), kind: Some("ferrite".into()), ..Default::default() };
+        let n = tie_limits(&none, &layers, &planes);
+        assert_eq!((n.max_mm, n.max_path_mm, n.budget), (None, None, None));
         // A plain tie needs a limit; a kind supplies one.
         let mut i = DesignIntent { schema: 1, ..Default::default() };
         i.ties.push(Tie { part: "C1".into(), to: "U1".into(), ..Default::default() });
@@ -5047,7 +5670,7 @@ mod default_tests {
         let checks = check_board(&board, &i);
         let tie = checks.iter().find(|c| c.kind == "tie").unwrap();
         assert_eq!(tie.status, "fail", "8.5 mm apart: {tie:?}");
-        assert!(tie.required["sources"]["max_mm"].as_str().unwrap().contains("path limit"));
+        assert!(tie.required["sources"]["max_mm"].as_str().unwrap().contains("crystal length guide"));
         assert_eq!(checks.iter().find(|c| c.kind == "tie_path").unwrap().status, "unverified");
     }
 }
@@ -5102,7 +5725,8 @@ mod tie_path_tests {
         let nh = c.measured["est_inductance_nh"].as_f64().unwrap();
         assert!((pf - 4.0 * pm.c_pf_per_mm).abs() < 0.01, "{pf} vs {}", 4.0 * pm.c_pf_per_mm);
         assert!((nh - 4.0 * pm.l_nh_per_mm).abs() < 0.01, "{nh}");
-        assert!(c.required["sources"]["max_path_mm"].as_str().unwrap().contains("AVR186"));
+        assert!(c.required["sources"]["budget_pf"].as_str().unwrap().contains("AVR186"));
+        assert_eq!(c.required["budget_pf"], json!(0.5));
     }
 
     #[test]
@@ -5251,8 +5875,15 @@ mod review_tests {
         std::fs::write(dir.path().join("b.intent.json"), serde_json::to_string(&with_plane).unwrap()).unwrap();
         let real = get(dir.path());
         assert!(real["stackup_basis"].as_str().unwrap().contains("saved board file"), "{}", real["stackup_basis"]);
-        let (a, r) = (assumed["tie_requirements"][0]["max_path_mm"].as_f64().unwrap(), real["tie_requirements"][0]["max_path_mm"].as_f64().unwrap());
+        // The budget's length equivalent follows the stack-up that was read;
+        // the length guide does not.
+        let equivalent = |v: &Value| -> f64 {
+            let text = v["tie_requirements"][0]["sources"]["budget_pf"].as_str().unwrap().to_string();
+            text.split("≈ ").nth(1).and_then(|t| t.split(" mm").next()).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{text}"))
+        };
+        let (a, r) = (equivalent(&assumed), equivalent(&real));
         assert!(r > 1.5 * a, "2-layer {r} mm vs assumed 4-layer {a} mm");
+        assert_eq!((assumed["tie_requirements"][0]["max_path_mm"].clone(), real["tie_requirements"][0]["max_path_mm"].clone()), (json!(6.0), json!(6.0)));
     }
 
     fn tie_board(extra: &str, tie: Tie) -> Check {
@@ -5268,16 +5899,24 @@ mod review_tests {
     }
 
     #[test]
-    fn a_tie_without_a_pin_takes_the_shortest_of_its_shared_nets() {
+    fn a_tie_without_a_pin_must_meet_the_limit_on_every_shared_net() {
         let extra = "(footprint \"J\" (layer \"F.Cu\") (at 10 10) (property \"Reference\" \"J1\")
               (pad \"1\" smd rect (at 0 0) (size 0.5 0.5) (layers \"F.Cu\") (net \"A\")) (pad \"2\" smd rect (at 0 5) (size 0.5 0.5) (layers \"F.Cu\") (net \"B\")))
             (footprint \"U\" (layer \"F.Cu\") (at 18 10) (property \"Reference\" \"U2\")
               (pad \"1\" smd rect (at 0 0) (size 0.5 0.5) (layers \"F.Cu\") (net \"A\")) (pad \"2\" smd rect (at -5 5) (size 0.5 0.5) (layers \"F.Cu\") (net \"B\")))
             (segment (start 10 10) (end 18 10) (width 0.2) (layer \"F.Cu\") (net \"A\"))
             (segment (start 10 15) (end 13 15) (width 0.2) (layer \"F.Cu\") (net \"B\"))";
+        // Review B1: the 8 mm leg on A fails the tie; the 3 mm leg on B does
+        // not rescue it. The top-level fields describe the failing leg.
         let c = tie_board(extra, Tie { part: "U2".into(), to: "J1".into(), max_path_mm: Some(5.0), ..Default::default() });
-        assert_eq!(c.status, "pass", "{c:?}");
-        assert_eq!((c.measured["net"].as_str(), c.measured["path_mm"].clone()), (Some("B"), json!(3.0)));
+        assert_eq!(c.status, "fail", "{c:?}");
+        assert_eq!((c.measured["net"].as_str(), c.measured["path_mm"].clone()), (Some("A"), json!(8.0)));
+        let legs: Vec<(&str, &str)> = c.measured["legs"].as_array().unwrap().iter().map(|l| (l["net"].as_str().unwrap(), l["status"].as_str().unwrap())).collect();
+        assert_eq!(legs, vec![("A", "fail"), ("B", "pass")]);
+        assert!(c.detail.contains("A: path 8 mm > 5 mm"), "{}", c.detail);
+        // With room for both, it passes and reports the longer leg.
+        let c = tie_board(extra, Tie { part: "U2".into(), to: "J1".into(), max_path_mm: Some(9.0), ..Default::default() });
+        assert_eq!((c.status, c.measured["net"].as_str()), ("pass", Some("A")), "{c:?}");
     }
 
     #[test]
@@ -5321,6 +5960,467 @@ mod review_tests {
         let want = (track + bottom + 2.0 * barrel) * 1000.0;
         assert_eq!(c.measured["drop_mv"], json!(r3(want)), "{c:?}");
         assert_eq!(c.measured["worst_pad"], json!("U1.1"));
+    }
+}
+
+/// Pass 19: fixes from the second independent review of Tier 1 (B1–B5, D1–D6).
+#[cfg(test)]
+mod second_review_tests {
+    use super::*;
+
+    const LAYERS4: &str = "(general (thickness 1.6)) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" power) (6 \"In2.Cu\" power) (2 \"B.Cu\" signal))";
+    /// Ground on In1 and +3V3 on In2, both over the whole 50 mm square.
+    const PLANES: &str = "(zone (net \"GND\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50))))
+        (zone (net \"+3V3\") (layers \"In2.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50))))";
+
+    fn seg(net: &str, layer: &str, w: f64, (x1, y1): (f64, f64), (x2, y2): (f64, f64)) -> String {
+        format!("(segment (start {x1} {y1}) (end {x2} {y2}) (width {w}) (layer \"{layer}\") (net \"{net}\"))")
+    }
+
+    fn via(net: &str, (x, y): (f64, f64)) -> String {
+        format!("(via (at {x} {y}) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"{net}\"))")
+    }
+
+    /// A footprint with 0.5 mm square surface pads: (number, net, dx, dy).
+    fn part(reference: &str, layer: &str, (x, y): (f64, f64), pads: &[(&str, &str, f64, f64)]) -> String {
+        let pads: String = pads.iter().map(|(n, net, dx, dy)| format!("(pad \"{n}\" smd rect (at {dx} {dy}) (size 0.5 0.5) (layers \"{layer}\") (net \"{net}\"))")).collect();
+        format!("(footprint \"X\" (layer \"{layer}\") (at {x} {y}) (property \"Reference\" \"{reference}\") {pads})")
+    }
+
+    fn board(layers: &str, body: &str) -> SexpNode {
+        konnect_sexp::parse_sexp(&format!("(kicad_pcb {layers} {body})")).unwrap()
+    }
+
+    fn path_check(board: &SexpNode, tie: Tie) -> Check {
+        let mut i = DesignIntent { schema: 1, ..Default::default() };
+        i.ties.push(tie);
+        check_board(board, &i).into_iter().find(|c| c.kind == "tie_path").expect("a tie_path check")
+    }
+
+    fn tie(part: &str, to: &str, pin: Option<&str>, kind: Option<&str>) -> Tie {
+        Tie { part: part.into(), to: to.into(), pin: pin.map(str::to_string), kind: kind.map(str::to_string), ..Default::default() }
+    }
+
+    fn stack4() -> (LayerStack, BTreeSet<String>) {
+        let names: Vec<String> = ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"].iter().map(|s| s.to_string()).collect();
+        (LayerStack::from_intent(Stackup::default(), &names, 1.6), ["In1.Cu".to_string(), "In2.Cu".to_string()].into())
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 0.002
+    }
+
+    // ── B1 ──────────────────────────────────────────────────────────────
+
+    /// A crystal tie without a pin: each node has its own budget, so a long
+    /// XO leg fails the tie however short XI is. The ground pads are on a
+    /// plane net and are not judged.
+    #[test]
+    fn a_pinless_crystal_fails_on_its_worse_leg() {
+        let u1 = part("U1", "F.Cu", (10.0, 10.0), &[("5", "XI", 0.0, 0.0), ("6", "XO", 0.0, 1.0), ("7", "GND", 0.0, 2.0)]);
+        let y1 = part("Y1", "F.Cu", (14.0, 10.0), &[("1", "XI", 0.0, 0.0), ("3", "XO", 0.0, 1.0), ("2", "GND", 0.0, 2.0)]);
+        let xi = seg("XI", "F.Cu", 0.2, (10.0, 10.0), (14.0, 10.0));
+        let long_xo = [seg("XO", "F.Cu", 0.2, (10.0, 11.0), (10.0, 31.0)), seg("XO", "F.Cu", 0.2, (10.0, 31.0), (14.0, 31.0)), seg("XO", "F.Cu", 0.2, (14.0, 31.0), (14.0, 11.0))].join(" ");
+        let c = path_check(&board(LAYERS4, &format!("{PLANES} {u1} {y1} {xi} {long_xo}")), tie("Y1", "U1", None, Some("crystal")));
+        assert_eq!(c.status, "fail", "{c:?}");
+        assert_eq!((c.measured["net"].as_str(), c.measured["path_mm"].clone()), (Some("XO"), json!(44.0)));
+        let legs: Vec<(&str, &str)> = c.measured["legs"].as_array().unwrap().iter().map(|l| (l["net"].as_str().unwrap(), l["status"].as_str().unwrap())).collect();
+        assert_eq!(legs, vec![("GND", "not_judged"), ("XI", "pass"), ("XO", "fail")]);
+        assert!(c.detail.contains("XO:"), "{}", c.detail);
+        // Both legs short: a pass, reporting the longer one.
+        let xo = seg("XO", "F.Cu", 0.2, (10.0, 11.0), (14.0, 11.0));
+        let c = path_check(&board(LAYERS4, &format!("{PLANES} {u1} {y1} {xi} {xo}")), tie("Y1", "U1", None, Some("crystal")));
+        assert_eq!(c.status, "pass", "{c:?}");
+        // One leg not routed: nothing proves the tie, so it is not a pass.
+        let c = path_check(&board(LAYERS4, &format!("{PLANES} {u1} {y1} {xi}")), tie("Y1", "U1", None, Some("crystal")));
+        assert_eq!(c.status, "unverified", "{c:?}");
+        assert!(c.detail.contains("XO:"), "{}", c.detail);
+    }
+
+    // ── B2 ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_invalid_intent_file_is_refused_by_every_reader() {
+        for (body, reason) in [
+            (r#"{"schema":1,"ties":[{"part":"C1","to":"U1"}]}"#, "give max_mm"),
+            (r#"{"schema":1,"ties":[{"part":"C1","to":"U1","kind":"decoupling_cap"}]}"#, "kind must be one of"),
+            (r#"{"schema":1,"ties":[{"part":"C1","to":"U1","max_mm":-1}]}"#, "max_mm must be > 0"),
+            (r#"{"schema":1,"nets":{"A_P":{"role":"diff_pair","pair":"A_N","standard":"usb3"},"A_N":{"role":"diff_pair","pair":"A_P"}}}"#, "standard must be one of"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("p.kicad_pro"), "{}").unwrap();
+            std::fs::write(dir.path().join("p.intent.json"), body).unwrap();
+            let error = load_intent(&dir.path().join("p")).expect_err(body).to_string();
+            assert!(error.contains(reason) && error.contains("not a valid design intent"), "{error}");
+            // get_design_intent (and check/apply, which load the same way) fail too.
+            assert!(handle_get_design_intent(&json!({"project": dir.path().join("p.kicad_pro")})).is_err());
+        }
+        // A valid file still loads.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.intent.json"), r#"{"schema":1,"ties":[{"part":"C1","to":"U1","max_mm":2.0}]}"#).unwrap();
+        assert_eq!(load_intent(&dir.path().join("p")).unwrap().0.ties.len(), 1);
+    }
+
+    /// Even past validation, a tie with no limit is never a pass.
+    #[test]
+    fn a_tie_with_no_limit_is_unverified_not_passed() {
+        let b = board(LAYERS4, &format!("{} {}", part("U1", "F.Cu", (10.0, 10.0), &[("1", "V", 0.0, 0.0)]), part("C1", "F.Cu", (90.0, 10.0), &[("1", "V", 0.0, 0.0)])));
+        let mut i = DesignIntent { schema: 1, ..Default::default() };
+        i.ties.push(tie("C1", "U1", None, None));
+        assert!(i.validate().is_err());
+        let checks = check_board(&b, &i);
+        let t = checks.iter().find(|c| c.kind == "tie").unwrap();
+        assert_eq!((t.status, t.required["max_mm"].clone()), ("unverified", Value::Null), "{t:?}");
+        assert!(!checks.iter().any(|c| c.kind == "tie_path"));
+        assert!(plan_ties(&b, &i, 0.2).0.is_empty());
+    }
+
+    // ── B3 ──────────────────────────────────────────────────────────────
+
+    /// Copper KiCad treats as connected is connected in the graph (Pass 18's
+    /// joins, extended here): the piece that bridges an offset between two
+    /// tracks is in the length; a via's annulus joins at no length.
+    #[test]
+    fn overlapping_copper_is_joined_where_coordinates_do_not_coincide() {
+        let u1 = part("U1", "F.Cu", (10.0, 10.0), &[("5", "XI", 0.0, 0.0)]);
+        let y1 = part("Y1", "F.Cu", (14.0, 10.0), &[("1", "XI", 0.0, 0.0)]);
+        let limit = |max: f64| Tie { max_path_mm: Some(max), ..tie("Y1", "U1", Some("5"), None) };
+        let run = |body: String| path_check(&board(LAYERS4, &body), limit(9.0));
+        // (a) A track through a 0.9 × 0.95 pad, 0.3 mm off its centre, that
+        // does not end in it.
+        let wide = "(footprint \"X\" (layer \"F.Cu\") (at 14 10) (property \"Reference\" \"Y1\") (pad \"1\" smd rect (at 0 0) (size 0.9 0.95) (layers \"F.Cu\") (net \"XI\")))";
+        let c = run(format!("{u1} {wide} {} {}", seg("XI", "F.Cu", 0.2, (10.0, 10.0), (10.0, 10.3)), seg("XI", "F.Cu", 0.2, (10.0, 10.3), (18.0, 10.3))));
+        assert_eq!((c.status, c.measured["path_mm"].clone()), ("pass", json!(4.3)), "{c:?}");
+        // (b) Two track ends 0.05 mm apart, each inside the other's width.
+        let c = run(format!("{u1} {y1} {} {}", seg("XI", "F.Cu", 0.25, (10.0, 10.0), (12.0, 10.0)), seg("XI", "F.Cu", 0.25, (12.0, 10.05), (14.0, 10.05))));
+        // The 0.05 mm between the ends is copper too, and counted.
+        assert_eq!((c.status, c.measured["path_mm"].clone()), ("pass", json!(4.05)), "{c:?}");
+        // (c) A stub landing mid-trunk, 0.05 mm off the trunk's centreline.
+        let c = run(format!("{u1} {y1} {} {}", seg("XI", "F.Cu", 0.25, (10.0, 10.0), (10.0, 14.0)), seg("XI", "F.Cu", 0.25, (10.05, 12.0), (14.0, 10.2))));
+        let want = 2.0 + 0.05 + (3.95_f64).hypot(1.8);
+        assert_eq!(c.status, "pass", "{c:?}");
+        assert!(close(c.measured["path_mm"].as_f64().unwrap(), want), "{} vs {want}", c.measured["path_mm"]);
+        // (d) A track ending on a via's annular ring, 0.1 mm from its centre.
+        let below = part("Y1", "B.Cu", (12.0, 10.0), &[("1", "XI", 0.0, 0.0)]);
+        let c = run(format!("{u1} {below} {} {}", seg("XI", "F.Cu", 0.25, (10.0, 10.0), (11.9, 10.0)), via("XI", (12.0, 10.0))));
+        assert_eq!((c.status, c.measured["path_mm"].clone(), c.measured["vias"].clone()), ("pass", json!(1.9), json!(1)), "{c:?}");
+        // (e) A stub whose last piece is shorter than the gap to the trunk:
+        // its end's nearest node is its own neighbour, not the trunk.
+        let c = run(format!(
+            "{u1} {y1} {} {} {}",
+            seg("XI", "F.Cu", 0.25, (10.0, 10.0), (10.0, 14.0)),
+            seg("XI", "F.Cu", 0.25, (10.08, 12.0), (10.1, 12.0)),
+            seg("XI", "F.Cu", 0.25, (10.1, 12.0), (14.0, 10.2))
+        ));
+        assert_eq!(c.status, "pass", "{c:?}");
+        // (f) A corner of a track (not an end) touching the trunk off its centreline.
+        let y2 = part("Y1", "F.Cu", (12.0, 13.0), &[("1", "XI", 0.0, 0.0)]);
+        let c = run(format!(
+            "{u1} {y2} {} {} {}",
+            seg("XI", "F.Cu", 0.25, (10.0, 10.0), (10.0, 14.0)),
+            seg("XI", "F.Cu", 0.25, (12.0, 11.0), (10.05, 12.0)),
+            seg("XI", "F.Cu", 0.25, (10.05, 12.0), (12.0, 13.0))
+        ));
+        assert_eq!(c.status, "pass", "{c:?}");
+        // Not joined: a 0.25 mm track ending 0.5 mm from the via centre does
+        // not reach its 0.3 mm ring (0.3 + 0.125 < 0.5)…
+        let c = run(format!("{u1} {below} {} {}", seg("XI", "F.Cu", 0.25, (10.0, 10.0), (11.5, 10.0)), via("XI", (12.0, 10.0))));
+        assert_eq!(c.status, "unverified", "{c:?}");
+        assert!(c.detail.contains("no path found in the track graph"), "{}", c.detail);
+        // …and two 0.25 mm tracks whose centrelines are 0.3 mm apart do not
+        // overlap (the rule is copper overlap, (w1 + w2) / 2, which is a
+        // little wider than KiCad's "end inside the other track").
+        let c = run(format!("{u1} {y1} {} {}", seg("XI", "F.Cu", 0.25, (10.0, 10.0), (10.0, 14.0)), seg("XI", "F.Cu", 0.25, (10.3, 12.0), (14.0, 10.2))));
+        assert_eq!(c.status, "unverified", "{c:?}");
+    }
+
+    /// The graph itself, as the voltage-drop check and others use it: a load
+    /// on a pad the feed track only crosses is reachable.
+    #[test]
+    fn net_graph_reaches_a_pad_a_track_only_crosses() {
+        let body = format!(
+            "{} (footprint \"X\" (layer \"F.Cu\") (at 14 10) (property \"Reference\" \"C1\") (pad \"1\" smd rect (at 0 0) (size 0.9 0.95) (layers \"F.Cu\") (net \"V\"))) {}",
+            part("U1", "F.Cu", (10.0, 10.3), &[("1", "V", 0.0, 0.0)]),
+            seg("V", "F.Cu", 0.2, (10.0, 10.3), (18.0, 10.3))
+        );
+        let tree = board(LAYERS4, &body);
+        let (layers, _) = stack4();
+        let graph = net_graph("V", &board_copper(&tree)["V"], &copper_pads(&tree), &[], &layers);
+        let (dist, _) = graph.shortest(&[graph.pad("U1.1").unwrap()], length_weight);
+        assert!(close(dist[graph.pad("C1.1").unwrap()], 4.0), "{:?}", dist[graph.pad("C1.1").unwrap()]);
+    }
+
+    #[test]
+    fn clipping_a_segment_to_a_pad_gives_the_part_inside() {
+        let square = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)];
+        let (t0, t1) = clip_convex((-1.0, 1.0), (3.0, 1.0), &square).unwrap();
+        assert!(close(t0, 0.25) && close(t1, 0.75), "{t0} {t1}");
+        // Either winding.
+        let reversed: Vec<(f64, f64)> = square.iter().rev().copied().collect();
+        assert!(clip_convex((-1.0, 1.0), (3.0, 1.0), &reversed).is_some());
+        assert!(clip_convex((-1.0, 3.0), (3.0, 3.0), &square).is_none());
+        assert!(clip_convex((-1.0, 1.0), (-0.5, 1.0), &square).is_none());
+    }
+
+    // ── D1 ──────────────────────────────────────────────────────────────
+
+    /// Johnson's own numbers: "Via Inductance II" predicts 0.49 nH and
+    /// 1.29 nH for a via pair 0.017 in and 0.12 in apart (h 0.040 in, r
+    /// 0.005 in); each via is half of the pair. With no return via the
+    /// barrel is formula [7.9], 5.08·h·[ln(4h/d) + 1] nH with inches.
+    #[test]
+    fn via_barrel_inductance_matches_johnsons_published_values() {
+        let mm = 25.4;
+        for (s, pair_nh) in [(0.017, 0.49), (0.02, 0.56), (0.03, 0.73), (0.06, 1.00)] {
+            let got = 2.0 * barrel_nh(0.040 * mm, 0.010 * mm, Some(s * mm));
+            assert!((got - pair_nh).abs() < 0.011, "s {s} in: {got} vs {pair_nh}");
+        }
+        let (h, d): (f64, f64) = (0.063, 0.012);
+        let formula_7_9 = 5.08 * h * ((4.0 * h / d).ln() + 1.0);
+        assert!((barrel_nh(h * mm, d * mm, None) - formula_7_9).abs() < 1e-6, "{formula_7_9}");
+        // A far return never gives more than [7.9].
+        assert_eq!(barrel_nh(h * mm, d * mm, Some(500.0)), barrel_nh(h * mm, d * mm, None));
+        // The plane term is the spreading inductance of UG483 Table 2-10:
+        // μ0·h = 128 pH per square at 102 µm, i.e. (μ/2π)·h per e-fold of span.
+        assert!((plane_nh(0.102, 0.15 * std::f64::consts::E.powf(2.0 * std::f64::consts::PI), 0.3) - 0.128).abs() < 0.001);
+    }
+
+    /// The verdict compares the estimate with the budget, not a length.
+    #[test]
+    fn a_crystal_leg_is_judged_on_its_capacitance() {
+        let u1 = part("U1", "F.Cu", (10.0, 10.0), &[("5", "XI", 0.0, 0.0)]);
+        let run = |w: f64, len: f64| {
+            let y1 = part("Y1", "F.Cu", (10.0 + len, 10.0), &[("1", "XI", 0.0, 0.0)]);
+            path_check(&board(LAYERS4, &format!("{PLANES} {u1} {y1} {}", seg("XI", "F.Cu", w, (10.0, 10.0), (10.0 + len, 10.0)))), tie("Y1", "U1", Some("5"), Some("crystal")))
+        };
+        let (layers, planes) = stack4();
+        let per_mm = |w: f64| layers.model("F.Cu", &planes).unwrap().per_mm(w).c_pf_per_mm;
+        // 0.3 mm × 5.7 mm is inside the 6 mm guide but over 0.5 pF.
+        let wide = run(0.3, 5.7);
+        assert!(5.7 * per_mm(0.3) > 0.5);
+        assert_eq!(wide.status, "fail", "{wide:?}");
+        assert!(wide.detail.contains("pF > 0.5 pF"), "{}", wide.detail);
+        assert!(close(wide.measured["est_capacitance_pf"].as_f64().unwrap(), 5.7 * per_mm(0.3)));
+        // 0.1 mm × 5.9 mm is under both.
+        let thin = run(0.1, 5.9);
+        assert!(5.9 * per_mm(0.1) < 0.5);
+        assert_eq!(thin.status, "pass", "{thin:?}");
+        // Under 0.5 pF but past the length guide still fails, on the guide.
+        let long = run(0.1, 6.5);
+        assert!(6.5 * per_mm(0.1) < 0.5);
+        assert_eq!(long.status, "fail", "{long:?}");
+        assert!(long.detail.contains("path 6.5 mm > 6 mm"), "{}", long.detail);
+    }
+
+    fn u1_supply() -> String {
+        part("U1", "F.Cu", (10.0, 10.0), &[("1", "+3V3", 0.0, 0.0), ("2", "GND", 0.0, 1.0)])
+    }
+
+    /// A capacitor beside its pin, both legs routed as tracks: the loop is
+    /// the two legs added up.
+    #[test]
+    fn a_decoupling_loop_adds_the_supply_and_return_legs() {
+        let c1 = part("C1", "F.Cu", (12.0, 10.0), &[("1", "+3V3", 0.0, 0.0), ("2", "GND", 0.0, 1.0)]);
+        let supply = |len: f64| seg("+3V3", "F.Cu", 0.3, (10.0, 10.0), (10.0 + len, 10.0));
+        let ground = seg("GND", "F.Cu", 0.3, (10.0, 11.0), (12.0, 11.0));
+        let (layers, planes) = stack4();
+        let l = layers.model("F.Cu", &planes).unwrap().per_mm(0.3).l_nh_per_mm;
+        let c = path_check(&board(LAYERS4, &format!("{PLANES} {} {c1} {} {ground}", u1_supply(), supply(2.0))), tie("C1", "U1", Some("1"), Some("decoupling")));
+        assert_eq!(c.status, "pass", "{c:?}");
+        assert!(close(c.measured["loop_inductance_nh"].as_f64().unwrap(), 4.0 * l), "{} vs {}", c.measured["loop_inductance_nh"], 4.0 * l);
+        assert_eq!(c.required["budget_nh"], json!(DECOUPLING_LOOP_NH));
+        let legs = c.measured["legs"].as_array().unwrap();
+        assert_eq!(legs.iter().map(|l| (l["net"].as_str().unwrap(), l["carried_by"].as_str().unwrap(), l["to_pad"].as_str().unwrap())).collect::<Vec<_>>(), vec![("+3V3", "tracks", "U1.1"), ("GND", "tracks", "U1.2")]);
+        // Without the pin the same two legs are found.
+        let pinless = path_check(&board(LAYERS4, &format!("{PLANES} {} {c1} {} {ground}", u1_supply(), supply(2.0))), tie("C1", "U1", None, Some("decoupling")));
+        assert_eq!((pinless.status, pinless.measured["loop_inductance_nh"].clone()), ("pass", c.measured["loop_inductance_nh"].clone()));
+        // Review B1/D4: the ground leg missing is not a pass on the supply leg alone…
+        let c = path_check(&board(LAYERS4, &format!("{PLANES} {} {c1} {}", u1_supply(), supply(2.0))), tie("C1", "U1", Some("1"), Some("decoupling")));
+        assert_eq!(c.status, "unverified", "{c:?}");
+        assert!(c.detail.contains("not verified: GND:"), "{}", c.detail);
+        // …but a supply leg that alone is over the budget is a proven failure.
+        let far = part("C1", "F.Cu", (30.0, 10.0), &[("1", "+3V3", 0.0, 0.0), ("2", "GND", 0.0, 1.0)]);
+        assert!(20.0 * l > DECOUPLING_LOOP_NH);
+        let c = path_check(&board(LAYERS4, &format!("{PLANES} {} {far} {}", u1_supply(), supply(20.0))), tie("C1", "U1", Some("1"), Some("decoupling")));
+        assert_eq!(c.status, "fail", "{c:?}");
+        assert!(c.detail.contains("loop inductance") && c.detail.contains("> 6 nH"), "{}", c.detail);
+        // A wide 7 mm pair of legs is under the budget where a length limit
+        // of 6 mm used to fail it.
+        let seven = part("C1", "F.Cu", (17.0, 10.0), &[("1", "+3V3", 0.0, 0.0), ("2", "GND", 0.0, 1.0)]);
+        let lw = layers.model("F.Cu", &planes).unwrap().per_mm(1.0).l_nh_per_mm;
+        assert!(14.0 * lw < DECOUPLING_LOOP_NH);
+        let body = format!("{PLANES} {} {seven} {} {}", u1_supply(), seg("+3V3", "F.Cu", 1.0, (10.0, 10.0), (17.0, 10.0)), seg("GND", "F.Cu", 1.0, (10.0, 11.0), (17.0, 11.0)));
+        assert_eq!(path_check(&board(LAYERS4, &body), tie("C1", "U1", Some("1"), Some("decoupling"))).status, "pass");
+    }
+
+    /// The capacitor on the other side, each leg through its own via: the
+    /// barrels are in the estimate, each with the other leg's via as return.
+    #[test]
+    fn via_barrels_are_part_of_the_loop_inductance() {
+        let c1 = part("C1", "B.Cu", (11.2, 10.0), &[("1", "+3V3", 0.0, 0.0), ("2", "GND", 0.0, 1.0)]);
+        let mut body = format!("{} {c1}", u1_supply());
+        for (net, y) in [("+3V3", 10.0), ("GND", 11.0)] {
+            body.push_str(&format!(" {} {} {}", seg(net, "F.Cu", 0.3, (10.0, y), (10.6, y)), seg(net, "B.Cu", 0.3, (10.6, y), (11.2, y)), via(net, (10.6, y))));
+        }
+        let c = path_check(&board(LAYERS4, &format!("{PLANES} {body}")), tie("C1", "U1", Some("1"), Some("decoupling")));
+        let (layers, planes) = stack4();
+        let height: f64 = layers.gaps.iter().map(|g| g.thickness_mm).sum();
+        // The return via of each leg is the other leg's, 1 mm away.
+        let barrel = MU_OVER_2PI_NH_PER_MM * height * (1.0_f64 / 0.15).ln();
+        let tracks = 0.6 * (layers.model("F.Cu", &planes).unwrap().per_mm(0.3).l_nh_per_mm + layers.model("B.Cu", &planes).unwrap().per_mm(0.3).l_nh_per_mm);
+        for leg in c.measured["legs"].as_array().unwrap() {
+            assert_eq!((leg["vias"].clone(), leg["path_mm"].clone()), (json!(1), json!(1.2)), "{leg}");
+            assert!(close(leg["via_barrel_mm"].as_f64().unwrap(), height), "{leg}");
+            assert!(close(leg["via_inductance_nh"].as_f64().unwrap(), barrel), "{leg} vs {barrel}");
+            assert!(close(leg["est_inductance_nh"].as_f64().unwrap(), tracks + barrel), "{leg}");
+        }
+        assert!(barrel > 0.5, "a through via is not negligible: {barrel}");
+        assert!(close(c.measured["loop_inductance_nh"].as_f64().unwrap(), 2.0 * (tracks + barrel)), "{c:?}");
+        assert_eq!(c.status, "pass", "{c:?}");
+        // A lone leg has no return via to pair with: formula [7.9].
+        let lone = tie_path(
+            &net_graph("+3V3", &board_copper(&board(LAYERS4, &body))["+3V3"], &copper_pads(&board(LAYERS4, &body)), &konnect_sexp::board::vias(&board(LAYERS4, &body)).items, &layers),
+            "+3V3",
+            &copper_pads(&board(LAYERS4, &body)).iter().filter(|p| p.reference == "C1").collect::<Vec<_>>(),
+            &copper_pads(&board(LAYERS4, &body)).iter().filter(|p| p.reference == "U1").collect::<Vec<_>>(),
+            &layers,
+            &planes,
+        )
+        .unwrap();
+        assert!(close(lone.via_inductance_nh, barrel_nh(height, 0.3, None)) && lone.via_inductance_nh > barrel);
+    }
+
+    // ── D4 ──────────────────────────────────────────────────────────────
+
+    /// Capacitor and pin each drop to the planes through their own vias: the
+    /// legs are stub + via at each end with the plane between.
+    #[test]
+    fn a_leg_through_the_plane_is_measured_stub_via_plane_via_stub() {
+        let c1 = part("C1", "F.Cu", (20.0, 10.0), &[("1", "+3V3", 0.0, 0.0), ("2", "GND", 0.0, 1.0)]);
+        let mut body = format!("{} {c1}", u1_supply());
+        // Pin side: vias 0.5 mm above / below the pads; capacitor side: 0.5 mm to the right.
+        for (net, pin_via, pad_y) in [("+3V3", (10.0, 9.5), 10.0), ("GND", (10.0, 11.5), 11.0)] {
+            body.push_str(&format!(" {} {} {} {}", seg(net, "F.Cu", 0.3, (10.0, pad_y), pin_via), via(net, pin_via), seg(net, "F.Cu", 0.3, (20.0, pad_y), (20.5, pad_y)), via(net, (20.5, pad_y))));
+        }
+        let c = path_check(&board(LAYERS4, &format!("{PLANES} {body}")), tie("C1", "U1", Some("1"), Some("decoupling")));
+        let (layers, planes) = stack4();
+        let core = layers.gaps[1].thickness_mm;
+        let legs = c.measured["legs"].as_array().unwrap();
+        assert_eq!(legs.len(), 2, "{c:?}");
+        for leg in legs {
+            let net = leg["net"].as_str().unwrap();
+            assert_eq!((leg["carried_by"].as_str(), leg["path_mm"].clone(), leg["vias"].clone()), (Some("plane"), json!(1.0), json!(2)), "{leg}");
+            // Either net: 10.5 mm along x, 0.5 mm along y between its two vias.
+            let span = (10.5_f64).hypot(0.5);
+            assert!(close(leg["plane_span_mm"].as_f64().unwrap(), span), "{leg}");
+            // The loop height of the plane part is the In1–In2 core.
+            assert!(close(leg["plane_inductance_nh"].as_f64().unwrap(), MU_OVER_2PI_NH_PER_MM * core * (span / 0.15).ln()), "{leg}");
+            // Barrels run from F.Cu to the net's own plane only.
+            let depth = if net == "GND" { layers.gaps[0].thickness_mm } else { layers.gaps[0].thickness_mm + core };
+            assert!(close(leg["via_barrel_mm"].as_f64().unwrap(), 2.0 * depth), "{leg}");
+            let tracks = layers.model("F.Cu", &planes).unwrap().per_mm(0.3).l_nh_per_mm;
+            let sum = leg["track_inductance_nh"].as_f64().unwrap() + leg["via_inductance_nh"].as_f64().unwrap() + leg["plane_inductance_nh"].as_f64().unwrap();
+            assert!(close(leg["track_inductance_nh"].as_f64().unwrap(), tracks) && close(leg["est_inductance_nh"].as_f64().unwrap(), sum), "{leg}");
+        }
+        let total: f64 = legs.iter().map(|l| l["est_inductance_nh"].as_f64().unwrap()).sum();
+        assert!(close(c.measured["loop_inductance_nh"].as_f64().unwrap(), total));
+        assert_eq!(c.status, if total <= DECOUPLING_LOOP_NH { "pass" } else { "fail" }, "{c:?}");
+        // The pin's via missing: that end has no way into the plane.
+        let cut = body.replace(&via("+3V3", (10.0, 9.5)), "");
+        let c = path_check(&board(LAYERS4, &format!("{PLANES} {cut}")), tie("C1", "U1", Some("1"), Some("decoupling")));
+        assert_eq!(c.status, "unverified", "{c:?}");
+        assert!(c.detail.contains("+3V3: no routed track path, and no via"), "{}", c.detail);
+        // A via outside the net's pour does not count as a drop into it.
+        let small = PLANES.replace("(zone (net \"+3V3\") (layers \"In2.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50))))", "(zone (net \"+3V3\") (layers \"In2.Cu\") (polygon (pts (xy 0 0) (xy 15 0) (xy 15 50) (xy 0 50))))");
+        assert_ne!(small, PLANES);
+        let c = path_check(&board(LAYERS4, &format!("{small} {body}")), tie("C1", "U1", Some("1"), Some("decoupling")));
+        assert_eq!(c.status, "unverified", "{c:?}");
+    }
+
+    /// No reference plane: the inductance is not modelled, so a short leg is
+    /// unverified (never a pass) and a long one fails the guide.
+    #[test]
+    fn a_loop_without_a_reference_plane_is_never_a_pass() {
+        let two = "(general (thickness 1.6)) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal))";
+        let run = |len: f64| {
+            let c1 = part("C1", "F.Cu", (10.0 + len, 10.0), &[("1", "+3V3", 0.0, 0.0), ("2", "GND", 0.0, 1.0)]);
+            let body = format!("{} {c1} {} {}", u1_supply(), seg("+3V3", "F.Cu", 0.3, (10.0, 10.0), (10.0 + len, 10.0)), seg("GND", "F.Cu", 0.3, (10.0, 11.0), (10.0 + len, 11.0)));
+            path_check(&board(two, &body), tie("C1", "U1", Some("1"), Some("decoupling")))
+        };
+        let short = run(2.0);
+        assert_eq!(short.status, "unverified", "{short:?}");
+        assert!(short.detail.contains("no reference plane"), "{}", short.detail);
+        let long = run(8.0);
+        assert_eq!(long.status, "fail", "{long:?}");
+        assert!(long.detail.contains("exceeds the 6 mm guide"), "{}", long.detail);
+    }
+
+    // ── B5, D6 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_length_limit_on_one_half_of_a_pair_applies_to_both() {
+        let mut i = DesignIntent { schema: 1, ..Default::default() };
+        i.nets.insert("M_P".into(), NetIntent { role: "diff_pair".into(), pair: Some("M_N".into()), standard: Some("ethernet_1000base_t".into()), ..Default::default() });
+        i.nets.insert("M_N".into(), NetIntent { role: "diff_pair".into(), pair: Some("M_P".into()), max_length_mm: Some(20.0), ..Default::default() });
+        assert!(i.validate().is_ok());
+        let reqs = requirements(&i);
+        let of = |net: &str| reqs.iter().find(|r| r.net == net).unwrap();
+        assert_eq!((of("M_P").max_length_mm, of("M_N").max_length_mm), (Some(20.0), Some(20.0)));
+        assert_eq!(of("M_P").sources["max_length_mm"], "user, set on pair partner M_N");
+        assert_eq!(of("M_N").sources["max_length_mm"], "user");
+    }
+
+    #[test]
+    fn full_speed_usb_takes_its_skew_from_the_edge_rate_not_the_high_speed_number() {
+        let pair = |standard: &str| {
+            let mut i = DesignIntent { schema: 1, ..Default::default() };
+            i.nets.insert("D_P".into(), NetIntent { role: "diff_pair".into(), pair: Some("D_N".into()), standard: Some(standard.into()), ..Default::default() });
+            i.nets.insert("D_N".into(), NetIntent { role: "diff_pair".into(), pair: Some("D_P".into()), ..Default::default() });
+            requirements(&i).into_iter().find(|r| r.net == "D_P").unwrap()
+        };
+        let fs = pair("usb2_fs");
+        // 10 % of 4 ns at about 6–7 ps/mm.
+        assert!((55.0..75.0).contains(&fs.max_skew_mm.unwrap()), "{:?}", fs.max_skew_mm);
+        assert!(fs.sources["max_skew_mm"].starts_with("edge-rate bound"), "{}", fs.sources["max_skew_mm"]);
+        assert_eq!(fs.effective.impedance_ohm, Some(90.0));
+        let hs = pair("usb2_hs");
+        assert_eq!(hs.max_skew_mm, Some(1.27));
+        assert!(hs.sources["max_skew_mm"].contains("ti-spraar7j"));
+    }
+
+    // ── D5 ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_plane_check_counts_the_filled_pieces_of_the_pour() {
+        let fill = |layer: &str, x: f64| format!("(filled_polygon (layer \"{layer}\") (pts (xy {x} 0) (xy {} 0) (xy {} 10)))", x + 10.0, x + 10.0);
+        let plane = |fills: &str, extra: &str| {
+            let b = board(LAYERS4, &format!("(zone (net \"+3V3\") (layers \"In2.Cu\" \"F.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50))) {fills}) {extra}"));
+            let mut i = DesignIntent { schema: 1, ..Default::default() };
+            i.nets.insert("+3V3".into(), NetIntent { role: "plane".into(), current_a: Some(1.0), ..Default::default() });
+            check_board(&b, &i).into_iter().filter(|c| c.subject == "+3V3").collect::<Vec<_>>()
+        };
+        let of = |checks: &[Check], kind: &str| checks.iter().find(|c| c.kind == kind).cloned();
+        // Not filled: it joins nothing yet.
+        let c = of(&plane("", ""), "plane").unwrap();
+        assert_eq!(c.status, "unverified", "{c:?}");
+        assert!(c.detail.contains("not filled"), "{}", c.detail);
+        // One piece on the inner layer; an outer pour in pieces is normal.
+        let c = of(&plane(&format!("{} {} {}", fill("In2.Cu", 0.0), fill("F.Cu", 0.0), fill("F.Cu", 20.0)), ""), "plane").unwrap();
+        assert_eq!(c.status, "pass", "{c:?}");
+        assert_eq!(c.measured["filled_pieces"], json!({"F.Cu": 2, "In2.Cu": 1}));
+        // The inner pour cut in two, rejoined by a 0.127 mm track: not a pass,
+        // and the track is held to the net's current.
+        let checks = plane(&format!("{} {}", fill("In2.Cu", 0.0), fill("In2.Cu", 20.0)), &seg("+3V3", "In2.Cu", 0.127, (9.0, 1.0), (21.0, 1.0)));
+        let c = of(&checks, "plane").unwrap();
+        assert_eq!(c.status, "unverified", "{c:?}");
+        assert!(c.detail.contains("In2.Cu: 2 pieces") && c.detail.contains("narrowest 0.127 mm"), "{}", c.detail);
+        assert_eq!(c.measured["narrowest_track_mm"], json!(0.127));
+        let width = of(&checks, "track_width").expect("a plane net with current_a has its tracks checked");
+        assert_eq!(width.status, "fail", "{width:?}");
+        // No zone at all is still a failure.
+        let mut i = DesignIntent { schema: 1, ..Default::default() };
+        i.nets.insert("+3V3".into(), NetIntent { role: "plane".into(), ..Default::default() });
+        assert_eq!(check_board(&board(LAYERS4, ""), &i).into_iter().find(|c| c.kind == "plane").unwrap().status, "fail");
     }
 }
 
@@ -5381,6 +6481,9 @@ mod plane_connection_tests {
         assert_eq!(c.measured["target"]["lands_on"], json!(["In1.Cu", "In2.Cu"]));
         let nh = c.measured["est_inductance_nh"].as_f64().unwrap();
         assert!(nh > 0.05 && nh < 0.2, "{nh}");
+        // The barrel down to In1 (0.21 mm, 0.3 mm drill): about 0.06 nH, reported only.
+        let via_nh = c.measured["est_via_nh"].as_f64().unwrap();
+        assert!(via_nh > 0.02 && via_nh < 0.15, "{via_nh}");
         // The +3V3 pad is not on a plane net (its zone is on F.Cu only).
         assert!(checks_with("", &intent()).iter().all(|c| c.measured["net"] == "GND"));
     }

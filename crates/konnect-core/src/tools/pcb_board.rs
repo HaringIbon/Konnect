@@ -907,13 +907,33 @@ fn format_outline(primitives: &[OutlinePrimitive], layer: &str, width: f64) -> S
         .join("")
 }
 
-fn format_gr_text(text: &str, x: f64, y: f64, rot: f64, layer: &str, size: f64) -> String {
+fn format_gr_text(
+    text: &str,
+    x: f64,
+    y: f64,
+    rot: f64,
+    layer: &str,
+    size: f64,
+    mirror: bool,
+) -> String {
     let uuid = new_uuid();
     let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    // KiCad writes a mirrored, centred text as `(justify mirror)` inside
+    // `(effects …)` (EDA_TEXT::Format, doc DB `kicad-10-0-8-eda-text`).
+    let justify = if mirror { " (justify mirror)" } else { "" };
     format!(
         "\n  (gr_text \"{escaped}\"\n    (at {x} {y} {rot})\n    (layer \"{layer}\")\n    \
-         (effects (font (size {size} {size}) (thickness 0.15)))\n    (uuid \"{uuid}\")\n  )"
+         (effects (font (size {size} {size}) (thickness 0.15)){justify})\n    (uuid \"{uuid}\")\n  )"
     )
+}
+
+/// Whether board text on `layer` is mirrored: an explicit `mirror` argument
+/// wins, else text on a back layer (B.Cu, B.SilkS, B.Fab, …) is mirrored so
+/// it reads correctly from the bottom, as KiCad's own text tool does
+/// (`m_textAttrs.m_Mirrored = m_board->IsBackLayer( layer )`, doc DB
+/// `kicad-10-0-8-drawing-tool`). `layer` is KiCad's canonical name.
+fn board_text_mirrored(layer: &str, explicit: Option<bool>) -> bool {
+    explicit.unwrap_or_else(|| layer.starts_with("B."))
 }
 
 /// Every unplated mounting-hole footprint KiCad 10 ships in `MountingHole.pretty`
@@ -1456,7 +1476,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "y":         { "type": "number" },
                     "layer":     { "type": "string", "description": "Layer name", "default": "F.SilkS" },
                     "size":      { "type": "number", "description": "Font size in mm", "default": 1.0 },
-                    "rotation":  { "type": "number", "description": "Rotation in degrees", "default": 0 }
+                    "rotation":  { "type": "number", "description": "Rotation in degrees", "default": 0 },
+                    "mirror":    { "type": "boolean", "description": "Mirror the text. Default: true on back layers (B.SilkS, B.Cu, B.Fab, ...) so it reads correctly from the bottom, false on front and user layers." }
                 },
                 "required": ["board", "text", "x", "y"]
             }),
@@ -2894,11 +2915,12 @@ async fn handle_add_board_text(
     };
     let size = args["size"].as_f64().unwrap_or(1.0);
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
+    let mirror = board_text_mirrored(&layer, args["mirror"].as_bool());
 
     let text_ipc = text.clone();
     let layer_ipc = layer.clone();
     let fallback_reason = match attempt_ipc_write(ctx, &board_path, "board text", move |c| {
-        let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, false);
+        let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, mirror);
         let any = builders::pack_any(&bt, "kiapi.board.types.BoardText");
         c.create_items(vec![any]).map(|_| ())
     })
@@ -2907,6 +2929,7 @@ async fn handle_add_board_text(
         BoardWrite::Ipc(()) => {
             return Ok(CallToolResult::json(&json!({
                 "text": text, "x": x, "y": y, "layer": layer, "size": size,
+                "mirrored": mirror,
                 "source": "ipc"
             })))
         }
@@ -2914,7 +2937,7 @@ async fn handle_add_board_text(
         BoardWrite::File(reason) => reason,
     };
 
-    let gr_text = format_gr_text(&text, x, y, rotation, &layer, size);
+    let gr_text = format_gr_text(&text, x, y, rotation, &layer, size, mirror);
     let content = read_consistent(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
     if let Some(conflict) = write_board_edits(
@@ -2928,6 +2951,7 @@ async fn handle_add_board_text(
 
     Ok(CallToolResult::json(&json!({
         "text": text, "x": x, "y": y, "layer": layer, "size": size,
+        "mirrored": mirror,
         "source": "file",
         "fallback_reason": fallback_reason.evidence(),
         "warning": fallback_reason.warning()
@@ -5339,6 +5363,106 @@ mod board_write_gate_tests {
         assert_eq!(updated.matches("(gr_line").count(), 4, "{updated}");
         assert_eq!(updated.matches("(gr_arc").count(), 4, "{updated}");
         parse_sexp(&updated).expect("rounded outline remains valid KiCad S-expression");
+    }
+
+    /// File fallback: back-layer text carries KiCad's `(justify mirror)`,
+    /// front text does not, and an explicit `mirror` wins.
+    #[tokio::test]
+    async fn bottom_side_board_text_is_mirrored_in_the_file() {
+        for (layer, explicit, mirrored) in [
+            ("B.SilkS", None, true),
+            ("B.Silkscreen", None, true),
+            ("B.Cu", None, true),
+            ("B.Fab", None, true),
+            ("F.SilkS", None, false),
+            ("User.1", None, false),
+            ("B.SilkS", Some(false), false),
+            ("F.Fab", Some(true), true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = blank_board(dir.path());
+            let ctx = ctx_with_ipc(String::new());
+            let mut args = json!({
+                "board": board.to_str().unwrap(),
+                "text": "REV A", "x": 5.0, "y": 5.0, "layer": layer
+            });
+            if let Some(explicit) = explicit {
+                args["mirror"] = json!(explicit);
+            }
+            let res = handle_add_board_text(&args, &ctx).await.unwrap();
+            assert!(!res.is_error, "{layer}: {:?}", res.content);
+            let response: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+            assert_eq!(response["source"], "file");
+            assert_eq!(response["mirrored"], mirrored, "{layer} {explicit:?}");
+            let updated = std::fs::read_to_string(&board).unwrap();
+            let tree = parse_sexp(&updated).expect("valid S-expression");
+            let text = tree.find("gr_text").expect("gr_text written");
+            let justify = text
+                .find("effects")
+                .and_then(|effects| effects.find("justify"))
+                .and_then(|justify| justify.children())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|n| n.as_str().map(str::to_string))
+                .collect::<Vec<_>>();
+            assert_eq!(justify.contains(&"mirror".to_string()), mirrored, "{layer}: {updated}");
+        }
+    }
+
+    /// Live path: the BoardText sent to KiCad has `mirrored` set on a back
+    /// layer and clear on a front one.
+    #[tokio::test]
+    async fn bottom_side_board_text_is_mirrored_over_ipc() {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+        for (layer, mirrored) in [("B.SilkS", true), ("B.Fab", true), ("F.SilkS", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = blank_board(dir.path());
+            let before = std::fs::read_to_string(&board).unwrap();
+            let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+            let seen = sent.clone();
+            let server = super::board_mock::spawn_kicad_holding_board(&board, move |command| {
+                if !command.type_url.ends_with("CreateItems") {
+                    return None;
+                }
+                let request =
+                    kiapi::common::commands::CreateItems::decode(command.value.as_slice()).unwrap();
+                for item in &request.items {
+                    let text = kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap();
+                    seen.lock().unwrap().push(text.text.unwrap().attributes.unwrap().mirrored);
+                }
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::CreateItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        created_items: request
+                            .items
+                            .into_iter()
+                            .map(|item| kiapi::common::commands::ItemCreationResult {
+                                status: Some(kiapi::common::commands::ItemStatus {
+                                    code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                    error_message: String::new(),
+                                }),
+                                item: Some(item),
+                            })
+                            .collect(),
+                    },
+                    "kiapi.common.commands.CreateItemsResponse",
+                ))
+            });
+            let ctx = ctx_with_ipc(server.address().to_string());
+            let args = json!({
+                "board": board.to_str().unwrap(),
+                "text": "REV A", "x": 5.0, "y": 5.0, "layer": layer
+            });
+            let res = handle_add_board_text(&args, &ctx).await.unwrap();
+            assert!(!res.is_error, "{layer}: {:?}", res.content);
+            let response: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+            assert_eq!(response["source"], "ipc", "{response}");
+            assert_eq!(response["mirrored"], mirrored);
+            assert_eq!(*sent.lock().unwrap(), vec![mirrored], "{layer}");
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), before, "live path leaves the file");
+        }
     }
 
     #[tokio::test]
