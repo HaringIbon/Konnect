@@ -2337,8 +2337,23 @@ fn tie_path_check(
         if zones.iter().any(|z| z.net.as_deref() == Some(net)) {
             return Some("it has a zone".to_string());
         }
+        // A ground name (GND, AGND, GND_PA, VSSA, 0V; not XTAL_GND_SENSE),
+        // and the net goes on past the oscillator: to pads of parts other
+        // than the crystal, its target and the load capacitors (capacitors
+        // on another net of the crystal).
         let base = net.rsplit('/').next().unwrap_or(net).to_ascii_uppercase();
-        (base.contains("GND") || base.starts_with("VSS") || base == "0V").then(|| "a ground name".to_string())
+        let ground_name = base == "GND" || base.ends_with("GND") || base.starts_with("GND") || base.starts_with("VSS") || base == "0V";
+        if !ground_name {
+            return None;
+        }
+        let crystal_nets: BTreeSet<&str> = all_pads.iter().filter(|p| p.reference == tie.part).filter_map(|p| p.net.as_deref()).filter(|n| *n != net).collect();
+        let load_cap = |r: &str| ref_kind(r) == "capacitor" && all_pads.iter().any(|p| p.reference == r && p.net.as_deref().is_some_and(|n| crystal_nets.contains(n)));
+        let beyond: BTreeSet<&str> = all_pads
+            .iter()
+            .filter(|p| p.net.as_deref() == Some(net) && p.reference != tie.part && p.reference != tie.to && !load_cap(&p.reference))
+            .map(|p| p.reference.as_str())
+            .collect();
+        (!beyond.is_empty()).then(|| format!("a ground name, and it reaches {}", beyond.into_iter().take(3).collect::<Vec<_>>().join(", ")))
     };
     fn on_net<'a>(pads: &[&'a CopperPad], net: &str) -> Vec<&'a CopperPad> {
         pads.iter().copied().filter(|p| p.net.as_deref() == Some(net)).collect()
@@ -2531,7 +2546,8 @@ fn tie_path_check(
             }
         }
         if !results.iter().any(|r| r.leg.is_some() || r.status == "unverified") {
-            open.push("every net the part shares with the target is a plane net; name a pin to check a routed path".to_string());
+            let why: Vec<String> = results.iter().filter(|r| r.status == "not_judged").map(|r| format!("{}: {}", r.net, r.detail)).collect();
+            open.push(format!("no net the part shares with the target is judged ({}); name a pin to check a routed path", why.join("; ")));
         }
     }
     // The leg the top-level fields describe: the worst judged one, else the first measured.
@@ -3264,6 +3280,22 @@ fn plane_connection_checks(
             chosen.insert(i, (p, others));
         }
 
+        // Per graph node: how far its copper reaches (half the widest
+        // track through it, a via's radius at its centre), and the pad (index
+        // into `net_pads`) a pad node stands for.
+        let mut node_reach = vec![0.0f64; graph.adj.len()];
+        for (a, b, kind) in &graph.edges {
+            let r = match kind {
+                EdgeKind::Track { width, .. } => width / 2.0,
+                EdgeKind::Barrel { via, .. } => net_vias[*via].size / 2.0,
+                EdgeKind::Pad => 0.0,
+            };
+            node_reach[*a] = node_reach[*a].max(r);
+            node_reach[*b] = node_reach[*b].max(r);
+        }
+        let first_pad_node = graph.pads.first().map_or(usize::MAX, |p| p.1);
+        let pad_of_node = |n: usize| n.checked_sub(first_pad_node).filter(|j| *j < net_pads.len());
+
         // Phase 3: one check per pad.
         let mut results: Vec<Check> = Vec::new();
         for (i, pad) in net_pads.iter().enumerate() {
@@ -3297,66 +3329,42 @@ fn plane_connection_checks(
                     }
                 }
                 // The pour as the plane (its only plane layer): the pad must
-                // touch the main piece, or a piece a via or through-hole pad
-                // of the net reaches, or a track joined to one of those or
-                // to the main piece (a way to the rest of the net). Another
-                // part's pad on the same island joins nothing more.
+                // touch the main piece, or a piece whose copper the net's
+                // graph joins to the main piece. Walked breadth-first from
+                // the pad and from every track node, via and through-hole pad
+                // on the piece, through tracks and vias on any layer; it
+                // succeeds only at copper on the pad's layer that touches the
+                // main piece (a node, a via's annulus or a through-hole pad).
+                // A via or through-hole pad is no way down here: the plane is
+                // this layer. Another part's pad on the same island joins
+                // nothing more.
                 let main = z.main_piece(pad.layer);
-                let pad_layer = layers.index(pad.layer);
-                let spans = |v: &konnect_sexp::board::Via| {
-                    let idx: Vec<usize> = v.layers.iter().filter_map(|l| layers.index(l)).collect();
-                    match (idx.iter().min(), idx.iter().max(), pad_layer) {
-                        (Some(lo), Some(hi), Some(i)) => *lo <= i && i <= *hi,
-                        _ => false,
-                    }
+                let on_layer = |n: usize| graph.layer[n].as_deref() == Some(pad.layer);
+                let touches = |n: usize, poly: &[Pt]| match pad_of_node(n) {
+                    Some(j) => !net_pads[j].smd && polygon_distance(&net_pads[j].outline, poly) <= 0.01,
+                    None => on_layer(n) && polygon_distance(&[graph.pos[n]; 3], poly) <= node_reach[n] + 1e-6,
                 };
-                let reaches_drop = |t: usize| {
-                    net_vias.iter().any(|v| spans(v) && polygon_distance(&[(v.x, v.y); 3], &polys[t]) <= v.size / 2.0 + 1e-6)
-                        || net_pads.iter().any(|p| !p.smd && polygon_distance(&p.outline, &polys[t]) <= 0.01)
-                };
-                // A track of the net on the piece (or from the pad itself)
-                // that the graph follows to the main piece, a via or a
-                // through-hole pad joins the piece too: KiCad connects copper
-                // that touches. Breadth-first over the net's graph.
-                let reaches_by_track = |t: usize| {
-                    let mut half = vec![0.0f64; graph.adj.len()];
-                    let mut via_node = vec![false; graph.adj.len()];
-                    for (a, b, kind) in &graph.edges {
-                        match kind {
-                            EdgeKind::Track { width, .. } => {
-                                half[*a] = half[*a].max(width / 2.0);
-                                half[*b] = half[*b].max(width / 2.0);
-                            }
-                            EdgeKind::Barrel { .. } => {
-                                via_node[*a] = true;
-                                via_node[*b] = true;
-                            }
-                            EdgeKind::Pad => {}
-                        }
-                    }
-                    let on_layer = |n: usize| graph.layer[n].as_deref() == Some(pad.layer);
-                    let in_poly = |n: usize, poly: &[Pt]| on_layer(n) && polygon_distance(&[graph.pos[n]; 3], poly) <= half[n] + 1e-6;
-                    let first_pad = graph.pads.first().map_or(usize::MAX, |p| p.1);
-                    let tht = |n: usize| n.checked_sub(first_pad).is_some_and(|j| j < net_pads.len() && !net_pads[j].smd);
+                let joined = |t: usize| {
+                    let Some(m) = main else { return false };
                     let mut seen = vec![false; graph.adj.len()];
-                    let mut queue: Vec<usize> = (0..graph.adj.len()).filter(|&n| n == start || in_poly(n, &polys[t])).collect();
+                    let mut queue: Vec<usize> = (0..graph.adj.len()).filter(|&n| n == start || touches(n, &polys[t])).collect();
                     for &n in &queue {
                         seen[n] = true;
                     }
                     while let Some(n) = queue.pop() {
-                        if via_node[n] || tht(n) || main.is_some_and(|m| in_poly(n, &polys[m])) {
+                        if touches(n, &polys[m]) {
                             return true;
                         }
-                        for &(m, _) in &graph.adj[n] {
-                            if !seen[m] {
-                                seen[m] = true;
-                                queue.push(m);
+                        for &(k, _) in &graph.adj[n] {
+                            if !seen[k] {
+                                seen[k] = true;
+                                queue.push(k);
                             }
                         }
                     }
                     false
                 };
-                let on_plane_piece = touching.iter().any(|&t| Some(t) == main || reaches_drop(t) || reaches_by_track(t));
+                let on_plane_piece = touching.iter().any(|&t| Some(t) == main || joined(t));
                 (nearest, z.has_fill(pad.layer), nearest_target, on_plane_piece)
             });
             let only_layer = !my_planes.iter().any(|l| l.as_str() != pad.layer);
@@ -7827,8 +7835,11 @@ mod third_review_tests {
         assert_eq!((c.status, c.measured["connection"].as_str()), ("fail", Some("pour_island")), "{c:?}");
         let on_main = board(LAYERS2, &format!("{} {c1}", zone("GND", &["B.Cu"], (0.0, 0.0, 50.0, 50.0), &[("B.Cu", 0.0, 0.0, 50.0, 50.0), ("B.Cu", 60.0, 60.0, 61.0, 61.0)])));
         assert_eq!(plane_pad(&on_main, &i, "C1.2").status, "pass");
-        // A via of the net on the island joins it to the rest of the net.
-        let joined = board(LAYERS2, &format!("{pieces} {c1} {}", via("GND", (10.5, 30.5))));
+        // A via of the net on the island joins it only when copper beyond
+        // it reaches the main piece (second follow-up): alone it does not.
+        let lone = board(LAYERS2, &format!("{pieces} {c1} {}", via("GND", (10.5, 30.5))));
+        assert_eq!(plane_pad(&lone, &i, "C1.2").measured["connection"], "pour_island");
+        let joined = board(LAYERS2, &format!("{pieces} {c1} {} {} {}", via("GND", (10.5, 30.5)), seg("GND", "F.Cu", 0.3, (10.5, 30.5), (10.5, 10.0)), via("GND", (10.5, 10.0))));
         assert_eq!(plane_pad(&joined, &i, "C1.2").status, "pass");
     }
 
@@ -8004,5 +8015,74 @@ mod third_review_tests {
         // A track that ends nowhere joins nothing.
         let dangling = board(LAYERS2, &format!("{pieces} {c1} {}", seg("GND", "B.Cu", 0.3, (10.5, 30.5), (30.0, 40.0))));
         assert_eq!(plane_pad(&dangling, &i, "C1.2").measured["connection"], "pour_island");
+    }
+
+    // ── Second follow-up ───────────────────────────────────────────────
+
+    /// The island rule walks to the main piece itself: a via or track that
+    /// goes nowhere does not join an island of the pad's only plane layer
+    /// (review: `zz_island_via_nowhere`), and a via sitting on the island
+    /// counts only through copper that reaches the main piece.
+    #[test]
+    fn an_island_is_joined_only_by_copper_that_reaches_the_main_piece() {
+        let mut i = intent();
+        i.nets.insert("GND".into(), NetIntent { role: "plane".into(), ..Default::default() });
+        let c1 = part("C1", "B.Cu", (9.0, 30.0), &[("1", "SIG", -1.0, 0.0), ("2", "GND", 1.0, 0.0)]);
+        let pieces = zone("GND", &["B.Cu"], (0.0, 0.0, 50.0, 50.0), &[("B.Cu", 0.0, 0.0, 50.0, 20.0), ("B.Cu", 9.0, 29.0, 11.0, 31.0)]);
+        let run = |extra: String| plane_pad(&board(LAYERS2, &format!("{pieces} {c1} {extra}")), &i, "C1.2");
+        // The reviewer's case: a track from the island to a via joined to nothing.
+        let c = run(format!("{} {}", seg("GND", "B.Cu", 0.3, (10.5, 30.5), (10.5, 35.0)), via("GND", (10.5, 35.0))));
+        assert_eq!((c.status, c.measured["connection"].as_str()), ("fail", Some("pour_island")), "{c:?}");
+        // A via on the island itself, going nowhere.
+        let c = run(via("GND", (10.5, 30.5)));
+        assert_eq!(c.measured["connection"], "pour_island", "{c:?}");
+        // A through-hole pad on the island only.
+        let j1 = "(footprint \"J\" (layer \"F.Cu\") (at 9.5 29.5) (property \"Reference\" \"J1\") (pad \"1\" thru_hole circle (at 0 0) (size 0.8 0.8) (drill 0.4) (layers \"*.Cu\") (net \"GND\")))";
+        assert_eq!(run(j1.to_string()).measured["connection"], "pour_island");
+        // The via on the island, up to F.Cu, across, and down into the main piece: joined.
+        let c = run(format!("{} {} {}", via("GND", (10.5, 30.5)), seg("GND", "F.Cu", 0.3, (10.5, 30.5), (10.5, 15.0)), via("GND", (10.5, 15.0))));
+        assert_eq!(c.status, "pass", "{c:?}");
+        // A via whose annulus touches the main piece ends the walk too.
+        let c = run(format!("{} {} {}", via("GND", (10.5, 30.5)), seg("GND", "F.Cu", 0.3, (10.5, 30.5), (10.5, 20.2)), via("GND", (10.5, 20.2))));
+        assert_eq!(c.status, "pass", "{c:?}");
+    }
+
+    /// Only ground names, and only a ground that goes on past the
+    /// oscillator, are exempt; an all-exempt pinless tie says why.
+    #[test]
+    fn only_a_real_ground_net_is_exempt_from_the_crystal_budget() {
+        let run = |nets: (&str, &str), extra: &str| {
+            let (a, b) = nets;
+            let u1 = part("U1", "F.Cu", (10.0, 10.0), &[("5", a, 0.0, 0.0), ("6", b, 0.0, 1.0)]);
+            let y1 = part("Y1", "F.Cu", (14.0, 10.0), &[("1", a, 0.0, 0.0), ("2", b, 0.0, 1.0)]);
+            let body = format!("{u1} {y1} {} {} {extra}", seg(a, "F.Cu", 0.2, (10.0, 10.0), (14.0, 10.0)), seg(b, "F.Cu", 0.2, (10.0, 11.0), (14.0, 11.0)));
+            let mut i = DesignIntent { plane_layers: vec!["B.Cu".into()], ..intent() };
+            i.ties.push(Tie { part: "Y1".into(), to: "U1".into(), kind: Some("crystal".into()), ..Default::default() });
+            check_board(&board(LAYERS2, &body), &i).into_iter().find(|c| c.kind == "tie_path").unwrap()
+        };
+        let status_of = |c: &Check, net: &str| c.measured["legs"].as_array().unwrap().iter().find(|l| l["net"] == net).map(|l| l["status"].as_str().unwrap().to_string()).unwrap();
+        // An oscillator net with GND inside its name is judged: its 30 mm stub fails.
+        let stub = seg("XTAL_GND_SENSE", "F.Cu", 0.2, (14.0, 11.0), (44.0, 11.0));
+        let c = run(("XI", "XTAL_GND_SENSE"), &stub);
+        assert_eq!(c.status, "fail", "{c:?}");
+        assert_eq!(status_of(&c, "XTAL_GND_SENSE"), "fail");
+        // A ground name that only joins the crystal, its target and a load
+        // capacitor is part of the oscillator circuit: judged.
+        let c2 = part("C2", "F.Cu", (14.0, 14.0), &[("1", "XI", 0.0, 0.0), ("2", "AGND", 0.0, 1.0)]);
+        let c = run(("XI", "AGND"), &c2);
+        assert_eq!(status_of(&c, "AGND"), "pass", "{c:?}");
+        // The same ground going on to another part is exempt.
+        let r9 = part("R9", "F.Cu", (30.0, 30.0), &[("1", "AGND", 0.0, 0.0)]);
+        let c = run(("XI", "AGND"), &format!("{c2} {r9}"));
+        assert_eq!(status_of(&c, "AGND"), "not_judged", "{c:?}");
+        // Every shared net exempt: the reason names them, not "a plane net".
+        let u1 = part("U1", "F.Cu", (10.0, 10.0), &[("6", "GND", 0.0, 1.0)]);
+        let y1 = part("Y1", "F.Cu", (14.0, 10.0), &[("2", "GND", 0.0, 1.0), ("1", "XI", 0.0, 0.0)]);
+        let mut i = DesignIntent { plane_layers: vec!["B.Cu".into()], ..intent() };
+        i.ties.push(Tie { part: "Y1".into(), to: "U1".into(), kind: Some("crystal".into()), ..Default::default() });
+        let body = format!("{u1} {y1} {} {}", seg("GND", "F.Cu", 0.2, (10.0, 11.0), (14.0, 11.0)), part("R9", "F.Cu", (30.0, 30.0), &[("1", "GND", 0.0, 0.0)]));
+        let c = check_board(&board(LAYERS2, &body), &i).into_iter().find(|c| c.kind == "tie_path").unwrap();
+        assert_eq!(c.status, "unverified", "{c:?}");
+        assert!(c.detail.contains("no net the part shares with the target is judged (GND: the crystal's ground") && !c.detail.contains("plane net"), "{}", c.detail);
     }
 }
