@@ -2378,6 +2378,14 @@ async fn handle_route_specctra_dsn(
         ),
         _ => None,
     };
+    // No stage-completed line: the counts are the last pass's, an estimate.
+    let warning = match (warning, routing.is_some_and(|r| r.final_score_estimated)) {
+        (w, true) => Some(format!(
+            "{}Freerouting's log has no stage-completed line, so the counts are the last auto-routing pass's (an estimate).",
+            w.map(|w| format!("{w} ")).unwrap_or_default()
+        )),
+        (w, false) => w,
+    };
     Ok(CallToolResult::json(&json!({
         "routing": {
             "complete": complete,
@@ -2385,6 +2393,7 @@ async fn handle_route_specctra_dsn(
             "unrouted": routing.and_then(|r| r.final_score).map(|s| s.unrouted),
             "violations": routing.and_then(|r| r.final_score).map(|s| s.violations),
             "score": routing.and_then(|r| r.final_score).map(|s| s.score),
+            "final_score_estimated": routing.map(|r| r.final_score_estimated),
             "autoroute_passes": routing.map(|r| r.autoroute_passes.len()),
             "source": "Freerouting's own log (diagnostics_path)"
         },

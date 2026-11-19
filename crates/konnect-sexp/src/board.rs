@@ -643,6 +643,34 @@ fn top_level_net_table(tree: &SexpNode) -> HashMap<String, String> {
         .collect()
 }
 
+/// The board's net table, for resolving the `(net …)` of nodes the scans
+/// here do not cover (arcs, zones inside footprints, fills): KiCad 10's
+/// `(net "GND")`, KiCad ≤ 9's `(net 3)` through the top-level table, or a
+/// zone's `(net 3) (net_name "GND")`.
+#[derive(Debug, Clone, Default)]
+pub struct NetTable(HashMap<String, String>);
+
+/// Read the board's top-level net table (empty for a KiCad 10 file).
+pub fn net_table(tree: &SexpNode) -> NetTable {
+    NetTable(top_level_net_table(tree))
+}
+
+impl NetTable {
+    /// The net name of `item` (`None` when unconnected or without a net).
+    pub fn item_net(&self, item: &SexpNode) -> Option<String> {
+        if let Some(node) = item.find("net") {
+            if net::net_name(node).is_none() && net::net_id(node).is_some_and(|id| id != "0") {
+                // `(net 3) (net_name "GND")`: the zone's own name wins over
+                // a table that may not list the id.
+                if let Some(name) = item.find_str("net_name").filter(|n| !n.is_empty()) {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        resolve_net(item, &self.0)
+    }
+}
+
 /// Resolve an item's `(net …)` child to a net name using both format shapes
 /// (see [`crate::net`]). `None` means unconnected — net 0, the empty name, or
 /// no net node at all. A numeric reference the table cannot resolve keeps the
@@ -1414,6 +1442,25 @@ mod tests {
         // (net 0) is the unconnected pseudo-net, not a net named "0".
         assert_eq!(scan.items[1].net, None);
         assert_eq!(scan.items[1].uuid, None);
+    }
+
+    #[test]
+    fn the_net_table_resolves_arcs_and_zones_in_every_format() {
+        let tree = parse_sexp(KICAD9_BOARD).unwrap();
+        let table = net_table(&tree);
+        let zone = tree.find("zone").unwrap();
+        assert_eq!(table.item_net(zone).as_deref(), Some("GND"));
+        let arc = parse_sexp(
+            "(arc (start 0 0) (mid 1 1) (end 2 0) (width 0.2) (layer \"F.Cu\") (net 2))",
+        )
+        .unwrap();
+        assert_eq!(table.item_net(&arc).as_deref(), Some("Net-(P3-P1)"));
+        // A zone id the table lacks still has its own name.
+        let lone = parse_sexp("(zone (net 9) (net_name \"AGND\"))").unwrap();
+        assert_eq!(table.item_net(&lone).as_deref(), Some("AGND"));
+        let ten = parse_sexp("(zone (net \"+3V3\"))").unwrap();
+        assert_eq!(NetTable::default().item_net(&ten).as_deref(), Some("+3V3"));
+        assert_eq!(table.item_net(&parse_sexp("(arc (net 0))").unwrap()), None);
     }
 
     #[test]

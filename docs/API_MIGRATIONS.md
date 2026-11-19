@@ -2523,7 +2523,26 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
 - **Graph (internal).** `net_graph` joins overlapping track nodes with `Track` edges as long as their distance; path lengths over such joins grow by that distance.
 
 
-## Unreleased (fork): grouped autoroute, per-net SES import, rip-up (Pass 20)
+## Unreleased (fork): Tier 1 third-review fixes
+
+- **`tie_path`, `crystal`.** `budget_pf` (0.5 pF) is compared with the whole node: Σ C′·len over every track of the net plus 0.4 pF per via of the net. A short path with a stub left beside it now fails. Legs add `net_capacitance_pf`, `net_track_mm`, `net_vias`, `net_unmodelled_mm`; `est_capacitance_pf` is still the path's share. `required.sources.budget_pf` says so.
+- **`tie_path`, verdict.** A failure is `unverified` only when the exceeded limit is on a net whose zone was not measured; the loop total still fails when the other legs alone exceed the budget. An inner pour that a via of the net drops into but no measured leg uses now counts as unmeasured. `plane_leg` tries every plane layer, so some legs that were track-only or unmeasured are now measured through the plane.
+- **`tie` and `plan_tie_placement`.** Distances are pad edge to pad edge by the true pad outline (circle, oval, roundrect), not the bounding rectangle: round and oval pads measure farther apart than before.
+- **`plane_connection`.**
+  - A via or track end whose copper overlaps a pad joins it (no track needed): pads that were `unverified` "not connected", or failed `long_stub` / `daisy_chain`, can now pass.
+  - A way down landing on a plane zone with no fill in the file, or only on a smaller piece of the fill than its main piece, gives `unverified` instead of `pass`. Refill zones and save before checking.
+  - New `connection: "pour_island"` (`fail`): a pad whose pour is the net's only plane layer touches only an isolated piece of it. `measured.pour.on_main_piece_or_joined` is new for such pads.
+  - Ways down are assigned by a matching, so fewer pads report `shared_via` / `via_shared_with`.
+  - `switching_hot_loop`: `plane_vias_at_pgnd` counts vias landing on a main fill only; `vias[]` adds `on_main_fill`; enough vias only counting the others is `excepted_unverified`.
+- **`plane` check.** A plane net with no inner pour (two-layer board) is judged on its outer pour's pieces: more than one piece is `unverified`. `measured.judged_layers` is new.
+- **`plane_connection_summary`.** `worst_failing[]` includes `excepted_fail` pads and each entry has `status`.
+- **`export_specctra_dsn`.** A fully fanned plane net leaves the job only when its solid-plane fill joins every via (within its layer span) and through-hole pad into one connected piece; a split plane keeps the net in the job (`kept_for_partial_planes`).
+- **KiCad ≤ 9 boards.** Zones written `(net 3) (net_name "GND")` and arcs written `(net 3)` are now read by the design-intent checks and the Specctra plane test (they were skipped).
+- **`route_specctra_dsn`.** `routing.final_score_estimated` is new: `true` when Freerouting's log had no stage-completed line and the counts are the last pass's; the warning says so.
+- **`tie_path`, pinless `crystal`.** A net with a zone, a `plane` or `power` role, or a ground name (`GND`, `…GND`, `GND…`, `VSS…`, `0V`) that also reaches parts other than the crystal, its target and its load capacitors is a leg with `status: "not_judged"` and a reason; only the oscillator nets are held to the pF budget and path guide. A pinless tie with every shared net exempt is `unverified` and lists each net's reason.
+- **`plane_connection`, `pour_island`.** A piece of the pour counts as the plane when the net's copper (tracks and vias on any layer) joins it to the main piece of that layer. A via or through-hole pad on the piece, or reached from it, counts only if the walk reaches the main piece through it; one joined to nothing leaves the pad `pour_island`.
+
+## Unreleased (fork): grouped autoroute, per-net SES import, rip-up (Pass 22)
 
 - **`export_specctra_dsn`: new optional `nets` and `net_classes`** (arrays of names). Either makes a *grouped* export:
   - Only the named nets (and every member of the named KiCad net classes; `Default` means the nets with no other class) are in the routing job. Every other net leaves the DSN network: its pads stay as obstacles with no net, its copper becomes keep-outs.
