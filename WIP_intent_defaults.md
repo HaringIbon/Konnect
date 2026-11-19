@@ -136,7 +136,7 @@ The limits come from the default stack-up (L′ and C′ from `LayerStack`).
 - `a_pair_without_a_standard_gets_skew_from_its_edge_rate_and_the_stackup_velocity`
 - `standards_are_validated_against_the_role`
 - `power_rise_defaults_to_10c_and_a_power_net_without_current_is_flagged`: 1.5 A gives ≈ 0.56 mm.
-- `tie_kinds_derive_path_limits_from_the_stackup_and_user_values_win`
+- `tie_kinds_give_budgets_and_placement_defaults_and_user_values_win` (Pass 19: budgets and placement defaults, no derived path limit)
 - `a_crystal_tie_fails_placement_beyond_its_derived_limit`
 
 Existing tests changed:
@@ -145,7 +145,7 @@ Existing tests changed:
 
 ## 4. What remains
 
-1. **Routed path-length check for ties: done.** `net_graph` (factored out of `voltage_drop`), `NetGraph::shortest`, `tie_path`; the `tie_path` check reports path_mm, vias, layers and the L/C estimates. See FORK_CHANGES.md Pass 16. Open: via barrels and pads are not in the L/C estimate (no sourced via-inductance formula in the doc DB yet).
+1. **Routed check for ties: done, reworked in Pass 19.** Every leg is judged (each shared net of a crystal; the supply and return legs of a decoupling loop, through tracks or the plane). The verdict compares Σ C′·len with the pF budget, or the loop inductance (tracks + via barrels + plane) with the nH budget, not a length. Via inductance is Howard Johnson's via-pair formula and his [7.9] [docdb `johnson-sigcon-via-inductance`, `johnson-sigcon-via-inductance-2`]. The loop budgets (6 / 5 nH) and placement defaults (2.5 mm) are Konnect judgements. See FORK_CHANGES.md Pass 19. Open: through-hole pads in a plane, outer-layer pours, pads as rectangles, no field-solver or measured cross-check.
 2. **DRC rules for crystal and pair defaults.** `apply_design_intent` already writes length and skew rules from the resolved values. A crystal tie's path limit could become a `length` rule on the crystal net, but only when that net runs between the crystal and the pin alone; the load-capacitor branch complicates this.
 3. **Group matching for RMII (TX group, RX group).** Not modelled; the intent has pair skew only.
 4. **AN2867.** Re-read it if st.com becomes reachable, and replace the AVR186-based crystal budget if ST gives a number.
@@ -157,3 +157,12 @@ Existing tests changed:
 ## 5–6. Drafts
 
 Merged into FORK_CHANGES.md (Pass 16) and docs/API_MIGRATIONS.md ("design-intent defaults and IPC-2152").
+
+## 7. Pass 19 changes to the defaults above
+
+- `usb2_fs` has no published skew default any more; the edge-rate rule gives it.
+- Crystal: 0.5 pF budget compared directly; 6 mm flat length guide; placement default 6 mm.
+- `decoupling` / `core_regulator_cap`: loop budgets 6 / 5 nH over both legs with vias and plane; placement default 2.5 mm; 6 / 3 mm only as the guide for a leg with no line model.
+- `max_length_mm` is a pair-level field.
+- Intent files are validated on every read.
+
