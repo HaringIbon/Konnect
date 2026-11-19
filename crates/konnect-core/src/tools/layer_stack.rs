@@ -218,6 +218,23 @@ impl LineModel {
         }
     }
 
+    /// Per-length line constants of a single trace `width_mm` wide: the
+    /// quasi-TEM relations τ = √εeff / c0, C' = τ / Z0, L' = τ · Z0. Microstrip
+    /// εeff is Hammerstad–Jensen's; a stripline in a homogeneous dielectric
+    /// has εeff = εr.
+    pub(crate) fn per_mm(&self, width_mm: f64) -> PerMm {
+        let z0 = self.impedance(width_mm, None).z_ohm;
+        let er_eff = match *self {
+            LineModel::Microstrip { h_mm, t_mm, er } => eecalc::microstrip(LineGeometry { width_mm, height_mm: h_mm, thickness_mm: t_mm, er, gap_mm: None })
+                .result
+                .er_eff
+                .unwrap_or(er),
+            LineModel::Stripline { er, .. } => er,
+        };
+        let delay = er_eff.sqrt() / C0_MM_PER_PS;
+        PerMm { z0_ohm: z0, er_eff, delay_ps_per_mm: delay, c_pf_per_mm: delay / z0, l_nh_per_mm: delay * z0 / 1000.0 }
+    }
+
     /// The width giving `target_ohm`, by bisection (impedance falls with width).
     pub(crate) fn width_for(&self, target_ohm: f64, gap_mm: Option<f64>) -> Option<f64> {
         let (mut lo, mut hi) = (0.01_f64, 5.0_f64);
@@ -231,6 +248,19 @@ impl LineModel {
         }
         Some((0.5 * (lo + hi) * 10_000.0).round() / 10_000.0)
     }
+}
+
+/// Speed of light, mm/ps.
+pub(crate) const C0_MM_PER_PS: f64 = 0.299_792_458;
+
+/// A line's per-millimetre constants.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) struct PerMm {
+    pub z0_ohm: f64,
+    pub er_eff: f64,
+    pub delay_ps_per_mm: f64,
+    pub c_pf_per_mm: f64,
+    pub l_nh_per_mm: f64,
 }
 
 /// Width bounds on one layer for an impedance target within `tol` (0.1 = ±10 %).
@@ -316,6 +346,26 @@ mod tests {
         let far = LineModel::Stripline { h1_mm: 0.3, h2_mm: 0.3, t_mm: 0.0175, er: 4.4 }.impedance(0.1, None).z_ohm;
         let z = asym.impedance(0.1, None).z_ohm;
         assert!(near < z && z < far, "{near} < {z} < {far}");
+    }
+
+    #[test]
+    fn per_length_constants_match_published_values() {
+        // In air a line propagates at c: 3.3356 ps/mm (1/c0), exact.
+        let air = LineModel::Microstrip { h_mm: 1.0, t_mm: 0.0, er: 1.0 }.per_mm(1.0);
+        assert!((air.delay_ps_per_mm - 3.335_641).abs() < 1e-5, "{air:?}");
+        // Pozar, Microwave Engineering 4e, Example 3.7: εr 2.20, d 1.58 mm,
+        // W 4.87 mm → 50 Ω, εe 1.87: τ = √1.87/c = 4.561 ps/mm, so
+        // C' = τ/Z0 = 0.0912 pF/mm and L' = τ·Z0 = 0.228 nH/mm (±1.5 %, the
+        // Z0 tolerance of that test in eecalc).
+        let p = LineModel::Microstrip { h_mm: 1.58, t_mm: 0.0, er: 2.2 }.per_mm(4.87);
+        assert!((p.delay_ps_per_mm / 4.561 - 1.0).abs() < 0.01, "{p:?}");
+        assert!((p.c_pf_per_mm / 0.0912 - 1.0).abs() < 0.015, "{p:?}");
+        assert!((p.l_nh_per_mm / 0.228 - 1.0).abs() < 0.015, "{p:?}");
+        // FR-4 stripline (εr 4.4): τ = √4.4/c = 6.997 ps/mm = 177.7 ps/in,
+        // the textbook "≈180 ps/in for FR-4 stripline"; L'·C' = τ².
+        let s = LineModel::Stripline { h1_mm: 0.2, h2_mm: 0.2, t_mm: 0.0175, er: 4.4 }.per_mm(0.15);
+        assert!((s.delay_ps_per_mm - 6.997).abs() < 0.001, "{s:?}");
+        assert!((s.l_nh_per_mm * 1000.0 * s.c_pf_per_mm - s.delay_ps_per_mm.powi(2)).abs() < 1e-9);
     }
 
     #[test]

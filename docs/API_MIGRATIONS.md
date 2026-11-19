@@ -2397,3 +2397,21 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
 ## Unreleased (fork): route_specctra_dsn reports the router's result
 
 - **`route_specctra_dsn`:** the response gains `routing` (`complete`, `initial_unrouted`, `unrouted`, `violations`, `score`, `autoroute_passes`, `source`) and `warning`. `final_state` is unchanged (job state only); read `routing.complete`, not `final_state`, to know whether the board was routed.
+
+## Unreleased (fork): design-intent defaults and IPC-2152
+
+- **`Tie.max_mm` is optional:** it is `Option<f64>` in Rust. Rust code that builds a `Tie` literal needs `max_mm: Some(x)` and `..Default::default()`. Existing intent JSON files read unchanged.
+- **New optional intent fields:** net `standard` and `rise_time_ns`; tie `kind`, `max_path_mm` and `max_vias`. A tie without `kind` still needs `max_mm` (or `max_path_mm`).
+- **Width requirements change:** IPC-2152 replaces IPC-2221. The two curves cross near 1 A (1 oz outer, 10 °C): below that IPC-2152 is narrower, above it wider. Inner widths are no longer about 2.6× the outer (0.5 oz inner is about 1.5×). Re-run `apply_design_intent` so the rules pick up the new widths.
+- **Existing boards can flip either way in `check_design_intent` `track_width`:** on the Ethernet board, +5V and VBUS (1.5 A, routed at 0.53 mm) now fail against 0.564 mm, while /RP_1V1 goes from fail to pass (0.279 mm needed; 0.9 mm of narrower neck is within the 1 mm allowance).
+- **`engineering_calc` width_for_current:** takes `method` (`"ipc2152"`, the default, or `"ipc2221"`).
+- **Responses:**
+  - `requirements[].sources` and `tie_requirements` are added.
+  - `check_design_intent` adds `required.sources` on tie checks.
+  - `check_design_intent` adds a `tie_path` check for every tie that has a `kind`, `max_path_mm` or `max_vias`. `measured` holds `from_pad`, `to_pad`, `net`, `path_mm`, `vias`, `layers`, `est_inductance_nh`, `est_capacitance_pf` and `unmodelled_mm`. The check is `unverified` with the reason when the pads are not joined by routed tracks, or when a zone may carry the connection.
+  - Intents that set a tie `kind` can now get new `fail` results from `tie_path`.
+  - `get_design_intent` and `set_design_intent` resolve defaults against the project's saved `.kicad_pcb` when it exists (as `apply_design_intent` does), and add `stackup_basis` saying which stack-up was used. Without a board file it reads "assumed default stack-up". Tie and skew defaults in those outputs can change on boards that are not 4-layer.
+- **Diff pairs share pair-level fields:** `standard`, `rise_time_ns`, `impedance_ohm`, `impedance_tolerance_pct`, `gap_mm` and `max_skew_mm` set on one net of a pair now apply to both; the inherited value's source reads "user, set on pair partner …". `set_design_intent` refuses a pair whose two nets set different values.
+- **Edge-rate skew default:** it now converts time to length at the slowest routable signal layer (a stripline, where one is modelled), not the outer microstrip, so it can come out tighter.
+- **Older builds cannot read new intent files:** the intent schema uses `deny_unknown_fields`, so an intent with `standard`, `rise_time_ns`, `kind`, `max_path_mm` or `max_vias` (or a tie without `max_mm`) is refused by builds before this change.
+
