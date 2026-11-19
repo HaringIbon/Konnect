@@ -2415,3 +2415,55 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
 - **Edge-rate skew default:** it now converts time to length at the slowest routable signal layer (a stripline, where one is modelled), not the outer microstrip, so it can come out tighter.
 - **Older builds cannot read new intent files:** the intent schema uses `deny_unknown_fields`, so an intent with `standard`, `rise_time_ns`, `kind`, `max_path_mm` or `max_vias` (or a tie without `max_mm`) is refused by builds before this change.
 
+
+## Unreleased (fork): plane-connection check
+
+- **New `check_design_intent` check, `plane_connection`, one per SMD pad on a plane net.** A plane net is a net with an inner-layer zone (as in `fanout_to_plane`) or an intent `plane` net with a zone. It is on by default, so **existing boards get new `fail`s**: 42 of 140 plane pads on the Ethernet board, 18 of 60 on the module board, 1 of 49 on the demo board.
+  - `measured`: `pad`, `net`, `layer`, `connection`, `stub_mm`, `vias`, `target` (`via` [x, y] or `through_hole_pad`, plus `lands_on`), `est_inductance_nh`, `unmodelled_mm` and `through_pads`. It may also hold `pour`, `via_shared_with`, `warnings` and `exception`.
+  - `connection` is one of `via`, `via_in_pad`, `pour`, `long_stub`, `daisy_chain`, `shared_via`, `no_via`, `none`, `invalid_limit` or `excepted`.
+  - `required`: `max_stub_mm` and its `source`.
+  - `stub_mm` is the connecting trace: routed track outside the pad and outside the target via (or through-hole pad). A via in the pad is 0. It is not fan-out's centre-to-centre stub.
+  - **`shared_via` fails** a pad whose plane via is also another part's pad's via. Pads of the same part may share one.
+  - **Via-in-pad warning:** a via inside a pad whose shorter side is under 1 mm adds a tombstoning warning to `warnings`; the status is not changed.
+- **New statuses:** `excepted_pass`, `excepted_fail` and `excepted_unverified`. A pad covered by a `plane_exceptions` entry is judged by that kind's alternative rule. Its `measured.exception` holds the kind's own measurements, and `detail` also says what the plain plane rule would have given. `summary` gains a count for each new status. Callers that only expect pass, fail or unverified must handle them.
+- **New check kind `plane_exception`:** one per exception. It covers the exception-level result (tie points, PGND vias, references the board lacks, an exception that matches no pad) and is pass, fail or unverified.
+- **New response fields:** `check_design_intent` adds `plane_connection` (per net: `by_status` and `worst_failing`). `get_design_intent` and `set_design_intent` add `plane_connection` (the default limit and its source, the overrides, the exceptions).
+- **New optional intent fields:**
+  - `max_plane_stub_mm`, intent-wide and per net. An explicit `null` in `set_design_intent` restores the default.
+  - `plane_exceptions`: a list of tagged objects. `kind` and a non-empty `source` are required, `reason` is optional, and unknown fields are refused. `set_design_intent` replaces the whole list and refuses parts, pins or nets that the saved `.kicad_pcb` lacks.
+  - Existing intent files read unchanged. Builds before this change refuse files that use the new fields (`deny_unknown_fields`).
+- **Exception kinds, one worked example each:**
+
+  ```json
+  {"kind": "switching_hot_loop", "regulator": "U3", "input_caps": ["C20", "C21"], "pgnd_pins": ["U3.7"], "max_path_mm": 3.0, "min_vias": 2, "source": "TI LMR33630 datasheet §10.1"}
+  ```
+  Each input cap's GND pad must join a PGND pin with no via and within `max_path_mm` (default 1 nH ÷ L′, about 3.0 mm), either routed or through a shared filled pour. The PGND node needs at least `min_vias` (default 2) plane vias within the plane-stub limit of the PGND pins or the regulator's PGND pads.
+
+  ```json
+  {"kind": "crystal_local_ground", "crystal": "Y1", "load_caps": ["C3", "C4"], "vss_pin": "U1.47", "source": "ST AN2867 §5"}
+  ```
+  The load caps' and the crystal's pads on the VSS net must join `vss_pin` within `max_path_mm` (default: the crystal trace budget, about 5.5 mm). Vias are allowed but reported.
+
+  ```json
+  {"kind": "split_ground", "analog_net": "AGND", "digital_net": "GND", "tie": "U5.4|U5.9", "source": "ADS1115 datasheet §10"}
+  {"kind": "split_ground", "analog_net": "AGND", "digital_net": "GND", "tie": "NT1", "converter": "U5", "max_tie_mm": 5, "source": "…"}
+  ```
+  There must be exactly one DC tie between the nets: a net-tie footprint, or a part with an R, FB, L, JP or NT reference, besides the named tie and converter. A tie part must be within `max_tie_mm` of the converter. `analog_net` pads are plane-checked against that net's own zones. The check adds a note that ADI MT-031 now prefers a single plane.
+
+  ```json
+  {"kind": "no_plane", "net": "GND", "star_point": "J1.2", "source": "2-layer board"}
+  ```
+  Each SMD pad on the net must reach `star_point` by its own trace, not through another part's pad, within the optional `max_path_mm`. Without `star_point` the pads are `excepted_unverified` ("the plane rule does not apply").
+
+  ```json
+  {"kind": "datasheet", "pad": "U2.5", "rule": "EP to the shield pour only", "source": "XYZ datasheet §9.2"}
+  ```
+  Covers the pads matched by `pad` (`REF.PAD` or `REF`) and/or `net`, and reports them `excepted_unverified` with the rule.
+- **Default limit:** 0.5 nH ÷ L′ of a 0.3 mm outer trace. That is 1.5 mm on JLC04161H-7628, or 1.0 mm when the outer layer has no reference plane.
+- **`fanout_to_plane` is unchanged:** its `max_stub` default stays 2.5 mm, measured centre to centre (see FORK_CHANGES Pass 18).
+- **Connectivity in the shared track graph** (`net_graph`, used by `tie_path` and `voltage_drop` too) now joins copper that KiCad connects but the old exact-node graph missed:
+  - a track end inside a via's annulus;
+  - a dangling track end within (w1 + w2) / 2 of another node;
+  - a track crossing a pad without ending in it.
+
+  As a result, `tie_path` and `voltage_drop` can turn "not routed" or `unverified` into a measured result.

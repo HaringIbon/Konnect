@@ -674,3 +674,113 @@ Code: `design_intent.rs`, `eecalc.rs`, `layer_stack.rs` (and a 3-line `Tie` lite
   - 41 ties measured in about 0.25 s (debug build). 37 pass. 4 are unverified: +3V3 caps joined only by the 3V3 pour (C7, C11, C25, C26).
   - The figures are plausible: Y2 crystal 5.5 mm, 0 vias, 0.41 pF. C15 VCAP 2.4 mm, 1 via, 0.79 nH. C10 VBAT 10.8 mm, 3 vias. R1 CC1 27.2 mm, 3 vias.
 - **Not done:** DRC rules from crystal and pair defaults; RMII group matching; re-reading ST AN2867 (st.com unreachable); migrating the board scripts (`eth_board/build.py` still sets explicit skews and tie lengths, so user values win there).
+
+## Pass 18: plane-connection check
+
+Code: `design_intent.rs`, plus doc updates. Pass 17 is on another branch, so the number is left free.
+
+- **The rule** (user, 2026-11-19): an SMD pad with a ground connection must drop straight to the ground plane through a via, with no long trace, unless documentation says otherwise (an analog/digital ground split, for example). Konnect applies this to every plane net, GND first.
+- **Why a check was needed:** `fanout_to_plane` skips pads that already have a track or via. A GND pad that the autorouter, or a hand route, reached first through a long trace therefore passed silently.
+- **Check `plane_connection`:** `check_design_intent` runs it for every SMD pad on a plane net. A plane net is one with an inner-layer zone (the `fanout_to_plane` default) or an intent `plane` net that has a zone.
+  - **Path search:**
+    - It reuses `net_graph` and its Dijkstra. `shortest_from` is a variant whose weight also sees the step's nodes, so a path can be blocked through a node.
+    - It searches from the pad to the nearest via (or through-hole pad) that lands on a zone layer of the net other than the pad's own. "Lands" means the zone's fill reaches the via (the zone outline when the file has no fill).
+  - **Reported per pad:**
+    - `stub_mm`: the connecting trace, meaning track outside the pad and outside the target via's annulus. A via in the pad is 0, a via butted against the pad is about 0.
+    - `vias`, the target via and the layers it lands on, `est_inductance_nh` (Σ L′·len over the connecting trace, through the `LcSum` factored out of `tie_path`), `connection`, and `through_pads`.
+  - **Statuses:**
+    - **Pass:** `stub_mm` ≤ limit.
+    - **Fail `long_stub`:** the stub is over the limit.
+    - **Fail `no_via`:** the track graph finds no path to a plane via. The detail says "the track graph finds no path", not "unconnected".
+    - **Fail `daisy_chain`:** the pad reaches the plane only through another part's pad copper. The search runs first with foreign-pad copper blocked; a through-hole pad that is itself a way down is not blocked. UG483 calls for one via per land.
+    - **Unverified `none`:** nothing touches the pad yet (not routed).
+  - **Same-layer pour:**
+    - A pad joined to a filled pour of its net on its own layer passes, with `connection: pour`, when a via landing on another zone layer sits in the same pour island within the limit. The distance is a straight line from the pad edge to the via edge, and the detail gives the reason: a pour is far wider than a trace, so this is a real plane connection.
+    - It also passes when the pour's layer is the net's only zone layer, because then the pour is the plane.
+    - It fails when the nearest such via is beyond the limit.
+    - It is `unverified` when the zone has no fill in the file.
+  - **Shared vias fail (`shared_via`)** when a pad's plane via is also the plane via of another part's pad. UG483 p.29 says sharing vias among capacitors "should not be used under any circumstances", and LearnEMC says "Do not let high-frequency decoupling capacitors share a via with an active device". Pads of the same part may share a via, which is reported in `via_shared_with`. This conflicts with the shared-via fan-out planned in WORKFLOW §7 Tier 2; that item should be revisited, or the rule turned into a warning (one `if` in the code).
+  - **Via-in-pad warning:** a via inside a pad whose shorter side is under 1 mm (0402/0603 lands) still counts 0 mm electrically, but adds a `warnings` entry. An open via wicks solder and can tombstone the part, and the board file does not record fill/cap. Source: Eurocircuits PCB assembly guidelines, tombstoning (https://www.eurocircuits.com/pcb-assembly-guidelines-tombstoning/), not in the doc DB (blocked); the 1 mm threshold is a Konnect judgement.
+  - **Summary:** `check_design_intent` returns `plane_connection` with a per-net count by status and the 5 worst failing pads. `summary` counts `excepted_pass`, `excepted_fail` and `excepted_unverified`.
+- **Limit:**
+  - Default: `max_stub_mm` = 0.5 nH ÷ L′ of a 0.3 mm outer trace, floored to 0.1 mm. That is **1.5 mm** on JLC04161H-7628 (L′ = 0.330 nH/mm). The fallback without an outer line model is 1.0 mm.
+  - **No source gives a length; the default is a Konnect judgement:**
+    - AMD/Xilinx UG483 v1.14 [`xilinx-ug483-7series-pcb`]: p.24 "Vias should be butted directly against the pads"; p.30 "When possible, a connecting trace should not be used and the via should butt up against the land"; never share vias between capacitors and "maintain a one-to-one ratio of lands to vias". Table 2-5 gives ≤ 0.5 nH ESL for 0603/0805 MLCCs, which is the source of the budget: the connecting trace adds no more than one small capacitor's own ESL.
+    - TI SLUA457 [`ti-slua457-decoupling`]: "place a via near the VSS pin to a ground plane layer" (no number).
+    - LearnEMC, "Power Bus Decoupling Guidelines … Closely Spaced Power Distribution Planes" [`learnemc-decoupling-closely-spaced-planes`]: "Never use traces! Locate the vias adjacent to the mounting pads"; "If there is no room for the via adjacent to the pad, then move the whole capacitor"; "Do not let high-frequency decoupling capacitors share a via with an active device". No number.
+  - A web search found only blog rules of thumb, so they are not cited. Intel's mounting-inductance page (683073) returned a 404 redirect. ADI MT-101 and ADI's exposed-pad design note returned 502 even after analog.com was allowed.
+  - **Overrides:** `max_plane_stub_mm` per net, then intent-wide, then the default. Each check's `required.source` says which one applied. A limit that is not a positive finite number (a hand-edited file) gives `unverified`, `invalid_limit`, never infinity.
+  - **`fanout_to_plane` stays at 2.5 mm:**
+    - Its `max_stub` is measured pad centre to via centre, and the planner already takes the nearest clear site.
+    - On the three saved boards every fan-out stub is within the new limit: the longest passing connecting trace is 1.40 mm, with a median of 0.1 mm.
+    - In theory, 2.5 mm centre to centre on an 0402 pad is about 1.9 mm of connecting trace, so a fan-out made at the very end of its range would fail this check. That is left visible rather than made more restrictive without evidence.
+- **Exceptions are structured specs, not waivers** (user request, 2026-11-19):
+  - **Form:** `plane_exceptions` is a list of `PlaneException`, a serde-tagged enum (`kind`, `deny_unknown_fields`). Every kind has a mandatory `source` and an optional `reason`. A new kind is one variant plus one arm in `evaluate_plane_exceptions`.
+  - **Every kind is checked:**
+    - Each covered pad gets `excepted_pass`, `excepted_fail` or `excepted_unverified` under the kind's alternative rule, with that rule's measurements in `measured.exception`. The detail also says what the plain plane rule would have given.
+    - Each exception gets a `plane_exception` check.
+    - Covered pads on nets that are not plane nets (`no_plane`) are reported too.
+  - **`switching_hot_loop`** `{regulator, input_caps, pgnd_pins, max_path_mm?, min_vias?}`:
+    - Each input cap's PGND-net pad must join a PGND pin with 0 vias within `max_path_mm`, either by the routed path (`tie_path`) or through a shared filled pour (pad-edge distance).
+    - The default path is 1 nH ÷ L′ (0.3 mm outer), about 3.0 mm: a Konnect judgement reusing the core-regulator budget.
+    - The PGND node needs `min_vias` (default 2, Konnect judgement) plane vias within the plane-stub limit of the PGND pins or the regulator's PGND pads (thermal pad).
+    - Source: TI LMR33630 §10.1 [`ti-lmr33630-layout`]: "the most critical PCB feature is the loop formed by the input capacitor … and power ground"; caps "as close as possible to the VIN and GND terminals"; "an array of heat-sinking vias" to the thermal pad.
+  - **`crystal_local_ground`** `{crystal, load_caps, vss_pin, max_path_mm?}`:
+    - The load caps' and the crystal's pads on the VSS net must join `vss_pin` within the crystal trace budget (about 5.5 mm). Vias are reported, not failed.
+    - Source: ST AN2867, cited by title and flagged as not retrieved (st.com unreachable). It is opt-in, because guidance is mixed (guard ring versus plane).
+  - **`split_ground`** `{analog_net, digital_net, tie: "REF.PAD|REF.PAD" | REF, converter?, max_tie_mm?}`:
+    - There must be exactly one DC tie between the nets. Counted as ties: net-tie footprints (`net_tie_pad_groups` or a NetTie library name), and parts with an R, FB, L, JP or NT reference with pads on both nets, besides the named tie and converter. Capacitors and other parts on both nets are listed in `other_parts_on_both_nets`, not counted.
+    - A tie part must be within `max_tie_mm` (default 5 mm, Konnect judgement) of `converter`. Without `converter` the position is `unverified`.
+    - `analog_net` pads are plane-checked against that net's own zones.
+    - Sources: Johnson [`johnson-edn-adc-grounding`]: one connection "underneath the ADC, and nowhere else". The note also cites ADI MT-031 by title (not retrieved: analog.com returns 502) for its current preference for one solid plane with partitioned placement.
+  - **`no_plane`** `{net, star_point?, max_path_mm?}`:
+    - Each SMD pad must reach `star_point` by its own trace, a routed path that does not pass through another part's pad copper.
+    - Without `star_point` the pads are `excepted_unverified` ("the plane rule does not apply").
+  - **`datasheet`** `{pad?, net?, rule}`: the matched pads (plane nets, or the named net) are `excepted_unverified`, and the rule is echoed back.
+  - **Validation:**
+    - Schema-level: a source is required; pins must be `REF.PAD` and parts `REF`; lists must not be empty; limits must be positive.
+    - Against the board: parts, pins and nets that the saved board lacks are refused by `set_design_intent`, and reported as a failing `plane_exception` check by `check_design_intent`.
+  - Existing intent files deserialize unchanged; a test covers this.
+- **`net_graph` connectivity:** prompted by the independent Pass 16 review, three joins were added. They also affect `tie_path` and `voltage_drop`, and all their existing tests pass unchanged.
+  - **Track end in a via's annulus:** a track node within the via radius plus its half width joins the via. On the Ethernet board, C49.1's track ended 0.0125 mm off a via centre, and the 0.01 mm snap had made that a false `no_via`.
+  - **Dangling track end:** it joins the nearest node whose copper overlaps it, within (w1 + w2) / 2. Track ends and vias now split a crossing segment within w/2 plus their own reach (end half-width, via radius), so a stub that lands off a trunk's centreline joins it.
+  - **Track crossing a pad:** a track that crosses a pad without ending in it gets a node inside the pad. Tracks that end in a pad keep their centre convention, so `tie_path` lengths are unchanged.
+- **Tests:** `design_intent::plane_connection_tests` (19):
+  - default limit and its citation;
+  - a via beside the pad (0.3 mm stub and its L estimate);
+  - via in pad (0 mm, with the tombstoning warning);
+  - a long trace (9.4 mm, fail), per-net and intent-wide overrides;
+  - no via, a via outside the plane zone, and an untouched pad (`unverified`);
+  - daisy chain through C2.2, fixed by the pad's own via;
+  - a via shared with another part fails, while the same part's pads may share;
+  - through-hole and non-plane pads ignored, a through-hole GND pad as a way down;
+  - same-layer pour with a near via, a far via, and no fill;
+  - off-centre via, off-centreline stub, end-to-end gap, and a track crossing the pad;
+  - an invalid limit and unknown references;
+  - one pass/fail test per exception kind (hot loop: path, via count, a detour through another layer; crystal: routed and unrouted; split ground: converter pins, a 0 Ω second tie, a capacitor not counted, a net tie near and far; no plane: own trace, through another pad, no star point; datasheet: rule echoed, source and rule required);
+  - the worked JSON examples parse, while unknown fields, a missing source and an unknown kind are refused;
+  - `set_design_intent` round trip, refusing a part the saved board lacks and a missing source;
+  - old intent files load.
+  - `cargo test -p konnect-core --lib`: 1860 passed, 0 failed, 23 ignored (1841 before).
+- **Offline sanity run** (saved boards, read-only, through a temporary ignored test that was not committed; existing intents, none with exceptions; default 1.5 mm limit):
+
+  | Board | Plane pads | Pass | Fail | Run time |
+  |---|---|---|---|---|
+  | `eth_board` | 140 | 98 | 42 (24 `shared_via`, 12 `long_stub`, 6 `daisy_chain`) | 0.15 s |
+  | `stm32_nrf_module` | 60 | 42 | 18 (17 `shared_via`, 1 `daisy_chain`) | 0.03 s |
+  | `stm32_demo` | 49 | 48 | 1 `daisy_chain` | 0.05 s |
+
+  - **Ethernet board, worst pads:**
+    - U1.99 (GND) reaches the plane only through crystal Y4.2, over 17.8 mm.
+    - U1.28 (+3V3): 9.3 mm. U9.2 (+3V3): 7.2 mm.
+    - C5.1 (+3V3) through FB1.1: 4.5 mm. R20.2 through C36.2: 4.0 mm.
+    - C49.1 (+3V3): 3.8 mm. U4.1 (+3V3): 3.5 mm.
+    - C33.2 through C29.2: 3.5 mm. U1.27 (GND): 3.5 mm. C49.2 (GND): 3.3 mm. U3.14 (GND): 2.5 mm.
+  - **Module board, `shared_via`:** these are mostly MCU supply pins sharing a via with their decoupling capacitor (U1.1 with C11.1, U1.24 with C4.1, U1.36 with C9.1, U1.48 with C5.1, U4.30 with C14.1), plus USB-C J1.A12/B1 with R2.2. That is the pattern LearnEMC warns against.
+  - **Daisy chains on the module and demo boards** (C6.1 through C5.1, C9.1 through C10.1) share one cause: `fanout_to_plane` put C9's via inside C10's same-net pad. Its site check avoids the pad's own copper but not other same-net SMD pads. That is a fan-out issue for a later pass: a via in another part's pad also wicks solder.
+- **Limits and what is not verified:**
+  - Via inductance is not estimated (still no sourced formula in the document database). `est_inductance_nh` covers only the connecting trace.
+  - Pour paths are measured as straight lines, not through the fill geometry.
+  - Thermal-relief spokes count as connections when the fill polygon touches the pad.
+  - `zone_copper` expands `*.Cu` and `F&B.Cu` but no other wildcards.
+  - Nothing has been checked against a live KiCad session or against KiCad's own connectivity; the board results above have not been verified by hand, apart from C9/C10 and C49.
