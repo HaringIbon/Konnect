@@ -119,6 +119,10 @@ pub(crate) struct RoutingSummary {
     /// The last final score the log states (optimizer stage if it ran,
     /// otherwise the auto-routing stage, otherwise the last pass).
     pub final_score: Option<RouterScore>,
+    /// `final_score` is the last pass's score because the log has no
+    /// stage-completed or optimizer line (a truncated or killed run): an
+    /// estimate, not the router's final result.
+    pub final_score_estimated: bool,
 }
 
 impl RoutingSummary {
@@ -146,7 +150,7 @@ fn parse_score(text: &str) -> Option<RouterScore> {
 /// messages; fixture `tests/fixtures/freerouting_2_3_0_run.log`). Lines that
 /// are not log messages (MCP JSON on the same stream) are ignored.
 pub(crate) fn parse_routing_log(log: &str) -> Option<RoutingSummary> {
-    let mut summary = RoutingSummary { initial_unrouted: None, autoroute_passes: Vec::new(), final_score: None };
+    let mut summary = RoutingSummary { initial_unrouted: None, autoroute_passes: Vec::new(), final_score: None, final_score_estimated: false };
     let mut stage_final = None;
     let mut optimizer_final = None;
     for line in log.lines() {
@@ -171,7 +175,11 @@ pub(crate) fn parse_routing_log(log: &str) -> Option<RoutingSummary> {
             optimizer_final = line.split("final score: ").nth(1).and_then(parse_score).or(optimizer_final);
         }
     }
-    summary.final_score = optimizer_final.or(stage_final).or(summary.autoroute_passes.last().copied());
+    summary.final_score = optimizer_final.or(stage_final);
+    if summary.final_score.is_none() {
+        summary.final_score = summary.autoroute_passes.last().copied();
+        summary.final_score_estimated = summary.final_score.is_some();
+    }
     (summary.initial_unrouted.is_some() || summary.final_score.is_some()).then_some(summary)
 }
 
@@ -1167,6 +1175,18 @@ mod routing_log_tests {
         assert_eq!(summary.initial_unrouted, Some(3));
         assert_eq!(summary.complete(), Some(true));
         assert_eq!(parse_routing_log("Freerouting v2.3.0 started\nno scores here"), None);
+    }
+
+    /// Review 3 #10: a log cut off after the passes (no stage-completed or
+    /// optimizer line) gives the last pass's score, marked as an estimate.
+    #[test]
+    fn a_score_from_the_last_pass_is_marked_as_an_estimate() {
+        let full = parse_routing_log(RUN).unwrap();
+        assert!(!full.final_score_estimated);
+        let cut: String = RUN.lines().filter(|l| !l.contains("stage completed")).map(|l| format!("{l}\n")).collect();
+        let summary = parse_routing_log(&cut).unwrap();
+        assert_eq!(summary.final_score, summary.autoroute_passes.last().copied());
+        assert!(summary.final_score_estimated);
     }
 
     #[test]
