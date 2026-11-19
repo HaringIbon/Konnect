@@ -66,6 +66,10 @@ pub(crate) struct NativeExport {
     /// that layer can cut the pour into islands, so the net's own traces must
     /// connect its pads.
     pub kept_for_mixed_planes: Vec<String>,
+    /// Fully fanned plane nets kept in the routing job because their pour on
+    /// a solid plane layer does not reach every via and through-hole pad of
+    /// the net (a partial pour): the plane alone would leave those unjoined.
+    pub kept_for_partial_planes: Vec<String>,
     pub copper_layers: usize,
     pub power_layers: Vec<String>,
     pub custom_rules: bool,
@@ -168,6 +172,9 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
     let fully_fanned = fully_fanned_plane_nets(&board, &removed_planes);
     let (left_to_planes, kept_for_mixed_planes) =
         split_by_plane_layer(fully_fanned, &removed_planes, &mixed);
+    let (left_to_planes, kept_for_partial_planes): (Vec<String>, Vec<String>) = left_to_planes
+        .into_iter()
+        .partition(|net| solid_plane_reaches_every_drop(&board, net, &mixed));
     let dsn = drop_nets(&dsn, &left_to_planes)?;
     let dsn = edge_clearance_keepouts(&dsn, board_edge_clearance_mm(board_path))?;
     // Not `validate_dsn_syntax`: Topola's reader rejects KiCad's own image
@@ -191,7 +198,15 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
     for layer in structure.find_all("layer") {
         let name = dsn_atom(layer, 1, "layer name")?.to_string();
         if !board_copper.contains(&name) {
-            bail!("KiCad's DSN names layer '{name}', which is not a copper layer of the board");
+            // KiCad's exporter writes a renamed layer under its user name;
+            // the plane handling (and the session import) know layers by
+            // KiCad's own names, so such a board is refused, not half-routed.
+            bail!(
+                "KiCad's DSN names layer '{name}', which is not a copper layer of the board by its \
+                 standard name (board copper layers: {}). If the layer was renamed in Board Setup, \
+                 restore the standard name (F.Cu, In<n>.Cu, B.Cu) and export again",
+                board_copper.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
         }
         let index = layer
             .find("property")
@@ -473,6 +488,7 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
         removed_planes,
         left_to_planes,
         kept_for_mixed_planes,
+        kept_for_partial_planes,
         copper_layers,
         power_layers,
         custom_rules,
@@ -549,6 +565,48 @@ fn split_by_plane_layer(
             .iter()
             .any(|plane| &plane.net == net && plane.layer.starts_with("In") && !mixed.contains(&plane.layer))
     })
+}
+
+/// Whether a pour of `net` on a solid plane layer (inner, not `mixed`) lies
+/// under every via and every through-hole pad of the net.
+///
+/// A net leaves the routing job only because its plane joins all its
+/// fan-out vias. A partial pour (a +5V island on a layer that is mostly
+/// ground, beside the net's main pour on a `mixed` layer) joins only the
+/// vias inside it, so such a net must stay in the job. The pour is read by
+/// its outline: clearances and thermal gaps inside it are not considered,
+/// which errs towards leaving a net to its plane only when the outline says
+/// the plane is there.
+fn solid_plane_reaches_every_drop(board: &SexpNode, net: &str, mixed: &BTreeSet<String>) -> bool {
+    let zones = konnect_sexp::board::zones(board).items;
+    let solid = zones
+        .iter()
+        .filter(|zone| zone.net.as_deref() == Some(net))
+        .filter(|zone| {
+            zone.layers
+                .iter()
+                .any(|layer| layer.starts_with("In") && layer.ends_with(".Cu") && !mixed.contains(layer))
+        })
+        .collect::<Vec<_>>();
+    let under_plane = |point: (f64, f64)| {
+        solid
+            .iter()
+            .any(|zone| crate::tools::fanout::point_in_polygon(point, &zone.points))
+    };
+    let vias = konnect_sexp::board::vias(board).items;
+    let pads = crate::tools::fanout::copper_pads(board);
+    vias.iter()
+        .filter(|via| via.net.as_deref() == Some(net))
+        .all(|via| under_plane((via.x, via.y)))
+        && pads
+            .iter()
+            .filter(|pad| !pad.smd && pad.net.as_deref() == Some(net))
+            .all(|pad| {
+                under_plane((
+                    pad.corners.iter().map(|c| c.0).sum::<f64>() / 4.0,
+                    pad.corners.iter().map(|c| c.1).sum::<f64>() / 4.0,
+                ))
+            })
 }
 
 /// Remove nets from a DSN: their `(net …)` in the network, their names in
@@ -1140,6 +1198,89 @@ mod round_trip_tests {
         assert_eq!(left, vec!["GND"]);
         // An outer-layer pour is never a solid plane.
         assert_eq!(kept, vec!["+3V3", "+5V"]);
+    }
+
+    /// Review B4: a net leaves the job only when its solid-plane pour lies
+    /// under every via and through-hole pad of the net.
+    #[test]
+    fn a_partial_pour_on_a_solid_plane_does_not_take_the_net_out_of_the_job() {
+        let synthetic = |zones: &str, extra: &str| {
+            konnect_sexp::parse_sexp(&format!(
+                "(kicad_pcb (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" power) (6 \"In2.Cu\" mixed) (2 \"B.Cu\" signal))
+                  {zones}
+                  (via (at 5 5) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"+5V\"))
+                  (via (at 30 5) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"+5V\"))
+                  (via (at 30 30) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"GND\"))
+                  {extra})"
+            ))
+            .unwrap()
+        };
+        let mixed = BTreeSet::from(["In2.Cu".to_string()]);
+        let island = "(zone (net \"+5V\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10))))";
+        let main = "(zone (net \"+5V\") (layers \"In2.Cu\") (polygon (pts (xy 0 0) (xy 40 0) (xy 40 40) (xy 0 40))))";
+        // The In1 island covers one of the two vias; the pour that covers
+        // both is on the mixed layer, which routes may cut.
+        assert!(!super::solid_plane_reaches_every_drop(&synthetic(&format!("{island} {main}"), ""), "+5V", &mixed));
+        // The same big pour on the solid layer does reach both.
+        let solid = main.replace("In2.Cu", "In1.Cu");
+        assert!(super::solid_plane_reaches_every_drop(&synthetic(&solid, ""), "+5V", &mixed));
+        // A through-hole pad outside the pour counts like a via outside it.
+        let pad = "(footprint \"J\" (layer \"F.Cu\") (at 45 45) (property \"Reference\" \"J1\")
+            (pad \"1\" thru_hole circle (at 0 0) (size 1.6 1.6) (drill 0.8) (layers \"*.Cu\") (net \"+5V\")))";
+        assert!(!super::solid_plane_reaches_every_drop(&synthetic(&solid, pad), "+5V", &mixed));
+        // Other nets' vias do not matter, and a net without any solid pour is not reached.
+        assert!(!super::solid_plane_reaches_every_drop(&synthetic(main, ""), "+5V", &mixed));
+        // End to end on the real fixture: +3V3's In2 pour shrunk to a corner
+        // no longer takes the fully fanned net out of the job.
+        let (_dir, path) = board();
+        let fanned = board_with_fanned_3v3(BOARD);
+        let whole = super::lower(&path, &fanned, DSN).unwrap();
+        assert_eq!(whole.left_to_planes, vec!["+3V3"]);
+        assert!(whole.kept_for_partial_planes.is_empty());
+        let shrunk = with_3v3_pour_shrunk(&fanned);
+        let partial = super::lower(&path, &shrunk, DSN).unwrap();
+        assert!(partial.left_to_planes.is_empty(), "{:?}", partial.left_to_planes);
+        assert_eq!(partial.kept_for_partial_planes, vec!["+3V3"]);
+        let root = super::super::parse_dsn_sexp(&partial.bundle.dsn).unwrap();
+        assert!(root.find("network").unwrap().find_all("net").iter().any(|net| net.get(1).and_then(SexpNode::as_str) == Some("+3V3")));
+    }
+
+    /// The fixture with the outline of every `+3V3` zone replaced by a 1 mm
+    /// triangle far from the board.
+    fn with_3v3_pour_shrunk(board: &str) -> String {
+        let mut out = String::with_capacity(board.len());
+        let mut rest = board;
+        let mut changed = 0;
+        while let Some(start) = rest.find("(zone") {
+            let end = start + balanced_len(&rest[start..]).unwrap();
+            let form = &rest[start..end];
+            out.push_str(&rest[..start]);
+            match (form.contains("(net \"+3V3\")") || form.contains("(net_name \"+3V3\")"), form.find("(polygon")) {
+                (true, Some(at)) => {
+                    let polygon_end = at + balanced_len(&form[at..]).unwrap();
+                    out.push_str(&form[..at]);
+                    out.push_str("(polygon (pts (xy 900 900) (xy 901 900) (xy 901 901)))");
+                    out.push_str(&form[polygon_end..]);
+                    changed += 1;
+                }
+                _ => out.push_str(form),
+            }
+            rest = &rest[end..];
+        }
+        out.push_str(rest);
+        assert!(changed > 0, "the fixture has a +3V3 zone");
+        out
+    }
+
+    /// Review B6: a layer KiCad exports under a user name is refused with
+    /// the reason, never routed with its plane silently ignored.
+    #[test]
+    fn a_renamed_layer_is_refused_with_the_reason() {
+        let (_dir, path) = board();
+        let renamed = DSN.replace("In2.Cu", "PWR");
+        assert_ne!(renamed, DSN);
+        let error = format!("{:#}", super::lower(&path, BOARD, &renamed).unwrap_err());
+        assert!(error.contains("'PWR'") && error.contains("renamed in Board Setup") && error.contains("In2.Cu"), "{error}");
     }
 
     /// A pad rotated within its footprint is written
