@@ -642,12 +642,15 @@ Code: `design_intent.rs`, `eecalc.rs`, `layer_stack.rs` (and a 3-line `Tie` lite
   - `usb2_fs`, `usb2_hs`: 90 Ω ±10 %, skew ≤ 1.27 mm (50 mil) [`ti-spraar7j`]; FS rise time 4 ns [`st-ds14258-stm32h563`], HS 0.5 ns (USB 2.0 spec §7.1.2.2, quoted from memory: usb.org is blocked from this host).
   - `ethernet_100base_tx`: 100 Ω ±10 %, skew 1.27 mm, length ≤ 50.8 mm [`ti-snla387-ethernet-phy-layout`], rise 3 ns [`microchip-lan8742a-ds`]. `ethernet_1000base_t`: skew 0.508 mm.
   - `rmii` (single-ended): length ≤ 152.4 mm [`ti-snla079d-phyter-layout`, `ti-snla387-ethernet-phy-layout`, `microchip-lan8742-routing-checklist`]. No impedance default, because TI says 50 Ω and Microchip 68 Ω.
-  - **Edge-rate rule:** a pair without a published skew gets 10 % of its rise time as length, through the outer layer's propagation delay √εeff/c0. Johnson gives a 20 % skew budget, and an unspecified driver already uses at least 10 % [`johnson-edn-2004-cm-analysis-of-skew`, `johnson-edn-2002-your-layout-is-skewed`]. With a standard, the tighter of the published value and the edge-rate bound wins.
+  - **Edge-rate rule:** a pair without a published skew gets 10 % of its rise time as length, through the slowest routable signal layer's propagation delay √εeff/c0 (a stripline where one is modelled; c/√εr of the slowest dielectric when none is), so the bound is always conservative. Johnson gives a 20 % skew budget, and an unspecified driver already uses at least 10 % [`johnson-edn-2004-cm-analysis-of-skew`, `johnson-edn-2002-your-layout-is-skewed`]. With a standard, the tighter of the published value and the edge-rate bound wins.
   - The gap default stays 0.15 mm: no standard gives a gap.
+  - **Pairs share pair-level fields:** `standard`, `rise_time_ns`, impedance, tolerance, gap and skew set on one net apply to both halves (source "user, set on pair partner …"), so both resolve to the same limits and `dru_rules` emits the pair's impedance and skew rules whichever net sorts first. Different values on the two nets are refused by validation.
 - **Tie kinds (`kind`, `max_path_mm`, `max_vias`):**
   - `crystal`: path ≤ 0.5 pF ÷ C′ of a 0.2 mm outer trace, ≈ 5.5 mm on JLC04161H-7628; 0 vias. The 0.5 pF budget is AVR186's 1 pF XTALIN parasitic less the pads [`microchip-avr186-oscillator-layout`].
   - `core_regulator_cap`: path ≤ 1 nH ÷ L′ of a 0.3 mm outer trace, ≈ 3 mm; 1 via. `decoupling`: 2 nH ÷ L′, ≈ 6 mm; 1 via. The nH budgets are a Konnect choice, about one MLCC's own mounted ESL; ST and Microchip give no number [`st-an5711-stm32h5-hw`, `microchip-lan8742-routing-checklist`]. The output says so.
   - `max_mm` is optional with a kind (it defaults to the path limit). Without a line model for the outer layer the fallbacks are 6, 3 and 6 mm.
+- **Stack-up basis:** `get_design_intent` and `set_design_intent` resolve against the saved `.kicad_pcb` when it exists, like `apply_design_intent`, and report `stackup_basis`; without a board the basis reads "assumed default stack-up".
+- **Width flips on existing boards:** IPC-2152 is narrower than IPC-2221 below about 1 A and wider above. On the Ethernet board +5V and VBUS (1.5 A, routed 0.53 mm) now fail against 0.564 mm, and /RP_1V1 goes fail → pass.
 - **Provenance:** an explicit user value always wins. Every resolved value reports where it came from: `requirements[].sources` (field → `"user"` or the citation) and `tie_requirements[]` in the get, set and apply outputs, and `required.sources` on tie checks.
 - **`LineModel::per_mm`:** gives εeff, delay, C′ and L′ per mm for a microstrip or stripline.
 - **Routed tie path (`tie_path` check):**
@@ -665,7 +668,8 @@ Code: `design_intent.rs`, `eecalc.rs`, `layer_stack.rs` (and a 3-line `Tie` lite
     - `a_detour_fails_on_length_and_the_shortest_branch_counts`.
     - `a_path_through_a_via_to_the_bottom_counts_the_via`: a crystal fails, decoupling passes, a bottom pad on the via counts B.Cu, and no via means no path.
     - `an_unrouted_or_zone_carried_tie_is_unverified_with_the_reason`.
-  - `cargo test -p konnect-core --lib`: 1834 passed, 0 failed, 23 ignored.
+  - `design_intent::review_tests` (7, after an independent review): a standard, rise time or skew on one half of a pair; conflicting pair values refused; the edge-rate skew at the slowest layer (stripline); `get_design_intent` on a saved 2-layer board against the assumed stack-up; a tie without a pin over two shared nets; a through-hole pin joined by a bottom track; `voltage_drop` pinned to the exact least-resistance path on a fixed graph.
+  - `cargo test -p konnect-core --lib`: 1841 passed, 0 failed, 23 ignored.
 - **Sanity check on the saved Ethernet board** (read-only, with every tie given a 1000 mm path limit in memory; no file changed, no KiCad):
   - 41 ties measured in about 0.25 s (debug build). 37 pass. 4 are unverified: +3V3 caps joined only by the 3V3 pour (C7, C11, C25, C26).
   - The figures are plausible: Y2 crystal 5.5 mm, 0 vias, 0.41 pF. C15 VCAP 2.4 mm, 1 via, 0.79 nH. C10 VBAT 10.8 mm, 3 vias. R1 CC1 27.2 mm, 3 vias.

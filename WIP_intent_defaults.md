@@ -1,6 +1,6 @@
 # WIP: design-intent defaults from physics and published guidance
 
-Status, 2026-11-19. Everything below is committed on `wip/intent-defaults`, including the routed tie-path check (§4 item 1, done). `cargo test -p konnect-core --lib`: 1834 passed, 0 failed, 23 ignored. `cargo build --release` builds. The change log is FORK_CHANGES.md "Pass 16: design-intent defaults"; the API notes are in docs/API_MIGRATIONS.md. This file keeps the research detail and the open items (§4 items 2–5); delete it once those are done or tracked elsewhere.
+Status, 2026-11-19. Everything below is committed on `wip/intent-defaults`, including the routed tie-path check (§4 item 1, done). `cargo test -p konnect-core --lib`: 1841 passed, 0 failed, 23 ignored (after the review fixes). `cargo build --release` builds. The change log is FORK_CHANGES.md "Pass 16: design-intent defaults"; the API notes are in docs/API_MIGRATIONS.md. This file keeps the research detail and the open items (§4 items 2–5); delete it once those are done or tracked elsewhere.
 
 Files changed:
 - `crates/konnect-core/src/tools/design_intent.rs`
@@ -87,10 +87,10 @@ ST AN2867 (oscillator guide) was not obtained. www.st.com returns 502 through th
 | `ethernet_1000base_t` | 100 Ω | ±10 % | 0.508 mm | 50.8 mm | none | SNLA387 |
 | `rmii` (single-ended) | none (TI says 50 Ω, Microchip 68 Ω) | none | none | 152.4 mm | none | SNLA079D, SNLA387, LAN8742 checklist |
 
-**Edge-rate rule.** Layout skew may be at most `EDGE_SKEW_FRACTION` = 0.1 of the rise time: half of Johnson's 20 % budget, because the driver already uses at least 10 %. That time becomes a length through the outer layer's propagation delay τ = √εeff / c0 (`LineModel::per_mm`).
-- If the outer layer has no reference plane, the delay uses c/√εr instead. That is slower, so the limit is stricter.
+**Edge-rate rule.** Layout skew may be at most `EDGE_SKEW_FRACTION` = 0.1 of the rise time: half of Johnson's 20 % budget, because the driver already uses at least 10 %. That time becomes a length through the slowest routable signal layer's propagation delay τ = √εeff / c0 (`LineModel::per_mm`); a stripline is slower than the outer microstrip, so this is always the conservative choice (changed after review; it used the outer layer).
+- If no signal layer has a line model, the delay uses c/√εr of the slowest dielectric, which no real line is slower than.
 - The default skew is the tighter of the published value and the edge-rate bound. Both appear in the source string.
-- With a standard, the published value always wins: USB HS's edge-rate bound is about 8 mm, against 1.27 mm published.
+- With a standard, the tighter of the published value and the edge-rate bound wins (both appear in the source string). For the current standards the published value is the tighter one: USB HS's edge-rate bound is about 8 mm, against 1.27 mm published.
 
 **Gap.** The gap default stays 0.15 mm. No standard specifies a gap; it falls out of the impedance solve. The source string says so.
 
@@ -152,7 +152,7 @@ Existing tests changed:
 5. **Board migrations.**
    - `eth_board/build.py` sets `max_skew_mm=ETH_SKEW` (12 mm) and explicit crystal lengths. The user values win, so the reviewer's findings still pass until those are removed and `standard: "ethernet_100base_tx"` and tie `kind`s are set.
    - The eth board's 4.5 mm and 7.7 mm skews will then fail against 1.27 mm. KiCad's skew counts the whole net, including the termination stub.
-   - The eth board currently passes `current_a: 1.5` for +5V/VBUS. With IPC-2152 that gives 0.56 mm outer instead of 0.53 mm.
+   - The eth board passes `current_a: 1.5` for +5V/VBUS. IPC-2152 needs 0.564 mm outer where IPC-2221 gave 0.53 mm, so with this branch +5V and VBUS (routed at 0.53 mm) **fail** `track_width`, while /RP_1V1 goes fail → pass. IPC-2152 is narrower than IPC-2221 below about 1 A and wider above it. Checked read-only on the saved board.
 
 ## 5–6. Drafts
 
