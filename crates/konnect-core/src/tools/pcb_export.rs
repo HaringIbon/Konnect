@@ -263,7 +263,9 @@ pub fn tools() -> Vec<ToolDef> {
              Freerouting cannot route through Specctra planes; zone nets are routed as \
              ordinary nets on the signal layers, and inner layers KiCad types 'power' are not \
              routed on. Refill zones after import. Existing tracks and vias must be locked on \
-             either path. Writes a revision-bound reverse manifest beside the DSN for SES import.",
+             either path, except in a grouped export (nets / net_classes), which routes only \
+             the named nets and holds everything else fixed. Writes a revision-bound reverse \
+             manifest beside the DSN for SES import.",
             json!({
                 "type": "object",
                 "properties": {
@@ -290,6 +292,16 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["auto", "strict", "kicad"],
                         "default": "auto",
                         "description": "'auto': the strict Rust exporter, or KiCad's own exporter when the board is outside the strict profile. 'strict': refuse instead of falling back. 'kicad': always KiCad's exporter."
+                    },
+                    "nets": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Grouped autoroute: route only these nets (plus any net_classes). Every other net and all existing copper, locked or not, stay as fixed obstacles; the session then holds only the group's new copper. Uses KiCad's exporter. Response: group.nets (in the job) and group.not_in_job (with the reason)."
+                    },
+                    "net_classes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Grouped autoroute: route every net of these KiCad net classes ('Default' is the default class)."
                     }
                 },
                 "required": ["board", "output"]
@@ -739,9 +751,10 @@ async fn export_specctra_with_kicad(
     manifest_output_path: &Path,
     source_snapshot: &str,
     strict_reason: &str,
+    group: Option<&crate::specctra::native::RoutingGroup>,
 ) -> anyhow::Result<CallToolResult> {
     let python = crate::specctra::native::kicad_python(&ctx.config.kicad_cli);
-    let native = match crate::specctra::native::export(&python, board_path, source_snapshot).await
+    let native = match crate::specctra::native::export(&python, board_path, source_snapshot, group).await
     {
         Ok(native) => native,
         Err(error) => {
@@ -820,6 +833,22 @@ async fn export_specctra_with_kicad(
                 .to_string(),
         );
     }
+    if let Some(group) = &native.group {
+        warnings.push(format!(
+            "Grouped export: only the {} group net(s) are in the routing job. The {} other \
+             net(s) and all existing copper are fixed obstacles, so the session holds only the \
+             group's new copper. The router sees other nets' pads with the default class \
+             clearance; the import's DRC checks the real rules per net.",
+            group.nets.len(),
+            group.nets_held_fixed
+        ));
+        if !group.not_in_job.is_empty() {
+            warnings.push(format!(
+                "{} requested net(s) are not in the routing job; see group.not_in_job.",
+                group.not_in_job.len()
+            ));
+        }
+    }
     if native.custom_rules {
         warnings.push(
             "The board's .kicad_dru custom rules are not in the DSN; the router does not see \
@@ -846,6 +875,7 @@ async fn export_specctra_with_kicad(
             "left_to_planes": native.left_to_planes,
             "kept_for_mixed_planes": native.kept_for_mixed_planes,
             "kept_for_partial_planes": native.kept_for_partial_planes,
+            "group": native.group,
             "warnings": warnings,
             "capabilities": {
                 "dsn_export_available": true,
@@ -855,6 +885,35 @@ async fn export_specctra_with_kicad(
         })
         .to_string(),
     ))
+}
+
+/// The routing group from `nets` and `net_classes`; `None` when neither is
+/// given. Empty arrays and blank names are refused.
+fn routing_group_argument(
+    args: &serde_json::Value,
+) -> Result<Option<crate::specctra::native::RoutingGroup>, CallToolResult> {
+    let mut group = crate::specctra::native::RoutingGroup::default();
+    for (field, target) in [("nets", &mut group.nets), ("net_classes", &mut group.classes)] {
+        let value = &args[field];
+        if value.is_null() {
+            continue;
+        }
+        let Some(items) = value.as_array() else {
+            return Err(invalid_export_argument(field, "must be an array of names"));
+        };
+        if items.is_empty() {
+            return Err(invalid_export_argument(field, "must name at least one; omit it for the whole board"));
+        }
+        for item in items {
+            match item.as_str().map(str::trim) {
+                Some(name) if !name.is_empty() => {
+                    target.insert(name.to_string());
+                }
+                _ => return Err(invalid_export_argument(field, "every entry must be a non-empty name")),
+            }
+        }
+    }
+    Ok((!group.nets.is_empty() || !group.classes.is_empty()).then_some(group))
 }
 
 async fn handle_export_specctra_dsn(
@@ -873,6 +932,16 @@ async fn handle_export_specctra_dsn(
         return Ok(invalid_export_argument(
             "exporter",
             "must be 'auto', 'strict', or 'kicad'",
+        ));
+    }
+    let group = match routing_group_argument(args) {
+        Ok(group) => group,
+        Err(refusal) => return Ok(refusal),
+    };
+    if group.is_some() && exporter == "strict" {
+        return Ok(invalid_export_argument(
+            "exporter",
+            "a grouped export ('nets' or 'net_classes') uses KiCad's exporter; use 'auto' or 'kicad'",
         ));
     }
 
@@ -959,7 +1028,9 @@ async fn handle_export_specctra_dsn(
     // The strict exporter first, unless the caller asked for KiCad's or the
     // board carries custom rules (which only KiCad's exporter can ignore with
     // a warning; the strict profile refuses them).
-    let strict = if exporter == "kicad" || custom_rules_path.is_file() {
+    let strict = if group.is_some() {
+        Err("grouped export ('nets' or 'net_classes')".to_string())
+    } else if exporter == "kicad" || custom_rules_path.is_file() {
         Err("custom DRC rules or exporter 'kicad'".to_string())
     } else {
         crate::specctra::export_dsn(&board_path, &source_snapshot, &rules)
@@ -983,6 +1054,7 @@ async fn handle_export_specctra_dsn(
                 &manifest_output_path,
                 &source_snapshot,
                 &strict_reason,
+                group.as_ref(),
             )
             .await;
         }
@@ -1855,5 +1927,24 @@ mod fabrication_option_tests {
         };
         let error: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(error["error"]["field"], "layers[1]");
+    }
+}
+
+#[cfg(test)]
+mod routing_group_argument_tests {
+    use super::routing_group_argument;
+    use serde_json::json;
+
+    #[test]
+    fn nets_and_classes_make_a_group_and_bad_entries_are_refused() {
+        assert_eq!(routing_group_argument(&json!({})).unwrap(), None);
+        let group = routing_group_argument(&json!({ "nets": ["/SDA", " /SCL "], "net_classes": ["Power"] }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(group.nets.into_iter().collect::<Vec<_>>(), ["/SCL", "/SDA"]);
+        assert_eq!(group.classes.into_iter().collect::<Vec<_>>(), ["Power"]);
+        assert!(routing_group_argument(&json!({ "nets": [] })).is_err());
+        assert!(routing_group_argument(&json!({ "nets": [""] })).is_err());
+        assert!(routing_group_argument(&json!({ "net_classes": "Power" })).is_err());
     }
 }

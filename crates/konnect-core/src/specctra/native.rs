@@ -73,6 +73,40 @@ pub(crate) struct NativeExport {
     pub copper_layers: usize,
     pub power_layers: Vec<String>,
     pub custom_rules: bool,
+    /// What a grouped export put in the routing job; `None` for a whole-board
+    /// export.
+    pub group: Option<GroupReport>,
+}
+
+/// The nets one grouped autoroute job routes: named nets plus every member
+/// of the named net classes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RoutingGroup {
+    pub nets: BTreeSet<String>,
+    pub classes: BTreeSet<String>,
+}
+
+/// A requested net that is not in the routing job, and why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct NetNotRouted {
+    pub net: String,
+    pub reason: String,
+}
+
+/// What a grouped export did.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct GroupReport {
+    /// The nets in the routing job, sorted.
+    pub nets: Vec<String>,
+    /// Requested nets (directly or through a class) left out of the job.
+    pub not_in_job: Vec<NetNotRouted>,
+    /// Nets of the board's job that are not in the group: their pads stay as
+    /// obstacles with no net, their copper becomes keep-outs.
+    pub nets_held_fixed: usize,
+    /// Existing tracks and vias of the group's own nets written `(type fix)`:
+    /// the router connects to them but neither moves them nor writes them back
+    /// into the session.
+    pub fixed_group_wiring: usize,
 }
 
 /// The Python that can `import pcbnew`: `KONNECT_KICAD_PYTHON` when set, else
@@ -98,9 +132,10 @@ pub(crate) async fn export(
     python: &Path,
     board_path: &Path,
     snapshot: &str,
+    group: Option<&RoutingGroup>,
 ) -> Result<NativeExport> {
     let dsn = run_kicad_exporter(python, board_path, snapshot).await?;
-    lower(board_path, snapshot, &dsn)
+    lower_grouped(board_path, snapshot, &dsn, group)
 }
 
 async fn run_kicad_exporter(python: &Path, board_path: &Path, snapshot: &str) -> Result<String> {
@@ -150,7 +185,19 @@ async fn run_kicad_exporter(python: &Path, board_path: &Path, snapshot: &str) ->
 
 /// Strip planes and build the schema-2 manifest. Separate from the process
 /// call so it can be tested on a stored KiCad DSN.
+#[cfg(test)]
 pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<NativeExport> {
+    lower_grouped(board_path, snapshot, raw_dsn, None)
+}
+
+/// [`lower`], optionally restricted to a routing group: only the group's nets
+/// stay in the job, and all existing copper is fixed.
+pub(crate) fn lower_grouped(
+    board_path: &Path,
+    snapshot: &str,
+    raw_dsn: &str,
+    group: Option<&RoutingGroup>,
+) -> Result<NativeExport> {
     let board = parse_sexp(snapshot).context("parse KiCad IPC board snapshot")?;
     if board.head() != Some("kicad_pcb") {
         bail!("KiCad IPC snapshot root is not 'kicad_pcb'");
@@ -175,7 +222,15 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
     let (left_to_planes, kept_for_partial_planes): (Vec<String>, Vec<String>) = left_to_planes
         .into_iter()
         .partition(|net| solid_plane_reaches_every_drop(&board, net, &mixed));
+    let before_planes = dsn.clone();
     let dsn = drop_nets(&dsn, &left_to_planes)?;
+    let (dsn, group_report) = match group {
+        Some(group) => {
+            let (dsn, report) = restrict_to_group(&board, &dsn, &before_planes, group, &left_to_planes)?;
+            (dsn, Some(report))
+        }
+        None => (dsn, None),
+    };
     let dsn = edge_clearance_keepouts(&dsn, board_edge_clearance_mm(board_path))?;
     // Not `validate_dsn_syntax`: Topola's reader rejects KiCad's own image
     // outlines (`(outline (polygon …))`, which every stock footprint with a
@@ -185,7 +240,12 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
     if root.head() != Some("pcb") {
         bail!("KiCad's Specctra export root is not 'pcb'");
     }
-    let (locked_tracks, locked_vias) = locked_routing(&board)?;
+    // A grouped export fixes every existing item, so it need not be locked.
+    let (locked_tracks, locked_vias) = if group_report.is_some() {
+        existing_routing(&board)?
+    } else {
+        locked_routing(&board)?
+    };
 
     // Layers: every DSN layer must be a copper layer of the board.
     let board_copper = konnect_sexp::layers::copper(&konnect_sexp::layers::layers(&board))
@@ -464,11 +524,13 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
             custom_rules,
             outline: "kicad_native".to_string(),
             plane_layers: power_layers.clone(),
+            existing_routing_fixed: group_report.is_some(),
         },
         layers,
         components,
         nets,
         padstacks,
+        routing_group: group_report.as_ref().map(|report| report.nets.clone()),
     };
     let component_count = manifest.components.len();
     let net_count = manifest.nets.len();
@@ -492,6 +554,7 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
         copper_layers,
         power_layers,
         custom_rules,
+        group: group_report,
     })
 }
 
@@ -1051,6 +1114,194 @@ fn locked_routing(board: &SexpNode) -> Result<(usize, usize)> {
     Ok((tracks.len(), vias.len()))
 }
 
+/// Every existing track and via, locked or not, for a grouped export, which
+/// writes all of them as fixed. Arcs are still refused: KiCad's exporter
+/// writes an arc as the straight chord between its ends
+/// (`kicad-10-0-8-specctra-export`, the wiring loop), so as an obstacle it
+/// would be in the wrong place.
+fn existing_routing(board: &SexpNode) -> Result<(usize, usize)> {
+    if !board.find_all("arc").is_empty() {
+        bail!("board has a routed arc; existing routing must be straight tracks");
+    }
+    Ok((board.find_all("segment").len(), board.find_all("via").len()))
+}
+
+/// The nets of a DSN's `(network …)` with their pin counts, and each class's
+/// members, by their unquoted names.
+/// Net name → pin count, and class name → member nets.
+type DsnNetwork = (BTreeMap<String, usize>, BTreeMap<String, BTreeSet<String>>);
+
+fn dsn_network(dsn: &str) -> Result<DsnNetwork> {
+    let root = parse_dsn_sexp(dsn)?;
+    let network = root.find("network").context("DSN has no network")?;
+    let mut nets = BTreeMap::new();
+    for net in network.find_all("net") {
+        let pins = net
+            .find("pins")
+            .and_then(SexpNode::children)
+            .map_or(0, |pins| pins.len().saturating_sub(1));
+        nets.insert(dsn_atom(net, 1, "net name")?.to_string(), pins);
+    }
+    let mut classes = BTreeMap::new();
+    for class in network.find_all("class") {
+        let name = dsn_atom(class, 1, "class name")?.to_string();
+        let members = class
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .skip(2)
+            .filter_map(SexpNode::as_str)
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        classes.insert(name, members);
+    }
+    Ok((nets, classes))
+}
+
+/// Whether a KiCad net class name selects a DSN class. KiCad writes one DSN
+/// class per combination of classes a net has (`Power,Default`) and the
+/// default class as `kicad_default`.
+fn class_selects(requested: &str, dsn_class: &str) -> bool {
+    if requested == "Default" {
+        // Every class falls back to Default (`Power,Default`); asking for
+        // Default means the nets that have no other class.
+        return dsn_class == "kicad_default" || dsn_class == "Default";
+    }
+    dsn_class == requested || dsn_class.split(',').any(|part| part == requested)
+}
+
+/// Restrict the routing job to a group of nets.
+///
+/// Every other net leaves the `(network …)`, with its existing copper turned
+/// into keep-outs of the copper's own size (the same lowering as a net left to
+/// its plane, [`drop_nets`]). Freerouting reads a pin whose net is not in the
+/// network as a pin with no net, which every net keeps clear of
+/// (`freerouting-2-3-0-network-java`, `insert_component`), and routes only the
+/// nets in the network. Freerouting 2.3.0 has a per-class "ignored by the
+/// autorouter" flag, but nothing in a DSN sets it and its `ignore_net_classes`
+/// setting is `transient`, so the API cannot pass it
+/// (`freerouting-2-3-0-routersettings-java`); leaving the nets out of the DSN
+/// works with any router.
+///
+/// The group's own existing tracks and vias are written `(type fix)`, locked or
+/// not. Freerouting reads `fix` as `SYSTEM_FIXED` (`protect` would be
+/// `USER_FIXED`; `freerouting-2-3-0-wiring-java`, `calc_fixed`), connects new
+/// routes to such copper, never moves it, and leaves it out of the session it
+/// writes (`freerouting-2-3-0-seswriter-java`, `writeNet` skips
+/// `SYSTEM_FIXED`). So the session holds only new copper, and importing it
+/// cannot duplicate a track. KiCad itself writes `fix` only for locked items
+/// and `route` for the rest (`kicad-10-0-8-specctra-export`).
+fn restrict_to_group(
+    board: &SexpNode,
+    dsn: &str,
+    before_planes: &str,
+    group: &RoutingGroup,
+    left_to_planes: &[String],
+) -> Result<(String, GroupReport)> {
+    let (job_nets, _) = dsn_network(dsn)?;
+    // Class membership as KiCad wrote it, before nets left to their planes
+    // were taken out: a class whose every net went to a plane is still the
+    // user's class, and its nets are reported, not refused as unknown.
+    let (_, classes) = dsn_network(before_planes)?;
+    let mut requested = group.nets.clone();
+    for wanted in &group.classes {
+        let matching: Vec<&String> = classes.keys().filter(|name| class_selects(wanted, name)).collect();
+        if matching.is_empty() {
+            bail!(
+                "net class '{wanted}' has no net in the routing job (classes in the job: {})",
+                classes.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+        for name in matching {
+            requested.extend(classes[name].iter().map(|member| member.trim_matches('"').to_string()));
+        }
+    }
+    let board_nets = konnect_sexp::board::PcbConnectivityIndex::build(board)
+        .nets()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let unknown: Vec<&String> = group
+        .nets
+        .iter()
+        .filter(|net| !board_nets.contains(*net) && !job_nets.contains_key(*net))
+        .collect();
+    if !unknown.is_empty() {
+        bail!(
+            "net(s) {} are not on the board",
+            unknown.iter().map(|net| format!("'{net}'")).collect::<Vec<_>>().join(", ")
+        );
+    }
+    let mut not_in_job = Vec::new();
+    let mut routed = Vec::new();
+    for net in &requested {
+        let reason = match job_nets.get(net) {
+            Some(&pins) if pins >= 2 => {
+                routed.push(net.clone());
+                continue;
+            }
+            Some(_) => "it has a single pad, so there is nothing to connect",
+            None if left_to_planes.contains(net) => {
+                "every pad already reaches its plane (fully fanned out), so the plane connects it"
+            }
+            None => "it has no pad to connect (a zone- or track-only net)",
+        };
+        not_in_job.push(NetNotRouted { net: net.clone(), reason: reason.to_string() });
+    }
+    if routed.is_empty() {
+        bail!(
+            "no net of the group needs routing: {}",
+            not_in_job.iter().map(|n| format!("'{}' ({})", n.net, n.reason)).collect::<Vec<_>>().join("; ")
+        );
+    }
+    let others: Vec<String> = job_nets.keys().filter(|net| !routed.contains(*net)).cloned().collect();
+    let dsn = drop_nets(dsn, &others)?;
+    let (dsn, fixed) = fix_wiring(&dsn)?;
+    Ok((
+        dsn,
+        GroupReport { nets: routed, not_in_job, nets_held_fixed: others.len(), fixed_group_wiring: fixed },
+    ))
+}
+
+/// Write every `(wire …)` and `(via …)` of the `(wiring …)` section as
+/// `(type fix)`, replacing whatever type KiCad gave it. Returns the DSN and
+/// how many forms it fixed.
+fn fix_wiring(dsn: &str) -> Result<(String, usize)> {
+    let Some(start) = dsn.find("(wiring") else {
+        return Ok((dsn.to_string(), 0));
+    };
+    let end = start + balanced_len(&dsn[start..]).context("unbalanced DSN wiring")?;
+    let section = &dsn[start..end];
+    let mut out = String::with_capacity(section.len() + 64);
+    let mut rest = &section["(wiring".len()..];
+    out.push_str("(wiring");
+    let mut fixed = 0;
+    loop {
+        let next = ["(wire", "(via "]
+            .iter()
+            .filter_map(|tag| rest.find(tag))
+            .min();
+        let Some(at) = next else {
+            out.push_str(rest);
+            break;
+        };
+        let form_end = at + balanced_len(&rest[at..]).context("unbalanced DSN wiring form")?;
+        out.push_str(&rest[..at]);
+        let form = &rest[at..form_end];
+        let typed = match form.find("(type ") {
+            Some(type_at) => {
+                let type_end = type_at + balanced_len(&form[type_at..]).context("unbalanced DSN type")?;
+                format!("{}(type fix){}", &form[..type_at], &form[type_end..])
+            }
+            None => format!("{}(type fix))", &form[..form.len() - 1]),
+        };
+        out.push_str(&typed);
+        fixed += 1;
+        rest = &rest[form_end..];
+    }
+    Ok((format!("{}{}{}", &dsn[..start], out, &dsn[end..]), fixed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,7 +1439,7 @@ mod round_trip_tests {
     /// The fixture board with every `+3V3` pad made through-hole: such pads
     /// reach the planes on their own, so the fan-out planner reports the net
     /// fully fanned without a via per pad.
-    fn board_with_fanned_3v3(board: &str) -> String {
+    pub(super) fn board_with_fanned_3v3(board: &str) -> String {
         let mut out = String::with_capacity(board.len());
         let mut rest = board;
         while let Some(start) = rest.find("(pad ") {
@@ -1504,6 +1755,239 @@ mod round_trip_tests {
         assert_ne!(edited, BOARD);
         assert!(crate::specctra_ses::parse_import_plan(&path, &edited, &export.bundle.manifest, SES)
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    //! Grouped export (`export_specctra_dsn` with `nets` / `net_classes`) on
+    //! the real KiCad 10.0.8 DSN of the 4-layer fixture board.
+    use super::{balanced_len, fix_wiring, lower, lower_grouped, RoutingGroup};
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    const BOARD: &str = include_str!("../../tests/fixtures/specctra_native_4layer.kicad_pcb");
+    const DSN: &str = include_str!("../../tests/fixtures/specctra_native_4layer.dsn");
+    const SES: &str = include_str!("../../tests/fixtures/specctra_native_4layer.ses");
+
+    fn board_file(board: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcu_board_unrouted.kicad_pcb");
+        std::fs::write(&path, board).unwrap();
+        (dir, path)
+    }
+
+    fn nets(names: &[&str]) -> RoutingGroup {
+        RoutingGroup { nets: names.iter().map(|n| n.to_string()).collect(), classes: BTreeSet::new() }
+    }
+
+    fn classes(names: &[&str]) -> RoutingGroup {
+        RoutingGroup { nets: BTreeSet::new(), classes: names.iter().map(|n| n.to_string()).collect() }
+    }
+
+    fn manifest_nets(manifest: &str) -> Vec<String> {
+        let manifest: serde_json::Value = serde_json::from_str(manifest).unwrap();
+        manifest["nets"].as_array().unwrap().iter().map(|n| n["name"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// The board with an unlocked /SDA track and an unlocked /MOSI track and
+    /// via, and the DSN KiCad writes for them (`(type route)`, as
+    /// `kicad-10-0-8-specctra-export` does for unlocked copper).
+    fn with_unlocked_copper() -> (String, String) {
+        let copper = "\t(segment\n\t\t(start 130 110)\n\t\t(end 135 110)\n\t\t(width 0.2)\n\t\t(layer \"F.Cu\")\n\t\t(net \"/SDA\")\n\t\t(uuid \"aaaaaaaa-0000-0000-0000-000000000001\")\n\t)\n\
+\t(segment\n\t\t(start 130 112)\n\t\t(end 135 112)\n\t\t(width 0.2)\n\t\t(layer \"F.Cu\")\n\t\t(net \"/MOSI\")\n\t\t(uuid \"aaaaaaaa-0000-0000-0000-000000000002\")\n\t)\n\
+\t(via\n\t\t(at 135 112)\n\t\t(size 0.6)\n\t\t(drill 0.3)\n\t\t(layers \"F.Cu\" \"B.Cu\")\n\t\t(net \"/MOSI\")\n\t\t(uuid \"aaaaaaaa-0000-0000-0000-000000000003\")\n\t)\n";
+        let at = BOARD.find("\t(gr_arc").expect("fixture has board graphics");
+        let board = format!("{}{}{}", &BOARD[..at], copper, &BOARD[at..]);
+        let wiring = "  (wiring\n    (wire (path F.Cu 200  130000 -110000  135000 -110000)(net /SDA)(type route))\n    \
+(wire (path F.Cu 200  130000 -112000  135000 -112000)(net /MOSI)(type route))\n    \
+(via \"Via[0-3]_600:300_um\" 135000 -112000 (net /MOSI)(type route))\n  )";
+        let dsn = DSN.replacen("  (wiring\n  )", wiring, 1);
+        assert_ne!(dsn, DSN, "fixture premise: empty wiring");
+        (board, dsn)
+    }
+
+    #[test]
+    fn only_the_group_is_in_the_job_and_the_manifest() {
+        let (_dir, path) = board_file(BOARD);
+        let export = lower_grouped(&path, BOARD, DSN, Some(&nets(&["/SDA", "/SCL"]))).unwrap();
+        let group = export.group.as_ref().unwrap();
+        assert_eq!(group.nets, vec!["/SCL", "/SDA"]);
+        assert!(group.not_in_job.is_empty());
+        let whole = lower(&path, BOARD, DSN).unwrap();
+        assert_eq!(group.nets_held_fixed, whole.bundle.net_count - 2);
+        assert_eq!(manifest_nets(&export.bundle.manifest), vec!["/SCL", "/SDA"]);
+        let root = super::parse_dsn_sexp(&export.bundle.dsn).unwrap();
+        let network = root.find("network").unwrap();
+        assert_eq!(network.find_all("net").len(), 2);
+        // The pins of the other nets stay placed (obstacles), with no net.
+        assert!(export.bundle.dsn.contains("(place U1 "));
+        assert!(!export.bundle.dsn.contains("U1-30"), "/RXD's pins leave the network");
+        let manifest: serde_json::Value = serde_json::from_str(&export.bundle.manifest).unwrap();
+        assert_eq!(manifest["routing_group"], serde_json::json!(["/SCL", "/SDA"]));
+        assert_eq!(manifest["supported_profile"]["existing_routing_fixed"], true);
+        assert!(whole.group.is_none());
+        let whole_manifest: serde_json::Value = serde_json::from_str(&whole.bundle.manifest).unwrap();
+        assert!(whole_manifest.get("routing_group").is_none());
+    }
+
+    #[test]
+    fn net_classes_select_their_members_by_kicad_class_name() {
+        let (_dir, path) = board_file(BOARD);
+        // KiCad writes the class as `Power,Default` (a net in two classes).
+        let power = lower_grouped(&path, BOARD, DSN, Some(&classes(&["Power"]))).unwrap();
+        assert_eq!(power.group.unwrap().nets, vec!["+3V3", "+5V", "GND"]);
+        // `Default` is written `kicad_default`; single-pin nets are not routed.
+        let default = lower_grouped(&path, BOARD, DSN, Some(&classes(&["Default"]))).unwrap();
+        let group = default.group.unwrap();
+        assert!(group.nets.contains(&"/SDA".to_string()) && !group.nets.contains(&"GND".to_string()));
+        assert!(group.not_in_job.iter().any(|n| n.net.starts_with("unconnected-")), "{:?}", group.not_in_job);
+        let error = format!("{:#}", lower_grouped(&path, BOARD, DSN, Some(&classes(&["HighSpeed"]))).unwrap_err());
+        assert!(error.contains("'HighSpeed'") && error.contains("kicad_default"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_net_is_refused_and_a_pinless_one_is_reported() {
+        let (_dir, path) = board_file(BOARD);
+        let error = format!("{:#}", lower_grouped(&path, BOARD, DSN, Some(&nets(&["/SDA", "/NOPE"]))).unwrap_err());
+        assert!(error.contains("'/NOPE'") && error.contains("not on the board"), "{error}");
+        let single = lower_grouped(&path, BOARD, DSN, Some(&nets(&["/SDA", "unconnected-(U1-PD2-Pad32)"]))).unwrap();
+        let group = single.group.unwrap();
+        assert_eq!(group.nets, vec!["/SDA"]);
+        assert_eq!(group.not_in_job.len(), 1);
+        assert!(group.not_in_job[0].reason.contains("single pad"), "{:?}", group.not_in_job);
+        let error = format!("{:#}", lower_grouped(&path, BOARD, DSN, Some(&nets(&["unconnected-(U1-PD2-Pad32)"]))).unwrap_err());
+        assert!(error.contains("no net of the group") && error.contains("single pad"), "{error}");
+    }
+
+    /// Review finding 11: a class whose every net is left to its planes was
+    /// refused as "no net in the routing job"; its nets are now named, each
+    /// with the reason.
+    #[test]
+    fn a_class_left_entirely_to_planes_names_its_nets_and_why() {
+        // +3V3 alone in a class `Supply`, every pad of it through-hole (so it
+        // is fully fanned and left to its In2 plane).
+        let fanned = super::round_trip_tests::board_with_fanned_3v3(BOARD);
+        let dsn = DSN.replacen(
+            "    (class Power,Default +3V3 +5V GND",
+            "    (class Supply +3V3\n      (circuit\n        (use_via \"Via[0-3]_700:350_um\")\n      )\n      (rule\n        (width 400)\n        (clearance 200)\n      )\n    )\n    (class Power,Default +5V GND",
+            1,
+        );
+        assert_ne!(dsn, DSN);
+        let (_dir, path) = board_file(&fanned);
+        let export = lower(&path, &fanned, &dsn).unwrap();
+        assert_eq!(export.left_to_planes, vec!["+3V3"], "fixture premise");
+        let error = format!("{:#}", lower_grouped(&path, &fanned, &dsn, Some(&classes(&["Supply"]))).unwrap_err());
+        assert!(error.contains("'+3V3' (every pad already reaches its plane"), "{error}");
+        // With a routable net beside it, the plane net is reported, not refused.
+        let mut mixed = classes(&["Supply"]);
+        mixed.nets.insert("/SDA".into());
+        let report = lower_grouped(&path, &fanned, &dsn, Some(&mixed)).unwrap().group.unwrap();
+        assert_eq!(report.nets, vec!["/SDA"]);
+        assert_eq!(report.not_in_job.len(), 1);
+        assert_eq!(report.not_in_job[0].net, "+3V3");
+    }
+
+    #[test]
+    fn existing_copper_is_fixed_for_the_group_and_an_obstacle_for_the_rest() {
+        let (board, dsn) = with_unlocked_copper();
+        let (_dir, path) = board_file(&board);
+        // A whole-board export still refuses unlocked copper.
+        let error = format!("{:#}", lower(&path, &board, &dsn).unwrap_err());
+        assert!(error.contains("unlocked"), "{error}");
+        let export = lower_grouped(&path, &board, &dsn, Some(&nets(&["/SDA"]))).unwrap();
+        let out = &export.bundle.dsn;
+        assert_eq!(export.group.as_ref().unwrap().fixed_group_wiring, 1);
+        assert!(out.contains("(net /SDA)(type fix))"), "the group's own track is fixed:\n{out}");
+        assert!(!out.contains("(type route)"), "nothing stays routable");
+        assert!(!out.contains("(net /MOSI)"), "another net's copper leaves the wiring");
+        assert!(out.contains("(keepout \"\" (path F.Cu 200 130000 -112000 135000 -112000))"), "and is an obstacle");
+        assert!(out.contains("(keepout \"\" (circle F.Cu 600 135000 -112000))"));
+        let manifest: serde_json::Value = serde_json::from_str(&export.bundle.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["locked_track_count"], 2, "every existing track is counted");
+        assert_eq!(manifest["supported_profile"]["locked_via_count"], 1);
+    }
+
+    /// The fixture session cut down to `keep`'s nets, as a grouped job
+    /// returns it.
+    fn session_with_only(keep: &[&str]) -> String {
+        let mut out = String::new();
+        let start = SES.find("(network_out").unwrap();
+        let end = start + balanced_len(&SES[start..]).unwrap();
+        out.push_str(&SES[..start]);
+        out.push_str("(network_out\n");
+        let mut rest = &SES[start + "(network_out".len()..end - 1];
+        while let Some(at) = rest.find("(net ") {
+            let form_end = at + balanced_len(&rest[at..]).unwrap();
+            let form = &rest[at..form_end];
+            let name = form[5..].split_whitespace().next().unwrap();
+            if keep.contains(&name) {
+                out.push_str("      ");
+                out.push_str(form);
+                out.push('\n');
+            }
+            rest = &rest[form_end..];
+        }
+        out.push_str("    )");
+        out.push_str(&SES[end..]);
+        out
+    }
+
+    #[test]
+    fn a_grouped_session_imports_on_top_of_unlocked_copper() {
+        let (board, dsn) = with_unlocked_copper();
+        let (_dir, path) = board_file(&board);
+        let export = lower_grouped(&path, &board, &dsn, Some(&nets(&["/SDA", "/SCL"]))).unwrap();
+        let ses = session_with_only(&["/SDA", "/SCL"]);
+        let plan = crate::specctra_ses::parse_import_plan(&path, &board, &export.bundle.manifest, &ses).unwrap();
+        assert!(plan.existing_routing_fixed);
+        assert_eq!((plan.locked_track_count, plan.locked_via_count), (2, 1));
+        assert_eq!(plan.routing_group.as_deref(), Some(&["/SCL".to_string(), "/SDA".to_string()][..]));
+        let per_net = plan.per_net();
+        assert_eq!(per_net.iter().map(|r| r.net.as_str()).collect::<Vec<_>>(), vec!["/SCL", "/SDA"]);
+        assert!(per_net.iter().all(|r| r.tracks > 0 && r.length_mm > 1.0), "{per_net:?}");
+        // A session routing a net outside the group is refused.
+        let full = crate::specctra_ses::parse_import_plan(&path, &board, &export.bundle.manifest, SES).unwrap_err();
+        assert!(format!("{full:#}").contains("unknown net"), "{full:#}");
+        // The whole-board manifest of the same copper still refuses it
+        // (another copy of the board, with the copper locked, is needed).
+        let locked = board.replace("(uuid \"aaaaaaaa", "(locked yes)\n\t\t(uuid \"aaaaaaaa");
+        assert_ne!(locked, board);
+        let whole = lower(&path, &locked, &dsn).unwrap();
+        crate::specctra_ses::parse_import_plan(&path, &locked, &whole.bundle.manifest, SES).unwrap();
+        // The same whole-board manifest on the same board with one track
+        // unlocked is refused because of the lock, before the revision check.
+        let one_unlocked = locked.replacen("(locked yes)\n\t\t(uuid \"aaaaaaaa-0000-0000-0000-000000000002", "(uuid \"aaaaaaaa-0000-0000-0000-000000000002", 1);
+        assert_ne!(one_unlocked, locked);
+        let error = crate::specctra_ses::parse_import_plan(&path, &one_unlocked, &whole.bundle.manifest, SES).unwrap_err();
+        assert!(format!("{error:#}").contains("not locked"), "{error:#}");
+    }
+
+    #[test]
+    fn a_plan_keeps_only_the_requested_nets_and_refuses_strangers() {
+        let (_dir, path) = board_file(BOARD);
+        let export = lower(&path, BOARD, DSN).unwrap();
+        let mut plan = crate::specctra_ses::parse_import_plan(&path, BOARD, &export.bundle.manifest, SES).unwrap();
+        let all = plan.per_net();
+        let sda = all.iter().find(|r| r.net == "/SDA").unwrap().clone();
+        plan.retain_nets(&["/SDA".to_string()].into()).unwrap();
+        assert!(plan.tracks.iter().all(|t| t.net_name == "/SDA"));
+        assert!(plan.vias.iter().all(|v| v.net_name == "/SDA"));
+        assert_eq!(plan.per_net(), vec![sda]);
+        let error = plan.retain_nets(&["/NOPE".to_string()].into()).unwrap_err();
+        assert!(format!("{error:#}").contains("'/NOPE'"), "{error:#}");
+    }
+
+    #[test]
+    fn wiring_forms_are_all_written_fixed() {
+        let dsn = "(pcb x\n  (structure (via \"V1\"))\n  (wiring\n    (wire (path F.Cu 200 0 0 1 1)(net A)(type route))\n    (wire (path F.Cu 200 1 1 2 2)(net A))\n    (via \"V1\" 2 2 (net A)(type protect))\n  )\n)\n";
+        let (out, fixed) = fix_wiring(dsn).unwrap();
+        assert_eq!(fixed, 3);
+        assert_eq!(out.matches("(type fix)").count(), 3, "{out}");
+        assert!(out.contains("(structure (via \"V1\"))"), "the structure's via list is not wiring");
+        assert!(!out.contains("route") && !out.contains("protect"));
+        super::parse_dsn_sexp(&out).unwrap();
+        assert_eq!(fix_wiring("(pcb x)").unwrap(), ("(pcb x)".to_string(), 0));
     }
 }
 

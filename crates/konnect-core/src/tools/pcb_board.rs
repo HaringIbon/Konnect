@@ -1539,6 +1539,43 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
+            "rip_up_nets",
+            "Rip up (delete) tracks, arcs and vias on the live board in one undo step, so a group \
+             can be routed again without a checkpoint restore. Named nets go whole. A named \
+             footprint takes only the copper connected to its pads: a walk outward from them \
+             that stops at other footprints' pads; on a plane net (a zone, or intent role \
+             plane) also at vias and at the pour; and on a power or ground net (plane, intent \
+             role power, a ground-like name, or more than 3 pads) also at the first branch (a \
+             tap onto another track, or 3+ tracks meeting), so a shared trunk and other parts' \
+             taps stay. A segment is taken whole, so a part's own stretch of a trunk up to the \
+             first branch goes with it. Name the net to take all of it. footprint_walk reports \
+             each net's walk and where it stopped. Optionally only items touching a region (a via by \
+             its centre, a track or arc by any part of it; the item goes whole). Locked copper \
+             (hand routes, fan-out) is kept unless include_locked is true and is listed in \
+             locked_kept. Dry run by default; per-net counts and length; items are verified \
+             absent afterwards.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "nets": { "type": "array", "items": { "type": "string" } },
+                    "footprints": { "type": "array", "items": { "type": "string" }, "description": "References; the copper connected to their pads is ripped up (see the walk above)" },
+                    "region": {
+                        "type": "object",
+                        "description": "Board-mm rectangle; omit for the whole board",
+                        "properties": { "x0": { "type": "number" }, "y0": { "type": "number" }, "x1": { "type": "number" }, "y1": { "type": "number" } },
+                        "required": ["x0", "y0", "x1", "y1"],
+                        "additionalProperties": false
+                    },
+                    "include_locked": { "type": "boolean", "default": false },
+                    "dry_run": { "type": "boolean", "default": true }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { super::pcb_routing::handle_rip_up_nets(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "set_footprint_text",
             "Restyle the reference or value text of placed footprints on the live board in one \
              undo step: stroke thickness, character size and visibility. Selects footprints by \
