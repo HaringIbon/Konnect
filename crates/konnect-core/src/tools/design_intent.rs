@@ -900,7 +900,8 @@ pub(crate) fn tie_limits(tie: &Tie, layers: &LayerStack, planes: &BTreeSet<Strin
     let outer = layers.copper.first().map(|c| c.0.clone()).unwrap_or_default();
     let model = layers.model(&outer, planes).ok();
     let floor1 = |v: f64| (v * 10.0).floor() / 10.0;
-    let (path, vias): (Option<(f64, String)>, Option<(u32, String)>) = match tie.kind.as_deref() {
+    type Cited<T> = Option<(T, String)>;
+    let (path, vias): (Cited<f64>, Cited<u32>) = match tie.kind.as_deref() {
         Some("crystal") => (
             Some(match model {
                 Some(m) => {
@@ -1059,25 +1060,92 @@ struct DropResult {
     temp_c: f64,
 }
 
-/// Worst-case voltage drop from `source` to each pad of the net through the
-/// routed tracks and vias (Dijkstra on resistance), assuming the full current
-/// flows along each path: conservative for a net with several loads. Nodes
-/// are per layer; a via joins the layers it spans through its barrel; a
-/// track end, via or pad centre lying on another segment splits it (a T);
-/// a surface pad joins its own layer, a through pad every layer. Copper is
-/// taken at 25 °C plus the allowed rise. Zones are not modelled.
-fn voltage_drop(
-    net: &str,
-    n: &NetIntent,
-    copper: &NetCopper,
-    pads: &[CopperPad],
-    vias: &[konnect_sexp::board::Via],
-    layers: &LayerStack,
-) -> Result<DropResult, String> {
-    let (src_ref, src_pad) = n.source.as_deref().and_then(|s| s.split_once('.')).ok_or("no source")?;
-    let current = n.current_a.ok_or("no current_a")?;
-    let temp_c = 25.0 + n.max_temp_rise_c.unwrap_or(10.0);
-    let oz = |layer: &str| layers.index(layer).map_or(1.0, |i| layers.copper[i].1 / eecalc::MM_PER_OZ);
+/// One conducting piece of a net's routed copper, between two graph nodes.
+#[derive(Debug, Clone)]
+enum EdgeKind {
+    /// A straight run of track on one layer (arcs arrive pre-sampled).
+    Track { len: f64, width: f64, layer: String },
+    /// A via barrel between two consecutive copper layers; `via` indexes the
+    /// net's vias so a path can count distinct vias.
+    Barrel { via: usize, height: f64, drill: f64 },
+    /// A pad joining a node that lies on it (no length).
+    Pad,
+}
+
+/// A net's routed copper as a graph. Nodes are per layer; a via joins the
+/// layers it spans through its barrel; a track end, via or pad centre lying on
+/// another segment splits it (a T); a surface pad joins its own layer, a
+/// through pad every layer. Each pad is a node of its own, named `REF.PAD`.
+/// Zones are not modelled.
+struct NetGraph {
+    edges: Vec<(usize, usize, EdgeKind)>,
+    /// Per node: (neighbour, edge index).
+    adj: Vec<Vec<(usize, usize)>>,
+    pads: Vec<(String, usize)>,
+    /// Per node: its copper layer (`None` for a pad node).
+    layer: Vec<Option<String>>,
+}
+
+impl NetGraph {
+    fn pad(&self, name: &str) -> Option<usize> {
+        self.pads.iter().find(|(n, _)| n == name).map(|(_, node)| *node)
+    }
+
+    /// Multi-source Dijkstra with `weight` per edge: each node's distance and
+    /// the edge it was reached by.
+    fn shortest(&self, starts: &[usize], weight: impl Fn(&EdgeKind) -> f64) -> (Vec<f64>, Vec<Option<usize>>) {
+        let count = self.adj.len();
+        let mut dist = vec![f64::INFINITY; count];
+        let mut via: Vec<Option<usize>> = vec![None; count];
+        #[derive(PartialEq)]
+        struct State(f64, usize);
+        impl Eq for State {}
+        impl PartialOrd for State {
+            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(o)) }
+        }
+        impl Ord for State {
+            fn cmp(&self, o: &Self) -> std::cmp::Ordering { o.0.total_cmp(&self.0) }
+        }
+        let mut heap = BinaryHeap::new();
+        for &s in starts {
+            dist[s] = 0.0;
+            heap.push(State(0.0, s));
+        }
+        while let Some(State(d, u)) = heap.pop() {
+            if d > dist[u] {
+                continue;
+            }
+            for &(v, e) in &self.adj[u] {
+                let nd = d + weight(&self.edges[e].2);
+                if nd < dist[v] {
+                    dist[v] = nd;
+                    via[v] = Some(e);
+                    heap.push(State(nd, v));
+                }
+            }
+        }
+        (dist, via)
+    }
+
+    /// The path from a start to `node`, start first, following `via` back:
+    /// the start node and each (edge, node reached).
+    fn path(&self, via: &[Option<usize>], node: usize) -> (usize, Vec<(&EdgeKind, usize)>) {
+        let mut out = Vec::new();
+        let mut at = node;
+        while let Some(e) = via[at] {
+            let (a, b, kind) = &self.edges[e];
+            out.push((kind, at));
+            at = if *a == at { *b } else { *a };
+            if out.len() > self.edges.len() {
+                break;
+            }
+        }
+        out.reverse();
+        (at, out)
+    }
+}
+
+fn net_graph(net: &str, copper: &NetCopper, pads: &[CopperPad], vias: &[konnect_sexp::board::Via], layers: &LayerStack) -> NetGraph {
     let snap = |p: (f64, f64)| ((p.0 * 100.0).round() as i64, (p.1 * 100.0).round() as i64);
     type NodeKey = (String, (i64, i64));
     let mut ids: HashMap<NodeKey, usize> = HashMap::new();
@@ -1119,7 +1187,7 @@ fn voltage_drop(
             }
         }
     }
-    let mut edges: Vec<(usize, usize, f64)> = Vec::new();
+    let mut edges: Vec<(usize, usize, EdgeKind)> = Vec::new();
     for (a, b, w, layer) in &copper.segments {
         let len = (b.0 - a.0).hypot(b.1 - a.1);
         if len < 1e-9 {
@@ -1140,20 +1208,17 @@ fn voltage_drop(
             let (t0, t1) = (pair[0], pair[1]);
             let p0 = (a.0 + ux * t0, a.1 + uy * t0);
             let p1 = (a.0 + ux * t1, a.1 + uy * t1);
-            let r = eecalc::trace_resistance(t1 - t0, *w, oz(layer), temp_c, None).result.resistance_ohm;
             let (i0, i1) = (node(layer, p0, &mut ids), node(layer, p1, &mut ids));
-            edges.push((i0, i1, r));
+            edges.push((i0, i1, EdgeKind::Track { len: t1 - t0, width: *w, layer: layer.clone() }));
         }
     }
     // Via barrels between consecutive spanned layers.
-    for (v, layers_of) in net_vias.iter().zip(&via_spans) {
+    for (k, (v, layers_of)) in net_vias.iter().zip(&via_spans).enumerate() {
         for pair in layers_of.windows(2) {
             let (i, j) = (layers.index(&pair[0]).unwrap_or(0), layers.index(&pair[1]).unwrap_or(0));
             let height = layers.gaps.get(i.min(j)).map_or(0.2, |g| g.thickness_mm);
-            let circumference = std::f64::consts::PI * (v.drill + VIA_PLATING_MM);
-            let r = eecalc::trace_resistance(height, circumference, VIA_PLATING_MM / eecalc::MM_PER_OZ, temp_c, None).result.resistance_ohm;
             let (a, b) = (node(&pair[0], (v.x, v.y), &mut ids), node(&pair[1], (v.x, v.y), &mut ids));
-            edges.push((a, b, r));
+            edges.push((a, b, EdgeKind::Barrel { via: k, height, drill: v.drill }));
         }
     }
     // Pads join every node on their layers that lies on them.
@@ -1168,45 +1233,51 @@ fn voltage_drop(
             }
             let p = (key.0 as f64 / 100.0, key.1 as f64 / 100.0);
             if polygon_distance(&[p, p, p], &pad.corners) <= 0.02 {
-                edges.push((pad_node, *endpoint, 0.0));
+                edges.push((pad_node, *endpoint, EdgeKind::Pad));
             }
         }
     }
-    let count = ids.len() + pad_nodes.len();
-    let mut adj = vec![Vec::new(); count];
-    for (a, b, r) in edges {
-        adj[a].push((b, r));
-        adj[b].push((a, r));
+    let mut adj = vec![Vec::new(); ids.len() + pad_nodes.len()];
+    for (e, (a, b, _)) in edges.iter().enumerate() {
+        adj[*a].push((*b, e));
+        adj[*b].push((*a, e));
     }
-    let start = pad_nodes
-        .iter()
-        .find(|(name, _)| name == &format!("{src_ref}.{src_pad}"))
-        .map(|(_, node)| *node)
-        .ok_or_else(|| format!("source pad {src_ref}.{src_pad} is not on net {net}"))?;
-    let mut dist = vec![f64::INFINITY; count];
-    dist[start] = 0.0;
-    #[derive(PartialEq)]
-    struct State(f64, usize);
-    impl Eq for State {}
-    impl PartialOrd for State {
-        fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(o)) }
+    let mut layer = vec![None; adj.len()];
+    for ((l, _), id) in ids {
+        layer[id] = Some(l);
     }
-    impl Ord for State {
-        fn cmp(&self, o: &Self) -> std::cmp::Ordering { o.0.total_cmp(&self.0) }
-    }
-    let mut heap = BinaryHeap::from([State(0.0, start)]);
-    while let Some(State(d, u)) = heap.pop() {
-        if d > dist[u] {
-            continue;
+    NetGraph { edges, adj, pads: pad_nodes, layer }
+}
+
+/// Worst-case voltage drop from `source` to each pad of the net through the
+/// routed tracks and vias (Dijkstra on resistance over [`net_graph`]),
+/// assuming the full current flows along each path: conservative for a net
+/// with several loads. Copper is taken at 25 °C plus the allowed rise. Zones
+/// are not modelled.
+fn voltage_drop(
+    net: &str,
+    n: &NetIntent,
+    copper: &NetCopper,
+    pads: &[CopperPad],
+    vias: &[konnect_sexp::board::Via],
+    layers: &LayerStack,
+) -> Result<DropResult, String> {
+    let (src_ref, src_pad) = n.source.as_deref().and_then(|s| s.split_once('.')).ok_or("no source")?;
+    let current = n.current_a.ok_or("no current_a")?;
+    let temp_c = 25.0 + n.max_temp_rise_c.unwrap_or(10.0);
+    let oz = |layer: &str| layers.index(layer).map_or(1.0, |i| layers.copper[i].1 / eecalc::MM_PER_OZ);
+    let graph = net_graph(net, copper, pads, vias, layers);
+    let resistance = |e: &EdgeKind| match e {
+        EdgeKind::Track { len, width, layer } => eecalc::trace_resistance(*len, *width, oz(layer), temp_c, None).result.resistance_ohm,
+        EdgeKind::Barrel { height, drill, .. } => {
+            let circumference = std::f64::consts::PI * (drill + VIA_PLATING_MM);
+            eecalc::trace_resistance(*height, circumference, VIA_PLATING_MM / eecalc::MM_PER_OZ, temp_c, None).result.resistance_ohm
         }
-        for &(v, r) in &adj[u] {
-            if d + r < dist[v] {
-                dist[v] = d + r;
-                heap.push(State(d + r, v));
-            }
-        }
-    }
-    let loads: Vec<&(String, usize)> = pad_nodes.iter().filter(|(_, node)| *node != start).collect();
+        EdgeKind::Pad => 0.0,
+    };
+    let start = graph.pad(&format!("{src_ref}.{src_pad}")).ok_or_else(|| format!("source pad {src_ref}.{src_pad} is not on net {net}"))?;
+    let (dist, _) = graph.shortest(&[start], resistance);
+    let loads: Vec<&(String, usize)> = graph.pads.iter().filter(|(_, node)| *node != start).collect();
     let unreachable: Vec<String> = loads.iter().filter(|(_, node)| !dist[*node].is_finite()).map(|(name, _)| name.clone()).collect();
     if loads.is_empty() {
         return Err("the net has no load pad besides the source".to_string());
@@ -1219,6 +1290,89 @@ fn voltage_drop(
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .unwrap_or_default();
     Ok(DropResult { drop_mv: current * r * 1000.0, worst_pad: worst, unreachable, temp_c })
+}
+
+/// The shortest routed path between a tied part and its pin.
+#[derive(Debug, Serialize)]
+struct TiePath {
+    from_pad: String,
+    to_pad: String,
+    net: String,
+    /// Track length along the path (via barrels excluded).
+    path_mm: f64,
+    vias: u32,
+    /// Copper layers in path order, from the part to the pin.
+    layers: Vec<String>,
+    /// Σ L′·len and Σ C′·len over the tracks whose layer has a line model,
+    /// at each track's own width; via barrels excluded.
+    est_inductance_nh: Option<f64>,
+    est_capacitance_pf: Option<f64>,
+    /// Track length on layers without a line model (no reference plane).
+    unmodelled_mm: f64,
+}
+
+/// Shortest routed path (by length, barrels counted at their height) from any
+/// of `from` to any of `to` over `net`'s [`net_graph`]. `None` when routed copper does not join them.
+fn tie_path(graph: &NetGraph, net: &str, from: &[&CopperPad], to: &[&CopperPad], layers: &LayerStack, planes: &BTreeSet<String>) -> Option<TiePath> {
+    let name = |p: &CopperPad| format!("{}.{}", p.reference, p.number);
+    let starts: Vec<(String, usize)> = from.iter().filter_map(|p| graph.pad(&name(p)).map(|n| (name(p), n))).collect();
+    let start_nodes: Vec<usize> = starts.iter().map(|s| s.1).collect();
+    let (dist, via) = graph.shortest(&start_nodes, |e| match e {
+        EdgeKind::Track { len, .. } => *len,
+        EdgeKind::Barrel { height, .. } => *height,
+        EdgeKind::Pad => 0.0,
+    });
+    let (to_pad, end) = to
+        .iter()
+        .filter_map(|p| graph.pad(&name(p)).map(|n| (name(p), n)))
+        .filter(|(_, n)| dist[*n].is_finite())
+        .min_by(|a, b| dist[a.1].total_cmp(&dist[b.1]))?;
+    let (at, steps) = graph.path(&via, end);
+    let from_pad = starts.iter().find(|s| s.1 == at).map(|s| s.0.clone()).unwrap_or_default();
+    let mut models: HashMap<&str, Option<crate::tools::layer_stack::LineModel>> = HashMap::new();
+    let (mut path_mm, mut unmodelled, mut l_nh, mut c_pf, mut modelled) = (0.0, 0.0, 0.0, 0.0, false);
+    let mut used_vias = BTreeSet::new();
+    let mut used_layers: Vec<String> = Vec::new();
+    let barrel = |k: Option<&(&EdgeKind, usize)>| matches!(k, Some((EdgeKind::Barrel { .. }, _)));
+    for (i, &(e, reached)) in steps.iter().enumerate() {
+        // Copper layers in path order, including a layer a via lands on
+        // straight into a pad, but not the inner layers a via passes through.
+        let passing = barrel(Some(&steps[i])) && barrel(steps.get(i + 1));
+        if let (Some(l), false) = (&graph.layer[reached], passing) {
+            if used_layers.last() != Some(l) {
+                used_layers.push(l.clone());
+            }
+        }
+        match e {
+            EdgeKind::Track { len, width, layer } => {
+                path_mm += len;
+                match models.entry(layer.as_str()).or_insert_with(|| layers.model(layer, planes).ok()) {
+                    Some(m) => {
+                        let pm = m.per_mm(*width);
+                        l_nh += pm.l_nh_per_mm * len;
+                        c_pf += pm.c_pf_per_mm * len;
+                        modelled = true;
+                    }
+                    None => unmodelled += len,
+                }
+            }
+            EdgeKind::Barrel { via, .. } => {
+                used_vias.insert(*via);
+            }
+            EdgeKind::Pad => {}
+        }
+    }
+    Some(TiePath {
+        from_pad,
+        to_pad,
+        net: net.to_string(),
+        path_mm: r3(path_mm),
+        vias: used_vias.len() as u32,
+        layers: used_layers,
+        est_inductance_nh: modelled.then(|| r3(l_nh)),
+        est_capacitance_pf: modelled.then(|| r3(c_pf)),
+        unmodelled_mm: r3(unmodelled),
+    })
 }
 
 /// How much of a net's routed length meets its impedance target.
@@ -1421,6 +1575,7 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
         // the job), falling back to any pad when the pin has no net.
         let nets: BTreeSet<&str> = target.iter().filter_map(|p| p.net.as_deref()).collect();
         let sharing: Vec<&&CopperPad> = part.iter().filter(|p| p.net.as_deref().is_some_and(|n| nets.contains(n))).collect();
+        let shares = !sharing.is_empty();
         let (from, note) = if sharing.is_empty() {
             (part.iter().collect::<Vec<_>>(), "part shares no net with the pin; measured from its nearest pad")
         } else {
@@ -1440,17 +1595,56 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
             detail: tie.why.clone().map_or(note.to_string(), |w| format!("{w}; {note}")),
         });
         if limits.max_path_mm.is_some() || limits.max_vias.is_some() {
-            // TODO(next session): measure the routed path (shortest track +
-            // via-barrel path from the part's pad to the pin on their shared
-            // net, reusing voltage_drop's graph) and count its vias.
-            checks.push(Check {
-                kind: "tie_path",
-                subject,
-                status: "unverified",
-                measured: Value::Null,
-                required: json!({"max_path_mm": limits.max_path_mm, "max_vias": limits.max_vias}),
-                detail: "routed path length and via count are not measured yet; placement distance is checked above".to_string(),
-            });
+            let required = json!({"max_path_mm": limits.max_path_mm, "max_vias": limits.max_vias, "sources": limits.sources});
+            let unverified = |detail: String| Check { kind: "tie_path", subject: subject.clone(), status: "unverified", measured: Value::Null, required: required.clone(), detail };
+            // The shortest routed path over each shared net; the best one counts.
+            let mut best: Option<TiePath> = None;
+            let mut zoned = Vec::new();
+            for net in &nets {
+                let from_net: Vec<&CopperPad> = part.iter().copied().filter(|p| p.net.as_deref() == Some(*net)).collect();
+                let to_net: Vec<&CopperPad> = target.iter().copied().filter(|p| p.net.as_deref() == Some(*net)).collect();
+                if from_net.is_empty() {
+                    continue;
+                }
+                let c = copper.get(*net).unwrap_or(&empty);
+                if c.has_zone {
+                    zoned.push(net.to_string());
+                }
+                let graph = net_graph(net, c, &pads, &vias, &layers);
+                if let Some(p) = tie_path(&graph, net, &from_net, &to_net, &layers, &planes) {
+                    if best.as_ref().is_none_or(|b| p.path_mm < b.path_mm) {
+                        best = Some(p);
+                    }
+                }
+            }
+            let zone_note = if zoned.is_empty() { String::new() } else { format!("; net {} also has a zone, which may join the pads more directly", zoned.join(", ")) };
+            let check = match best {
+                _ if !shares => unverified("the part shares no net with the pin, so there is no path to measure".to_string()),
+                None if !zoned.is_empty() => unverified(format!("no routed track path joins the part and the pin; net {} has a zone that may carry the connection (zone paths are not measured)", zoned.join(", "))),
+                None => unverified("no routed track path joins the part and the pin yet (not routed)".to_string()),
+                Some(p) => {
+                    let mut over = Vec::new();
+                    if let Some(max) = limits.max_path_mm.filter(|m| p.path_mm > *m) {
+                        over.push(format!("path {} mm > {max} mm", p.path_mm));
+                    }
+                    if let Some(max) = limits.max_vias.filter(|m| p.vias > *m) {
+                        over.push(format!("{} vias > {max}", p.vias));
+                    }
+                    let model_note = if p.unmodelled_mm > 0.0 { format!("; {} mm on layers without a reference plane is left out of the L/C estimates", p.unmodelled_mm) } else { String::new() };
+                    // A zone could only shorten the path, so a pass stands; a
+                    // failure over a zoned net is not proven.
+                    let status = if over.is_empty() { "pass" } else if zoned.is_empty() { "fail" } else { "unverified" };
+                    let detail = format!(
+                        "shortest routed track path {} → {} on {}{}; L/C = Σ L′·len, Σ C′·len per segment at its own width and layer (via barrels not included){model_note}{zone_note}",
+                        p.from_pad,
+                        p.to_pad,
+                        p.net,
+                        if over.is_empty() { String::new() } else { format!(" exceeds the limit: {}", over.join(", ")) }
+                    );
+                    Check { kind: "tie_path", subject: subject.clone(), status, measured: serde_json::to_value(&p).unwrap_or(Value::Null), required: required.clone(), detail }
+                }
+            };
+            checks.push(check);
         }
     }
 
@@ -1822,7 +2016,7 @@ pub(crate) fn plan_ties(tree: &SexpNode, intent: &DesignIntent, clearance: f64) 
                     rotation,
                     tie: label,
                     distance_mm: r3(d),
-                    max_mm: max_mm,
+                    max_mm,
                     meets: d <= max_mm,
                 });
             }
@@ -1933,8 +2127,8 @@ pub fn tools() -> Vec<ToolDef> {
                             "pin": { "type": "string" },
                             "max_mm": { "type": "number", "description": "Pad edge to pad edge; optional with a kind" },
                             "kind": { "type": "string", "enum": ["crystal", "core_regulator_cap", "decoupling"], "description": "Defaults for max_mm, max_path_mm and max_vias from the stack-up" },
-                            "max_path_mm": { "type": "number" },
-                            "max_vias": { "type": "integer", "minimum": 0 },
+                            "max_path_mm": { "type": "number", "description": "Routed track length, part pad to pin on their shared net, checked by check_design_intent" },
+                            "max_vias": { "type": "integer", "minimum": 0, "description": "Vias on that routed path" },
                             "why": { "type": "string" }
                         },
                         "required": ["part", "to"],
@@ -2019,8 +2213,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_design_intent",
-            "Measure the board against the design intent: part ties (pad-edge distance), routed \
-             length, pair skew, track width against the current/impedance requirement, voltage \
+            "Measure the board against the design intent: part ties (pad-edge distance, and for \
+             ties with max_path_mm/max_vias the shortest routed path with its vias and estimated \
+             nH/pF), routed length, pair skew, track width against the current/impedance requirement, voltage \
              drop from the source pad, impedance estimate, plane zones. Each check is pass, fail \
              or unverified, with measured and required values. Reads the live board when KiCad \
              holds it.",
@@ -3111,5 +3306,115 @@ mod default_tests {
         assert_eq!(tie.status, "fail", "8.5 mm apart: {tie:?}");
         assert!(tie.required["sources"]["max_mm"].as_str().unwrap().contains("path limit"));
         assert_eq!(checks.iter().find(|c| c.kind == "tie_path").unwrap().status, "unverified");
+    }
+}
+
+/// The routed path of a tie: shortest track + via path from the tied part's
+/// pad to the pin on their shared net, with its vias and L/C estimate.
+#[cfg(test)]
+mod tie_path_tests {
+    use super::*;
+
+    /// Four layers, In1/In2 ground planes; U1.5 on F.Cu at (10, 10) on XI.
+    fn checks(kind: &str, extra: &str) -> Vec<Check> {
+        let board = konnect_sexp::parse_sexp(&format!(
+            "(kicad_pcb (general (thickness 1.6)) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" signal) (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal))
+              (zone (net \"GND\") (layers \"In1.Cu\" \"In2.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50))))
+              (footprint \"U\" (layer \"F.Cu\") (at 10 10) (property \"Reference\" \"U1\")
+                (pad \"5\" smd rect (at 0 0) (size 0.5 0.5) (layers \"F.Cu\") (net \"XI\")))
+              {extra})"
+        ))
+        .unwrap();
+        let mut i = DesignIntent { schema: 1, ..Default::default() };
+        i.ties.push(Tie { part: "Y1".into(), to: "U1".into(), pin: Some("5".into()), kind: Some(kind.into()), ..Default::default() });
+        check_board(&board, &i)
+    }
+
+    fn path(kind: &str, extra: &str) -> Check {
+        checks(kind, extra).into_iter().find(|c| c.kind == "tie_path").unwrap()
+    }
+
+    const Y1_TOP: &str = "(footprint \"Y\" (layer \"F.Cu\") (at 14 10) (property \"Reference\" \"Y1\")
+        (pad \"1\" smd rect (at 0 0) (size 0.5 0.5) (layers \"F.Cu\") (net \"XI\")) (pad \"2\" smd rect (at 2 0) (size 0.5 0.5) (layers \"F.Cu\") (net \"XO\")))";
+    const Y1_BOTTOM: &str = "(footprint \"Y\" (layer \"B.Cu\") (at 13 10) (property \"Reference\" \"Y1\")
+        (pad \"1\" smd rect (at 0 0) (size 0.5 0.5) (layers \"B.Cu\") (net \"XI\")))";
+
+    fn seg(layer: &str, w: f64, (x1, y1): (f64, f64), (x2, y2): (f64, f64)) -> String {
+        format!("(segment (start {x1} {y1}) (end {x2} {y2}) (width {w}) (layer \"{layer}\") (net \"XI\"))")
+    }
+
+    #[test]
+    fn a_direct_trace_passes_with_its_length_and_capacitance() {
+        let c = path("crystal", &format!("{Y1_TOP} {}", seg("F.Cu", 0.2, (10.0, 10.0), (14.0, 10.0))));
+        assert_eq!(c.status, "pass", "{c:?}");
+        assert_eq!(c.measured["path_mm"], json!(4.0));
+        assert_eq!(c.measured["vias"], json!(0));
+        assert_eq!((c.measured["from_pad"].as_str(), c.measured["to_pad"].as_str()), (Some("Y1.1"), Some("U1.5")));
+        // Σ C′·len on the outer microstrip at 0.2 mm.
+        let intent = DesignIntent { schema: 1, ..Default::default() };
+        let (layers, _, _) = stack_and_planes(&intent, None);
+        let planes: BTreeSet<String> = ["In1.Cu".to_string(), "In2.Cu".to_string()].into();
+        let pm = layers.model("F.Cu", &planes).unwrap().per_mm(0.2);
+        let pf = c.measured["est_capacitance_pf"].as_f64().unwrap();
+        let nh = c.measured["est_inductance_nh"].as_f64().unwrap();
+        assert!((pf - 4.0 * pm.c_pf_per_mm).abs() < 0.01, "{pf} vs {}", 4.0 * pm.c_pf_per_mm);
+        assert!((nh - 4.0 * pm.l_nh_per_mm).abs() < 0.01, "{nh}");
+        assert!(c.required["sources"]["max_path_mm"].as_str().unwrap().contains("AVR186"));
+    }
+
+    #[test]
+    fn a_detour_fails_on_length_and_the_shortest_branch_counts() {
+        let detour = [seg("F.Cu", 0.2, (10.0, 10.0), (10.0, 20.0)), seg("F.Cu", 0.2, (10.0, 20.0), (14.0, 20.0)), seg("F.Cu", 0.2, (14.0, 20.0), (14.0, 10.0))].join(" ");
+        let c = path("crystal", &format!("{Y1_TOP} {detour}"));
+        assert_eq!(c.status, "fail", "{c:?}");
+        assert_eq!(c.measured["path_mm"], json!(24.0));
+        assert!(c.detail.contains("exceeds"), "{}", c.detail);
+        // A tee straight across makes the short path win.
+        let c = path("crystal", &format!("{Y1_TOP} {detour} {}", seg("F.Cu", 0.2, (10.0, 10.0), (14.0, 10.0))));
+        assert_eq!((c.status, c.measured["path_mm"].clone()), ("pass", json!(4.0)), "{c:?}");
+    }
+
+    #[test]
+    fn a_path_through_a_via_to_the_bottom_counts_the_via() {
+        let routed = format!(
+            "{Y1_BOTTOM} {} {} (via (at 12 10) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"XI\"))",
+            seg("F.Cu", 0.3, (10.0, 10.0), (12.0, 10.0)),
+            seg("B.Cu", 0.3, (12.0, 10.0), (13.0, 10.0))
+        );
+        // A crystal allows no via.
+        let c = path("crystal", &routed);
+        assert_eq!(c.status, "fail", "{c:?}");
+        assert_eq!((c.measured["path_mm"].clone(), c.measured["vias"].clone()), (json!(3.0), json!(1)));
+        // Layers in path order, from the tied part to the pin.
+        assert_eq!(c.measured["layers"], json!(["B.Cu", "F.Cu"]));
+        assert!(c.detail.contains("1 vias > 0"), "{}", c.detail);
+        // A decoupling capacitor allows one.
+        assert_eq!(path("decoupling", &routed).status, "pass");
+        // A bottom pad sitting on the via: no bottom track, but B.Cu is on the path.
+        let on_via = format!(
+            "{} {} (via (at 12 10) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"XI\"))",
+            Y1_BOTTOM.replace("(at 13 10)", "(at 12 10)"),
+            seg("F.Cu", 0.3, (10.0, 10.0), (12.0, 10.0))
+        );
+        let c = path("decoupling", &on_via);
+        assert_eq!((c.status, c.measured["path_mm"].clone(), c.measured["vias"].clone()), ("pass", json!(2.0), json!(1)), "{c:?}");
+        assert_eq!(c.measured["layers"], json!(["B.Cu", "F.Cu"]));
+        // Without the via the bottom track does not connect.
+        let unjoined = format!("{Y1_BOTTOM} {} {}", seg("F.Cu", 0.3, (10.0, 10.0), (12.0, 10.0)), seg("B.Cu", 0.3, (12.0, 10.0), (13.0, 10.0)));
+        assert_eq!(path("decoupling", &unjoined).status, "unverified");
+    }
+
+    #[test]
+    fn an_unrouted_or_zone_carried_tie_is_unverified_with_the_reason() {
+        let c = path("crystal", Y1_TOP);
+        assert_eq!(c.status, "unverified");
+        assert!(c.detail.contains("not routed"), "{}", c.detail);
+        let zone = "(zone (net \"XI\") (layers \"F.Cu\") (polygon (pts (xy 9 9) (xy 15 9) (xy 15 11) (xy 9 11))))";
+        let c = path("crystal", &format!("{Y1_TOP} {zone}"));
+        assert_eq!(c.status, "unverified");
+        assert!(c.detail.contains("zone"), "{}", c.detail);
+        // A routed path under the limit passes even when a zone is present.
+        let c = path("crystal", &format!("{Y1_TOP} {zone} {}", seg("F.Cu", 0.2, (10.0, 10.0), (14.0, 10.0))));
+        assert_eq!(c.status, "pass", "{c:?}");
     }
 }

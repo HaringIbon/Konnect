@@ -628,3 +628,45 @@ Both tools are registered in `pcb_board`, which now has 18 tools. `pcb_routing` 
   - `final_state` still reports the job state.
 - **Tests:** `routing_log_tests` (4 tests, on the real fixture).
 - **End-to-end check:** routing the module board through MCP (23 passes) returned `complete: false, initial_unrouted: 64, unrouted: 7, violations: 52`, with the warning.
+
+## Pass 16: design-intent defaults
+
+Code: `design_intent.rs`, `eecalc.rs`, `layer_stack.rs` (and a 3-line `Tie` literal update in `placement.rs`). Sources are cited by document-database slug.
+
+- **Width from current is IPC-2152:**
+  - The Brooks & Adam closed-form fit to the IPC-2152 data, ΔT = K·I^a·W^b·Th^c, with the same equation and coefficients as KiCad master commit `7f558e2779` [`kicad-ipc2152-track-width`]. The internal fit is chosen by the nearest nominal copper weight.
+  - No internal-layer derating: IPC-2152's data show inner traces cool about as well as outer ones. Inner widths are now about 1.5× outer (0.5 oz inner, 1 oz outer), where IPC-2221 gave about 2.6×.
+  - The old chart [`kicad-10-ipc2221-track-width`] stays available as `engineering_calc` width_for_current `method: "ipc2221"`.
+  - Default rise is 10 °C (KiCad's calculator default). A power net without `current_a` gets a warning that no width is derived (suggested basis: the fuse or PTC trip current).
+- **Interface standards on nets (`standard`, `rise_time_ns`):**
+  - `usb2_fs`, `usb2_hs`: 90 Ω ±10 %, skew ≤ 1.27 mm (50 mil) [`ti-spraar7j`]; FS rise time 4 ns [`st-ds14258-stm32h563`], HS 0.5 ns (USB 2.0 spec §7.1.2.2, quoted from memory: usb.org is blocked from this host).
+  - `ethernet_100base_tx`: 100 Ω ±10 %, skew 1.27 mm, length ≤ 50.8 mm [`ti-snla387-ethernet-phy-layout`], rise 3 ns [`microchip-lan8742a-ds`]. `ethernet_1000base_t`: skew 0.508 mm.
+  - `rmii` (single-ended): length ≤ 152.4 mm [`ti-snla079d-phyter-layout`, `ti-snla387-ethernet-phy-layout`, `microchip-lan8742-routing-checklist`]. No impedance default, because TI says 50 Ω and Microchip 68 Ω.
+  - **Edge-rate rule:** a pair without a published skew gets 10 % of its rise time as length, through the outer layer's propagation delay √εeff/c0. Johnson gives a 20 % skew budget, and an unspecified driver already uses at least 10 % [`johnson-edn-2004-cm-analysis-of-skew`, `johnson-edn-2002-your-layout-is-skewed`]. With a standard, the tighter of the published value and the edge-rate bound wins.
+  - The gap default stays 0.15 mm: no standard gives a gap.
+- **Tie kinds (`kind`, `max_path_mm`, `max_vias`):**
+  - `crystal`: path ≤ 0.5 pF ÷ C′ of a 0.2 mm outer trace, ≈ 5.5 mm on JLC04161H-7628; 0 vias. The 0.5 pF budget is AVR186's 1 pF XTALIN parasitic less the pads [`microchip-avr186-oscillator-layout`].
+  - `core_regulator_cap`: path ≤ 1 nH ÷ L′ of a 0.3 mm outer trace, ≈ 3 mm; 1 via. `decoupling`: 2 nH ÷ L′, ≈ 6 mm; 1 via. The nH budgets are a Konnect choice, about one MLCC's own mounted ESL; ST and Microchip give no number [`st-an5711-stm32h5-hw`, `microchip-lan8742-routing-checklist`]. The output says so.
+  - `max_mm` is optional with a kind (it defaults to the path limit). Without a line model for the outer layer the fallbacks are 6, 3 and 6 mm.
+- **Provenance:** an explicit user value always wins. Every resolved value reports where it came from: `requirements[].sources` (field → `"user"` or the citation) and `tie_requirements[]` in the get, set and apply outputs, and `required.sources` on tie checks.
+- **`LineModel::per_mm`:** gives εeff, delay, C′ and L′ per mm for a microstrip or stripline.
+- **Routed tie path (`tie_path` check):**
+  - `voltage_drop`'s graph builder is factored into `net_graph`: per-layer nodes, tracks split at T-junctions, via barrels between consecutive spanned layers, and pads joining every node on them. Each edge is typed (`Track`, `Barrel`, `Pad`) so callers choose the weight. `NetGraph::shortest` is a multi-source Dijkstra with predecessors. `voltage_drop` now weighs that graph by resistance; its results are unchanged and its tests pass as before.
+  - `tie_path` runs Dijkstra on length (barrels at their dielectric height) from the tied part's pads on each net it shares with the pin, to the pin pad, and keeps the shortest over the shared nets.
+  - It reports `from_pad`, `to_pad`, `net`, `path_mm` (track length), `vias` (distinct vias), `layers` (in path order, including a layer a via lands on straight into a pad, but not inner layers a via only passes through), `est_inductance_nh` = Σ L′·len and `est_capacitance_pf` = Σ C′·len per segment at its own width and layer, and `unmodelled_mm` (track on layers with no reference plane, left out of the estimates).
+  - It fails above `max_path_mm` or `max_vias`. It is `unverified`, with the reason, when the part shares no net with the pin, when no routed track path joins them (`not routed`), or when that net has a zone that may carry the connection. A failing path on a net that also has a zone is `unverified`, because a zone could only shorten the path. A passing path stands.
+  - **Limits:** the L/C estimates leave out via barrels and pads. Via inductance is not estimated: no sourced formula is in the document database yet. The via limit stands in for it.
+- **Tests:**
+  - `eecalc`: `ipc_2152_matches_kicads_reference_values`; `ipc_2152_does_not_derate_inner_layers_and_tracks_the_old_chart_outside`.
+  - `layer_stack`: `per_length_constants_match_published_values` (air, Pozar Ex. 3.7, FR-4 stripline, L′·C′ = τ²).
+  - `design_intent::default_tests` (7 tests).
+  - `design_intent::tie_path_tests`:
+    - `a_direct_trace_passes_with_its_length_and_capacitance`: L/C equal L′·len and C′·len.
+    - `a_detour_fails_on_length_and_the_shortest_branch_counts`.
+    - `a_path_through_a_via_to_the_bottom_counts_the_via`: a crystal fails, decoupling passes, a bottom pad on the via counts B.Cu, and no via means no path.
+    - `an_unrouted_or_zone_carried_tie_is_unverified_with_the_reason`.
+  - `cargo test -p konnect-core --lib`: 1834 passed, 0 failed, 23 ignored.
+- **Sanity check on the saved Ethernet board** (read-only, with every tie given a 1000 mm path limit in memory; no file changed, no KiCad):
+  - 41 ties measured in about 0.25 s (debug build). 37 pass. 4 are unverified: +3V3 caps joined only by the 3V3 pour (C7, C11, C25, C26).
+  - The figures are plausible: Y2 crystal 5.5 mm, 0 vias, 0.41 pF. C15 VCAP 2.4 mm, 1 via, 0.79 nH. C10 VBAT 10.8 mm, 3 vias. R1 CC1 27.2 mm, 3 vias.
+- **Not done:** DRC rules from crystal and pair defaults; RMII group matching; re-reading ST AN2867 (st.com unreachable); migrating the board scripts (`eth_board/build.py` still sets explicit skews and tie lengths, so user values win there).

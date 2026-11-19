@@ -97,6 +97,7 @@ pub(crate) fn ipc2152_width_mil(current_a: f64, temp_rise_c: f64, thickness_mil:
 }
 
 /// IPC-2152 current in A that a `width_mil` trace carries for the rise.
+#[cfg(test)]
 pub(crate) fn ipc2152_current_a(width_mil: f64, temp_rise_c: f64, thickness_mil: f64, inner: bool) -> f64 {
     let (k, a, b, c) = brooks_adam(inner, thickness_mil);
     (temp_rise_c / (k * width_mil.powf(b) * thickness_mil.powf(c))).powf(1.0 / a)

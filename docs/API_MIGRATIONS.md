@@ -2397,3 +2397,16 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
 ## Unreleased (fork): route_specctra_dsn reports the router's result
 
 - **`route_specctra_dsn`:** the response gains `routing` (`complete`, `initial_unrouted`, `unrouted`, `violations`, `score`, `autoroute_passes`, `source`) and `warning`. `final_state` is unchanged (job state only); read `routing.complete`, not `final_state`, to know whether the board was routed.
+
+## Unreleased (fork): design-intent defaults and IPC-2152
+
+- **`Tie.max_mm` is optional:** it is `Option<f64>` in Rust. Rust code that builds a `Tie` literal needs `max_mm: Some(x)` and `..Default::default()`. Existing intent JSON files read unchanged.
+- **New optional intent fields:** net `standard` and `rise_time_ns`; tie `kind`, `max_path_mm` and `max_vias`. A tie without `kind` still needs `max_mm` (or `max_path_mm`).
+- **Width requirements change:** IPC-2152 replaces IPC-2221. Outer widths come out about 10 % narrower at 1 A, 10 °C and 1 oz. Inner widths are no longer about 2.6× the outer (0.5 oz inner is about 1.5×). Re-run `apply_design_intent` so the rules pick up the new widths.
+- **`engineering_calc` width_for_current:** takes `method` (`"ipc2152"`, the default, or `"ipc2221"`).
+- **Responses:**
+  - `requirements[].sources` and `tie_requirements` are added.
+  - `check_design_intent` adds `required.sources` on tie checks.
+  - `check_design_intent` adds a `tie_path` check for every tie that has a `kind`, `max_path_mm` or `max_vias`. `measured` holds `from_pad`, `to_pad`, `net`, `path_mm`, `vias`, `layers`, `est_inductance_nh`, `est_capacitance_pf` and `unmodelled_mm`. The check is `unverified` with the reason when the pads are not joined by routed tracks, or when a zone may carry the connection.
+  - Intents that set a tie `kind` can now get new `fail` results from `tie_path`.
+

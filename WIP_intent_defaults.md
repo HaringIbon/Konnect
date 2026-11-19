@@ -1,6 +1,6 @@
 # WIP: design-intent defaults from physics and published guidance
 
-Status, 2026-11-18. The tree compiles. `cargo test -p konnect-core --lib` passes: 1830 passed, 0 failed, 23 ignored. `cargo build --release` builds. Nothing is committed.
+Status, 2026-11-19. Everything below is committed on `wip/intent-defaults`, including the routed tie-path check (§4 item 1, done). `cargo test -p konnect-core --lib`: 1834 passed, 0 failed, 23 ignored. `cargo build --release` builds. The change log is FORK_CHANGES.md "Pass 16: design-intent defaults"; the API notes are in docs/API_MIGRATIONS.md. This file keeps the research detail and the open items (§4 items 2–5); delete it once those are done or tracked elsewhere.
 
 Files changed:
 - `crates/konnect-core/src/tools/design_intent.rs`
@@ -145,13 +145,7 @@ Existing tests changed:
 
 ## 4. What remains
 
-1. **Routed path-length check for ties (recommended: yes).** The placement distance passed the eth board's 21.9 mm, 3-via VCAP path; only the routed path shows that problem. `check_design_intent` already emits a `tie_path` check, but it is always `unverified` for now. To finish it:
-   - Factor `voltage_drop`'s graph builder (track segments split at T-junctions, via barrels, pad joins) into a generic `net_graph`.
-   - Run Dijkstra on length, from the part's pads on the shared net to the pin pad, keeping predecessors.
-   - Report `path_mm`, `vias`, `est_inductance_nh` (Σ L′·len) and `est_capacitance_pf` (Σ C′·len).
-   - Fail above `max_path_mm` or `max_vias`.
-   - Mark the check `unverified` when the path is not routed or is carried by a zone.
-   - Test cases: a direct trace, a path through a via to the bottom side, and an unrouted path.
+1. **Routed path-length check for ties: done.** `net_graph` (factored out of `voltage_drop`), `NetGraph::shortest`, `tie_path`; the `tie_path` check reports path_mm, vias, layers and the L/C estimates. See FORK_CHANGES.md Pass 16. Open: via barrels and pads are not in the L/C estimate (no sourced via-inductance formula in the doc DB yet).
 2. **DRC rules for crystal and pair defaults.** `apply_design_intent` already writes length and skew rules from the resolved values. A crystal tie's path limit could become a `length` rule on the crystal net, but only when that net runs between the crystal and the pin alone; the load-capacitor branch complicates this.
 3. **Group matching for RMII (TX group, RX group).** Not modelled; the intent has pair skew only.
 4. **AN2867.** Re-read it if st.com becomes reachable, and replace the AVR186-based crystal budget if ST gives a number.
@@ -160,42 +154,6 @@ Existing tests changed:
    - The eth board's 4.5 mm and 7.7 mm skews will then fail against 1.27 mm. KiCad's skew counts the whole net, including the termination stub.
    - The eth board currently passes `current_a: 1.5` for +5V/VBUS. With IPC-2152 that gives 0.56 mm outer instead of 0.53 mm.
 
-## 5. Draft for FORK_CHANGES.md
+## 5–6. Drafts
 
-```
-### Design-intent defaults from physics and published guidance (design_intent.rs, eecalc.rs, layer_stack.rs)
-- Width from current is now IPC-2152 (Brooks & Adam fit, same equation and coefficients as
-  KiCad master commit 7f558e2779). No internal-layer derating; the old IPC-2221 curve remains
-  as `engineering_calc` `method: "ipc2221"`.
-- Nets take `standard` (usb2_fs, usb2_hs, ethernet_100base_tx, ethernet_1000base_t, rmii) and
-  `rise_time_ns`. Unset impedance, tolerance, skew, length and rise time come from TI
-  SPRAAR7J / SNLA387 / SNLA079D, the LAN8742A datasheet and the USB 2.0 spec. A pair without a
-  published skew gets 10 % of its rise time, as length at the stack-up's propagation velocity
-  (Johnson, EDN 2002/2004).
-- Ties take `kind` (crystal, core_regulator_cap, decoupling), `max_path_mm` and `max_vias`.
-  `max_mm` is optional when a kind is given. Crystal path = 0.5 pF / C′ of the outer layer
-  (AVR186 parasitics); core-regulator cap = 1 nH / L′; decoupling = 2 nH / L′ (≈5.5, 3 and 6 mm
-  on JLC04161H-7628).
-- Every requirement reports `sources` ("user" or a citation); `tie_requirements` lists the
-  resolved tie limits. User values always override defaults.
-- A power net without `current_a` is flagged. The default temperature rise is 10 °C.
-- `LineModel::per_mm` gives εeff, delay, C′ and L′ per mm.
-- check_design_intent emits `tie_path` checks (unverified for now: routed-path measurement is
-  the next step).
-```
-
-## 6. Draft for API_MIGRATIONS.md
-
-```
-### Design intent: defaults and IPC-2152 (2026-11)
-- `Tie.max_mm` is now optional (`Option<f64>` in Rust). Rust code building a `Tie` literal needs
-  `max_mm: Some(x)` and `..Default::default()`. Existing intent JSON files read unchanged.
-- New optional fields: net `standard` and `rise_time_ns`; tie `kind`, `max_path_mm` and
-  `max_vias`. A tie without `kind` still needs `max_mm` (or `max_path_mm`).
-- Width requirements change. IPC-2152 replaces IPC-2221: outer widths come out ~10 % narrower
-  at 1 A / 10 °C / 1 oz, and inner widths are no longer ~2.6× the outer (0.5 oz inner ≈ 1.5×).
-  Re-run apply_design_intent so the rules pick up the new widths.
-- `engineering_calc` width_for_current takes `method` ("ipc2152", the default, or "ipc2221").
-- Responses add `requirements[].sources` and `tie_requirements`; check_design_intent adds
-  `tie_path` checks and `required.sources` on tie checks.
-```
+Merged into FORK_CHANGES.md (Pass 16) and docs/API_MIGRATIONS.md ("design-intent defaults and IPC-2152").
