@@ -478,6 +478,48 @@ pub(crate) fn units(nets: &BTreeSet<String>, groups: &[BTreeSet<String>]) -> Vec
     out
 }
 
+/// Units to drop before any trial: a unit whose group (a pair, a skew group)
+/// has a member with no routes in the session that was still unconnected
+/// before the import. Keeping the routed half alone would leave half a pair.
+/// A member already complete (hand-routed and fixed) does not hold its
+/// partner back. Returns the units left and the rejections.
+pub(crate) fn drop_orphaned_halves(
+    units: Vec<BTreeSet<String>>,
+    groups: &[BTreeSet<String>],
+    with_routes: &BTreeSet<String>,
+    before: &BTreeMap<String, usize>,
+) -> (Vec<BTreeSet<String>>, BTreeMap<String, NetRejection>) {
+    let mut rejected = BTreeMap::new();
+    let mut kept = Vec::new();
+    for unit in units {
+        let missing: BTreeSet<&String> = groups
+            .iter()
+            .filter(|group| group.iter().any(|net| unit.contains(net)))
+            .flat_map(|group| group.iter())
+            .filter(|net| !with_routes.contains(*net) && before.get(*net).copied().unwrap_or(0) > 0)
+            .collect();
+        if missing.is_empty() {
+            kept.push(unit);
+            continue;
+        }
+        let names = missing.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ");
+        for net in &unit {
+            rejected.insert(
+                net.clone(),
+                NetRejection {
+                    reason: format!(
+                        "its group partner {names} has no routes in the session and is still unconnected; half a pair or skew group is not kept alone"
+                    ),
+                    errors: Vec::new(),
+                    unconnected_after: None,
+                    by: "group",
+                },
+            );
+        }
+    }
+    (kept, rejected)
+}
+
 /// Differential pairs by name among `nets`: `X_P`/`X_N`, `XP`/`XN` with a
 /// separator before (`USB_DP`/`USB_DN`), and `X+`/`X-`.
 pub(crate) fn name_pairs(nets: &BTreeSet<String>) -> Vec<BTreeSet<String>> {
@@ -536,6 +578,26 @@ pub(crate) fn intent_pairs(intent: &serde_json::Value) -> Vec<BTreeSet<String>> 
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Why a re-import of the kept nets does not match its trial, if it does
+/// not: a kept net with more unconnected items than in the trial, or a net
+/// outside them with more than before the import.
+pub(crate) fn reimport_regression(
+    now: &BTreeMap<String, usize>,
+    trial: &BTreeMap<String, usize>,
+    before: &BTreeMap<String, usize>,
+    kept: &BTreeSet<String>,
+) -> Option<String> {
+    for net in kept {
+        let (was, is) = (trial.get(net).copied().unwrap_or(0), now.get(net).copied().unwrap_or(0));
+        if is > was {
+            return Some(format!("{net} has {is} unconnected items, {was} in its trial"));
+        }
+    }
+    other_nets_worse(before, now, kept)
+        .first()
+        .map(|(net, was, is)| format!("{net}, which is not imported, goes from {was} to {is} unconnected items"))
 }
 
 /// What the live board's undo history holds after the import, newest last.
@@ -611,7 +673,8 @@ pub(crate) fn without_items(board: &str, drop: &std::collections::HashSet<String
             if depth == 2 {
                 if let Some(start) = form_start.take() {
                     let form = &board[start..=i];
-                    let routed = ["(segment", "(arc", "(via"].iter().any(|head| form.starts_with(head));
+                    let routed = ["(segment", "(arc", "(via"].iter().any(|head| form.starts_with(head))
+                        || (form.starts_with("(zone") && form.contains("(teardrop"));
                     let id = form.find("(uuid \"").map(|at| &form[at + 7..]).and_then(|s| s.find('"').map(|end| &s[..end]));
                     if routed && id.is_some_and(|id| drop.contains(id)) {
                         let keep_to = board[..start].trim_end_matches([' ', '\t']).len();
@@ -926,6 +989,28 @@ mod tests {
         assert_eq!(d.accepted, set(&["B"]));
     }
 
+    /// Review B: a pair half whose partner the router left unrouted is not
+    /// kept alone; a partner that was already complete does not hold it back.
+    #[test]
+    fn a_pair_half_without_its_partner_is_dropped_before_any_trial() {
+        let job = set(&["/USB_D_P", "/USB_D_N", "/ETH_P", "/ETH_N", "LED"]);
+        let with_routes = set(&["/USB_D_P", "/ETH_P", "LED"]);
+        let groups = name_pairs(&job);
+        assert_eq!(groups.len(), 2, "pairs come from the job's nets, not only the routed ones");
+        let before = BTreeMap::from([
+            ("/USB_D_P".to_string(), 1),
+            ("/USB_D_N".to_string(), 1),
+            ("/ETH_P".to_string(), 1),
+            ("/ETH_N".to_string(), 0),
+            ("LED".to_string(), 1),
+        ]);
+        let units = units(&with_routes, &groups);
+        let (kept, rejected) = drop_orphaned_halves(units, &groups, &with_routes, &before);
+        assert_eq!(kept, vec![set(&["/ETH_P"]), set(&["LED"])]);
+        assert_eq!(rejected["/USB_D_P"].by, "group");
+        assert!(rejected["/USB_D_P"].reason.contains("/USB_D_N"), "{:?}", rejected["/USB_D_P"]);
+    }
+
     #[test]
     fn groups_come_from_names_rules_and_intent() {
         let nets = set(&["/USB_D_P", "/USB_D_N", "ETH_TX+", "ETH_TX-", "CLK_P", "LED"]);
@@ -941,6 +1026,18 @@ mod tests {
         // Units join overlapping groups; members without routes stay out.
         let u = units(&set(&["A", "B", "C"]), &[set(&["A", "B"]), set(&["B", "C"]), set(&["Z", "C"])]);
         assert_eq!(u, vec![set(&["A", "B", "C"])]);
+    }
+
+    #[test]
+    fn a_reimport_must_not_open_more_than_its_trial() {
+        let kept = set(&["A", "B"]);
+        let before = BTreeMap::from([("A".to_string(), 2), ("B".to_string(), 1), ("GND".to_string(), 0)]);
+        let trial = BTreeMap::from([("A".to_string(), 0)]);
+        assert_eq!(reimport_regression(&BTreeMap::new(), &trial, &before, &kept), None);
+        let worse = BTreeMap::from([("A".to_string(), 1)]);
+        assert!(reimport_regression(&worse, &trial, &before, &kept).unwrap().contains("A has 1"));
+        let cut = BTreeMap::from([("GND".to_string(), 1)]);
+        assert!(reimport_regression(&cut, &trial, &before, &kept).unwrap().contains("GND"));
     }
 
     #[test]
@@ -968,6 +1065,17 @@ mod tests {
         assert_eq!(without_items(board, &Default::default()).unwrap(), board);
         let missing: std::collections::HashSet<String> = ["nope".to_string()].into();
         assert!(without_items(board, &missing).is_err(), "a KIID not found is an error, not a silent no-op");
+        // A teardrop zone goes with its tracks; a plain zone never does.
+        let with_zones = board.replacen(
+            "\t(via",
+            "\t(zone\n\t\t(net \"A\")\n\t\t(uuid \"td1\")\n\t\t(attr\n\t\t\t(teardrop\n\t\t\t\t(type padvia)\n\t\t\t)\n\t\t)\n\t)\n\t(zone\n\t\t(net \"A\")\n\t\t(uuid \"z1\")\n\t)\n\t(via",
+            1,
+        );
+        let teardrop: std::collections::HashSet<String> = ["td1".to_string()].into();
+        let out = without_items(&with_zones, &teardrop).unwrap();
+        assert!(!out.contains("td1") && out.contains("\"z1\""), "{out}");
+        let plain: std::collections::HashSet<String> = ["z1".to_string()].into();
+        assert!(without_items(&with_zones, &plain).is_err());
         // A graphic with a matching uuid is never removed.
         let graphic: std::collections::HashSet<String> = ["t1".to_string()].into();
         assert!(without_items(board, &graphic).is_err());

@@ -1450,8 +1450,14 @@ pub(crate) struct WalkReport {
     /// A net with a zone or the intent role `plane`: only the footprint's own
     /// fan-out goes (the walk stops at its vias and at the pour).
     pub plane_net: bool,
+    /// A power or ground net (a plane net, intent role `power`, a ground-like
+    /// name, or more than 3 pads): the walk also stops at the first branch,
+    /// so a shared trunk and the other parts' taps stay.
+    pub supply_net: bool,
     pub items: usize,
-    /// Where the walk stopped, and how often: `other_pad`, `plane_via`, `zone`.
+    /// Where the walk stopped, and how often: `other_pad`, `plane_via`,
+    /// `zone`, `branch` (a tee or a node where 3 or more tracks meet, on a
+    /// supply net).
     pub stopped_at: BTreeMap<&'static str, usize>,
 }
 
@@ -1460,6 +1466,13 @@ fn point_segment_mm(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
     let len2 = dx * dx + dy * dy;
     let t = if len2 == 0.0 { 0.0 } else { (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0) };
     (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
+}
+
+/// A ground-like net name: `GND`, `AGND`, `GND_ISO`, `VSS…`, `0V` (after the
+/// sheet path).
+pub(crate) fn ground_like(net: &str) -> bool {
+    let name = net.rsplit('/').next().unwrap_or(net).to_ascii_uppercase();
+    name.contains("GND") || name.starts_with("VSS") || name == "0V"
 }
 
 /// Whether copper of half-width `reach` at `p` on `layer` (`None`: every
@@ -1504,6 +1517,7 @@ pub(crate) fn walk_from_footprint(
     pads: &[WalkPad],
     fills: &[ZoneFill],
     plane_nets: &BTreeSet<String>,
+    power_nets: &BTreeSet<String>,
 ) -> (BTreeSet<String>, Vec<WalkReport>) {
     let own: Vec<&WalkPad> = pads.iter().filter(|pad| pad.reference == reference).collect();
     let nets: BTreeSet<&str> = own.iter().filter_map(|pad| pad.net.as_deref()).collect();
@@ -1511,6 +1525,10 @@ pub(crate) fn walk_from_footprint(
     let mut reports = Vec::new();
     for net in nets {
         let plane = plane_nets.contains(net);
+        let supply = plane
+            || power_nets.contains(net)
+            || ground_like(net)
+            || pads.iter().filter(|pad| pad.net.as_deref() == Some(net)).count() > 3;
         let on_net: Vec<&CopperRecord> = items.iter().filter(|item| item.net == net).collect();
         let others: Vec<&WalkPad> = pads.iter().filter(|pad| pad.reference != reference && pad.net.as_deref() == Some(net)).collect();
         let own_pads: Vec<&&WalkPad> = own.iter().filter(|pad| pad.net.as_deref() == Some(net)).collect();
@@ -1555,6 +1573,28 @@ pub(crate) fn walk_from_footprint(
                     *stops.entry(stop).or_default() += 1;
                     continue;
                 }
+                if supply {
+                    // A branch point: three or more tracks meet here, or this
+                    // item lands on another one's body (a tap onto a trunk).
+                    let touching: Vec<&CopperRecord> = on_net
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, next)| *j != i && reaches_item(p, reach, layer.as_deref(), next))
+                        .map(|(_, next)| *next)
+                        .collect();
+                    let onto_body = touching.iter().any(|next| {
+                        next.kind != "via"
+                            && !node_points(next).iter().any(|q| (p.0 - q.0).hypot(p.1 - q.1) <= reach + next.width_mm / 2.0)
+                    });
+                    // Vias are joints, not branches: count the tracks and
+                    // arcs that meet here, this one included.
+                    let tracks_here = touching.iter().filter(|next| next.kind != "via").count()
+                        + usize::from(item.kind != "via");
+                    if tracks_here >= 3 || onto_body {
+                        *stops.entry("branch").or_default() += 1;
+                        continue;
+                    }
+                }
                 for (j, next) in on_net.iter().enumerate() {
                     if !visited[j] && reaches_item(p, reach, layer.as_deref(), next) {
                         visited[j] = true;
@@ -1573,7 +1613,11 @@ pub(crate) fn walk_from_footprint(
                         && stop_at(q, next.width_mm / 2.0, next_layer.as_deref()).is_none()
                         && !node_points(item).iter().any(|p| (p.0 - q.0).hypot(p.1 - q.1) <= reach + next.width_mm / 2.0)
                 });
-                if tee {
+                if tee && supply {
+                    // A tap onto this item's body: on a supply net this item
+                    // is a trunk; the tap belongs to another part.
+                    *stops.entry("branch").or_default() += 1;
+                } else if tee {
                     visited[j] = true;
                     queue.push_back(j);
                 }
@@ -1585,6 +1629,7 @@ pub(crate) fn walk_from_footprint(
             footprint: reference.to_string(),
             net: net.to_string(),
             plane_net: plane,
+            supply_net: supply,
             items: found.len(),
             stopped_at: stops,
         });
@@ -1594,7 +1639,11 @@ pub(crate) fn walk_from_footprint(
 
 /// Pads, zone fills and plane nets for the footprint walk, from the board
 /// text (and the design intent's `plane` roles beside it).
-fn walk_context(tree: &konnect_sexp::SexpNode, board: &Path) -> (Vec<WalkPad>, Vec<ZoneFill>, BTreeSet<String>) {
+/// Pads, fills, plane nets (a zone or intent role `plane`) and power nets
+/// (intent role `power`).
+type WalkContext = (Vec<WalkPad>, Vec<ZoneFill>, BTreeSet<String>, BTreeSet<String>);
+
+fn walk_context(tree: &konnect_sexp::SexpNode, board: &Path) -> WalkContext {
     let pads = crate::tools::fanout::copper_pads(tree)
         .into_iter()
         .map(|pad| WalkPad {
@@ -1622,10 +1671,12 @@ fn walk_context(tree: &konnect_sexp::SexpNode, board: &Path) -> (Vec<WalkPad>, V
     let intent = std::fs::read_to_string(format!("{}.intent.json", board.with_extension("").display()))
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let mut power_nets = BTreeSet::new();
     if let Some(nets) = intent.as_ref().and_then(|i| i["nets"].as_object()) {
         plane_nets.extend(nets.iter().filter(|(_, spec)| spec["role"] == "plane").map(|(net, _)| net.clone()));
+        power_nets.extend(nets.iter().filter(|(_, spec)| spec["role"] == "power").map(|(net, _)| net.clone()));
     }
-    (pads, fills, plane_nets)
+    (pads, fills, plane_nets, power_nets)
 }
 
 /// Item widths (tracks, arcs) and via diameters by KIID, from the board text.
@@ -1690,7 +1741,7 @@ pub(crate) async fn handle_rip_up_nets(args: &serde_json::Value, ctx: &ToolConte
     let result = with_board_ipc_classified(ctx, &board, move |client, document| {
         let source = client.save_document_to_string_in(document.clone())?;
         let tree = konnect_sexp::parse_sexp(&source).context("parse the live board")?;
-        let (pads, fills, plane_nets) = walk_context(&tree, &board_for_walk);
+        let (pads, fills, plane_nets, power_nets) = walk_context(&tree, &board_for_walk);
         let widths = copper_widths(&tree);
         let named_nets: BTreeSet<String> = nets.iter().cloned().collect();
         let board_nets: BTreeSet<&str> = pads.iter().filter_map(|pad| pad.net.as_deref()).collect();
@@ -1715,7 +1766,7 @@ pub(crate) async fn handle_rip_up_nets(args: &serde_json::Value, ctx: &ToolConte
             if !pads.iter().any(|pad| &pad.reference == reference) {
                 anyhow::bail!("footprint '{reference}' has no copper pad on the board");
             }
-            let (found, reports) = walk_from_footprint(reference, &records, &pads, &fills, &plane_nets);
+            let (found, reports) = walk_from_footprint(reference, &records, &pads, &fills, &plane_nets, &power_nets);
             walks.extend(reports);
             let walked: Vec<CopperRecord> = records
                 .iter()
@@ -2031,16 +2082,57 @@ mod rip_up_tests {
             polygon: vec![(2.0, 3.5), (7.0, 3.5), (7.0, 4.5), (2.0, 4.5)],
         }];
         let planes: BTreeSet<String> = ["GND".to_string()].into();
-        let (found, reports) = walk_from_footprint("U1", &items, &pads, &fills, &planes);
+        let (found, reports) = walk_from_footprint("U1", &items, &pads, &fills, &planes, &BTreeSet::new());
         assert_eq!(found, ["g1", "g4", "s1", "s2", "tee", "v1"].iter().map(|s| s.to_string()).collect::<BTreeSet<_>>());
         let gnd = reports.iter().find(|r| r.net == "GND").unwrap();
         assert!(gnd.plane_net);
         assert_eq!((gnd.stopped_at.get("plane_via"), gnd.stopped_at.get("zone")), (Some(&1), Some(&1)), "{gnd:?}");
         let sda = reports.iter().find(|r| r.net == "SDA").unwrap();
         assert_eq!((sda.items, sda.stopped_at.get("other_pad")), (3, Some(&1)), "{sda:?}");
-        // Without a plane role, GND is walked like a signal: through the via.
-        let (found, _) = walk_from_footprint("U1", &items, &pads, &fills, &BTreeSet::new());
+        // Without a plane role, GND is still a supply net (by name): it goes
+        // through the via, which is no branch, but stops nowhere else here.
+        let (found, _) = walk_from_footprint("U1", &items, &pads, &fills, &BTreeSet::new(), &BTreeSet::new());
         assert!(found.contains("g2") && found.contains("g5") && !found.contains("g3"), "{found:?}");
+    }
+
+    /// Review A: a traced +3V3 bus from U2 with taps to U1, C5 and U3.
+    /// Ripping U1 takes U1's own tap only; the trunk and the other parts'
+    /// taps stay, whether the tap meets the trunk mid-segment or at a joint.
+    #[test]
+    fn a_supply_trunk_and_other_parts_taps_stay() {
+        let pads = [
+            pad("U2", "+3V3", (0.0, 0.0)),
+            pad("U1", "+3V3", (5.0, 3.0)),
+            pad("C5", "+3V3", (10.0, 3.0)),
+            pad("U3", "+3V3", (15.0, 3.0)),
+            pad("U1", "SIG", (5.0, 6.0)),
+            pad("R1", "SIG", (5.0, 9.0)),
+        ];
+        let items = [
+            on("F.Cu", record("trunk1", "track", "+3V3", false, &[(0.0, 0.0), (10.0, 0.0)])),
+            on("F.Cu", record("trunk2", "track", "+3V3", false, &[(10.0, 0.0), (15.0, 0.0)])),
+            // U1's tap lands on the trunk's body.
+            on("F.Cu", record("tap_u1", "track", "+3V3", false, &[(5.0, 3.0), (5.0, 0.0)])),
+            // C5's tap meets the trunk at a joint (three tracks meet).
+            on("F.Cu", record("tap_c5", "track", "+3V3", false, &[(10.0, 3.0), (10.0, 0.0)])),
+            on("F.Cu", record("tap_u3", "track", "+3V3", false, &[(15.0, 3.0), (15.0, 0.0)])),
+            on("F.Cu", record("sig", "track", "SIG", false, &[(5.0, 6.0), (5.0, 9.0)])),
+        ];
+        let none = BTreeSet::new();
+        let (found, reports) = walk_from_footprint("U1", &items, &pads, &[], &none, &none);
+        assert_eq!(found, ["sig", "tap_u1"].iter().map(|s| s.to_string()).collect::<BTreeSet<_>>());
+        let supply = reports.iter().find(|r| r.net == "+3V3").unwrap();
+        assert!(supply.supply_net && !supply.plane_net);
+        assert_eq!(supply.stopped_at.get("branch"), Some(&1), "{supply:?}");
+        // C5 sits on a joint where three tracks meet.
+        let (found, _) = walk_from_footprint("C5", &items, &pads, &[], &none, &none);
+        assert_eq!(found, ["tap_c5"].iter().map(|s| s.to_string()).collect::<BTreeSet<_>>());
+        // Walked from the trunk's own part, the trunk stops at U1's tap.
+        let (found, _) = walk_from_footprint("U2", &items, &pads, &[], &none, &none);
+        assert_eq!(found, ["trunk1"].iter().map(|s| s.to_string()).collect::<BTreeSet<_>>());
+        // A signal net (two pads, no role) is walked to the next pad as before.
+        assert!(!reports.iter().find(|r| r.net == "SIG").unwrap().supply_net);
+        assert!(ground_like("/sheet/AGND") && ground_like("VSSA") && !ground_like("+3V3"));
     }
 
     #[test]
@@ -2074,6 +2166,33 @@ mod rip_up_tests {
         assert_eq!(summary[0]["tracks"], 1);
         assert_eq!(summary[0]["vias"], 1);
         assert_eq!(summary[0]["length_mm"], 5.0);
+    }
+
+    /// Review C: a project that ignores unconnected items would make every
+    /// net read as complete; the DRC copy always reports them.
+    #[test]
+    fn the_drc_copy_of_the_project_always_reports_unconnected_items() {
+        let ignored = r#"{"board": {"design_settings": {"rule_severities": {"unconnected_items": "ignore", "clearance": "warning"}}}, "meta": {"version": 3}}"#;
+        let fixed: serde_json::Value = serde_json::from_str(&project_for_drc(ignored)).unwrap();
+        assert_eq!(fixed["board"]["design_settings"]["rule_severities"]["unconnected_items"], "error");
+        assert_eq!(fixed["board"]["design_settings"]["rule_severities"]["clearance"], "warning", "nothing else changes");
+        let warning = ignored.replace("\"ignore\"", "\"warning\"");
+        assert_eq!(project_for_drc(&warning), warning, "a warning is still reported");
+        let already = ignored.replace("\"ignore\"", "\"error\"");
+        assert_eq!(project_for_drc(&already), already, "an error setting is copied verbatim");
+        assert_eq!(project_for_drc("{\"meta\": {}}"), "{\"meta\": {}}", "no setting: KiCad's default (error) applies");
+        assert_eq!(project_for_drc("not json"), "not json");
+    }
+
+    #[test]
+    fn only_teardrops_the_import_made_are_tracked() {
+        let after = konnect_sexp::parse_sexp(
+            "(kicad_pcb (zone (net \"A\") (uuid \"old\") (attr (teardrop (type padvia)))) \
+             (zone (net \"B\") (uuid \"new\") (attr (teardrop (type padvia)))) (zone (net \"B\") (uuid \"pour\")))",
+        )
+        .unwrap();
+        let found = new_teardrop_zones("(kicad_pcb (zone (uuid \"old\")))", &after);
+        assert_eq!(found, std::collections::HashMap::from([("new".to_string(), "B".to_string())]));
     }
 
     /// Review finding 2: the outputs are written last and a failure leaves
@@ -2735,12 +2854,14 @@ async fn drc_with_project_rules(
     let stem = board.file_stem().context("board has no file name")?;
     let copy = dir.path().join(stem).with_extension("kicad_pcb");
     std::fs::write(&copy, source).context("write board for DRC")?;
-    for extension in ["kicad_pro", "kicad_dru"] {
-        let rules = board.with_extension(extension);
-        if rules.is_file() {
-            std::fs::copy(&rules, copy.with_extension(extension))
-                .with_context(|| format!("copy {} for DRC", rules.display()))?;
-        }
+    let dru = board.with_extension("kicad_dru");
+    if dru.is_file() {
+        std::fs::copy(&dru, copy.with_extension("kicad_dru")).with_context(|| format!("copy {} for DRC", dru.display()))?;
+    }
+    let project = board.with_extension("kicad_pro");
+    if project.is_file() {
+        let text = std::fs::read_to_string(&project).with_context(|| format!("read {} for DRC", project.display()))?;
+        std::fs::write(copy.with_extension("kicad_pro"), project_for_drc(&text)).context("write project for DRC")?;
     }
     let report = cli::run_drc(cli_path, &copy, refill_zones).await?;
     // `run_drc` deletes KiCad's own JSON once it has parsed it (the file this
@@ -2748,6 +2869,23 @@ async fn drc_with_project_rules(
     // parsed report is what is kept.
     let json = serde_json::to_string_pretty(&report).context("serialize DRC report")?;
     Ok((report, json))
+}
+
+/// The project as the gates' DRC reads it: the user's rules, except that
+/// unconnected items are always reported. A project that ignores them makes
+/// KiCad write `unconnected_items: []`, which would read as every net
+/// connected and let a per-net import or a gate accept anything. The copy is
+/// ours; the user's project is not changed. Text that is not JSON is kept.
+fn project_for_drc(text: &str) -> String {
+    let Ok(mut project) = serde_json::from_str::<serde_json::Value>(text) else {
+        return text.to_string();
+    };
+    let severity = &mut project["board"]["design_settings"]["rule_severities"]["unconnected_items"];
+    if severity.as_str() == Some("ignore") {
+        *severity = serde_json::Value::String("error".into());
+        return serde_json::to_string_pretty(&project).unwrap_or_else(|_| text.to_string());
+    }
+    text.to_string()
 }
 
 /// What identifies one DRC violation across two runs: its rule and the KIIDs
@@ -3042,13 +3180,37 @@ struct LiveTrial<'a> {
     runtime: &'a tokio::runtime::Handle,
     /// The last trial: its nets, report and the report's JSON.
     last: Option<(BTreeSet<String>, cli::DrcReport, String)>,
+    /// Teardrop zones the import made (KIID → net): a trial without a net
+    /// leaves its teardrops out with its tracks.
+    new_teardrops: &'a std::collections::HashMap<String, String>,
+}
+
+/// Teardrop zones in `after` that `before` does not have, with their nets.
+/// KiCad 10 keeps teardrops as zones with `(attr (teardrop …))`; when the
+/// board generates them they appear with the imported tracks.
+fn new_teardrop_zones(before: &str, after: &konnect_sexp::SexpNode) -> std::collections::HashMap<String, String> {
+    after
+        .find_all("zone")
+        .into_iter()
+        .filter(|zone| zone.find("attr").and_then(|attr| attr.find("teardrop")).is_some())
+        .filter_map(|zone| {
+            let uuid = zone.find_str("uuid")?;
+            let net = zone.find("net").and_then(konnect_sexp::net::net_name)?;
+            (!before.contains(uuid)).then(|| (uuid.to_string(), net.to_string()))
+        })
+        .collect()
 }
 
 impl crate::tools::route_verdict::Trial for LiveTrial<'_> {
     fn run(&mut self, nets: &BTreeSet<String>) -> anyhow::Result<crate::tools::route_verdict::TrialResult> {
         use crate::tools::route_verdict as verdict;
-        let drop: HashSet<String> =
-            self.created.iter().filter(|(_, net)| !nets.contains(*net)).map(|(id, _)| id.clone()).collect();
+        let drop: HashSet<String> = self
+            .created
+            .iter()
+            .chain(self.new_teardrops.iter())
+            .filter(|(_, net)| !nets.contains(*net))
+            .map(|(id, _)| id.clone())
+            .collect();
         let text = verdict::without_items(self.full_text, &drop)?;
         let (report, json) = self.runtime.block_on(drc_with_project_rules(self.cli_path, self.board, &text, self.refill))?;
         let tree = konnect_sexp::parse_sexp(&text).context("parse the trial board")?;
@@ -3259,8 +3421,14 @@ async fn handle_apply_specctra_ses(
         let routes = plan.per_net();
         let routes_of = |net: &str| routes.iter().find(|r| r.net == net);
         let with_routes: BTreeSet<String> = items.iter().map(|(net, _)| net.clone()).collect();
-        let groups = import_groups(&board_for_ipc, &explicit_groups, &with_routes);
-        let units = verdict::units(&with_routes, &groups.iter().map(|(g, _)| g.clone()).collect::<Vec<_>>());
+        // Groups over the job's nets, so a pair half whose partner the router
+        // left unrouted is seen as half a pair.
+        let job_nets: BTreeSet<String> = plan.job_nets.iter().cloned().collect();
+        let groups = import_groups(&board_for_ipc, &explicit_groups, &job_nets);
+        let group_sets: Vec<BTreeSet<String>> = groups.iter().map(|(g, _)| g.clone()).collect();
+        let units = verdict::units(&with_routes, &group_sets);
+        let (units, orphaned) = verdict::drop_orphaned_halves(units, &group_sets, &with_routes, &unconnected_before);
+        let units = if accept == Accept::PerNet { units } else { verdict::units(&with_routes, &group_sets) };
 
         let count_of = |nets: &BTreeSet<String>, kind: &str| {
             items.iter().filter(|(net, item)| nets.contains(net) && item.type_url.ends_with(kind)).count()
@@ -3327,6 +3495,8 @@ async fn handle_apply_specctra_ses(
                 read_back(&with_routes)?;
                 let full_text = client.save_document_to_string_in(document.clone())?;
                 let created_map: std::collections::HashMap<String, String> = created.iter().cloned().collect();
+                let full_tree = konnect_sexp::parse_sexp(&full_text).context("parse the imported board")?;
+                let new_teardrops = new_teardrop_zones(&before, &full_tree);
                 let mut trial = LiveTrial {
                     full_text: &full_text,
                     created: &created_map,
@@ -3337,6 +3507,7 @@ async fn handle_apply_specctra_ses(
                     refill: plan.refill_zones,
                     runtime: &runtime,
                     last: None,
+                    new_teardrops: &new_teardrops,
                 };
                 let decision = match accept {
                     Accept::All => {
@@ -3365,12 +3536,16 @@ async fn handle_apply_specctra_ses(
                             ..Default::default()
                         }
                     }
-                    Accept::PerNet => verdict::decide(
-                        &units,
-                        &unconnected_before,
-                        verdict::DecideOptions { require_complete, max_rounds: MAX_IMPORT_ROUNDS, max_bisection_trials: bisection_budget(units.len()) },
-                        &mut trial,
-                    )?,
+                    Accept::PerNet => {
+                        let mut decided = verdict::decide(
+                            &units,
+                            &unconnected_before,
+                            verdict::DecideOptions { require_complete, max_rounds: MAX_IMPORT_ROUNDS, max_bisection_trials: bisection_budget(units.len()) },
+                            &mut trial,
+                        )?;
+                        decided.rejected.extend(orphaned.clone());
+                        decided
+                    }
                 };
                 let last = trial.last.take();
                 Ok((full_text, decision, last))
@@ -3418,6 +3593,13 @@ async fn handle_apply_specctra_ses(
                                 "the re-import of the kept nets has DRC errors its trial did not have ({})",
                                 describe_new_errors(&added)
                             );
+                        }
+                        // Nor more open connections, on a kept net or elsewhere.
+                        let unconnected = verdict::unconnected_by_net(&report, &item_nets)
+                            .context("the re-import's DRC reports no unconnected items")?;
+                        let trial_unconnected = decision.accepted_trial.as_ref().map(|t| t.unconnected.clone()).unwrap_or_default();
+                        if let Some(regression) = verdict::reimport_regression(&unconnected, &trial_unconnected, &unconnected_before, &decision.accepted) {
+                            anyhow::bail!("the re-import of the kept nets does not match its trial: {regression}");
                         }
                         Ok((text, report, json))
                     })();
@@ -3636,7 +3818,10 @@ async fn handle_apply_specctra_ses(
         })))
         }
         Err(failure) => {
-            let reason = failure.message().to_string();
+            let mut reason = failure.message().to_string();
+            if reason.contains("rolled back") || reason.contains("compensating deletion") {
+                reason.push_str(ROLLBACK_UNDO_WARNING);
+            }
             Ok(CallToolResult::error_kind(
                 ToolErrorKind::HandlerError {
                     reason: reason.clone(),
@@ -3646,6 +3831,11 @@ async fn handle_apply_specctra_ses(
         }
     }
 }
+
+/// Appended to a rolled-back import's error: the board is as before, but its
+/// undo history is not.
+const ROLLBACK_UNDO_WARNING: &str = " The undo history now holds this call's import and rollback commits \
+     (2 to 4 entries): one Ctrl-Z re-creates rolled-back routes, so do not undo past the state before this call.";
 
 /// `add_copper_pour` is an alias of `add_zone`; both build the same zone
 /// through [`crate::tools::pcb_board::add_zone_impl`]. They were two

@@ -1200,3 +1200,22 @@ Rebased by merging `safe-writes` 78bb158 (Pass 21); this pass was renumbered fro
 **Not done:**
 - No unit test for fixes 6 and 8: they are in the IPC closure, and no IPC fake exists.
 - The offline trials assume KiCad's DRC on the text equals the live board. The re-import's own DRC is the check on that.
+
+### Final follow-up (second review of 112e980)
+
+| # | Finding | Fix | Test (fails on 112e980) |
+|---|---|---|---|
+| A | The footprint walk ripped shared supply trunks: it followed tees and joints to the next pad in every direction. The tool text claimed otherwise | On a supply net the walk also stops at the first branch: a tap onto another track's body, or a node where 3 or more tracks meet (vias are joints, not branches). A supply net is a plane net, intent role `power`, a ground-like name (`GND`, `VSS…`, `0V`) or a net with more than 3 pads. `footprint_walk` gains `supply_net` and the stop reason `branch`. The tool text and tool-directory now say exactly that, and also that a segment goes whole: a part's own stretch of a trunk up to the first branch goes with it | `a_supply_trunk_and_other_parts_taps_stay` |
+| B | A pair half was kept when its partner had no routes, because groups were built from the routed nets only | Groups are built from the job's nets. A unit whose group has a member with no routes that was still unconnected before the import is rejected before any trial, with `decided_by: "group"` and the partner named. A partner that was already complete does not hold it back | `a_pair_half_without_its_partner_is_dropped_before_any_trial` |
+| C | A project with `unconnected_items` set to `ignore` made every net read complete | The project copy used for every Konnect DRC (`drc_with_project_rules`: per-net trials, the import gate, `route_path` and `fanout_to_plane` gates) sets `unconnected_items` back to `error` when the project ignores it. Other severities and the user's project are untouched | `the_drc_copy_of_the_project_always_reports_unconnected_items` |
+| D | API_MIGRATIONS said "at most 12 extra trial DRCs" | Corrected to 2·units + 8, capped at 64 | (doc) |
+
+**Optional and low-priority items:**
+- **Teardrops.** Trials now also leave out the teardrop zones the import created (zones with `(attr (teardrop …))` that the board did not have before) for the nets they cut. This is not checked live: no board here has teardrops enabled, and whether IPC-created tracks get teardrops is not established. Tests: `only_teardrops_the_import_made_are_tracked`, plus a teardrop case in `trial_boards_leave_out_exactly_the_named_items`.
+- **Re-import gate.** The re-import of the kept nets now also fails, and is rolled back, when a kept net has more unconnected items than in its trial, or when another net has more than before the import (`reimport_regression`, tested by `a_reimport_must_not_open_more_than_its_trial`).
+- **Undo warning on rollback.** A rolled-back import's error now ends with the undo warning: the history holds 2 to 4 entries from the call.
+
+**Tests:**
+- `konnect-core --lib`: 1959 passed, 0 failed.
+- Workspace: 2662 passed, 1 failed (the environmental `conformance_test` pin-label test).
+- `doc_tool_counts`: 6/6.

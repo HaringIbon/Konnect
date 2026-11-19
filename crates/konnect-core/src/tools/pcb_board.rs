@@ -1543,10 +1543,13 @@ pub fn tools() -> Vec<ToolDef> {
             "Rip up (delete) tracks, arcs and vias on the live board in one undo step, so a group \
              can be routed again without a checkpoint restore. Named nets go whole. A named \
              footprint takes only the copper connected to its pads: a walk outward from them \
-             that stops at other footprints' pads and, on a plane net (a zone, or intent role \
-             plane), at vias and at the pour, so it never takes GND or a supply beyond the \
-             part's own fan-out (name the net to take it all). footprint_walk reports each \
-             net's walk and where it stopped. Optionally only items touching a region (a via by \
+             that stops at other footprints' pads; on a plane net (a zone, or intent role \
+             plane) also at vias and at the pour; and on a power or ground net (plane, intent \
+             role power, a ground-like name, or more than 3 pads) also at the first branch (a \
+             tap onto another track, or 3+ tracks meeting), so a shared trunk and other parts' \
+             taps stay. A segment is taken whole, so a part's own stretch of a trunk up to the \
+             first branch goes with it. Name the net to take all of it. footprint_walk reports \
+             each net's walk and where it stopped. Optionally only items touching a region (a via by \
              its centre, a track or arc by any part of it; the item goes whole). Locked copper \
              (hand routes, fan-out) is kept unless include_locked is true and is listed in \
              locked_kept. Dry run by default; per-net counts and length; items are verified \
