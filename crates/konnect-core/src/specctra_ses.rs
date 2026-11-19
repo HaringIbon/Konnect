@@ -20,6 +20,14 @@ pub(crate) struct SesImportPlan {
     pub session_id: String,
     pub locked_track_count: usize,
     pub locked_via_count: usize,
+    /// The export fixed every existing track and via, locked or not (a grouped
+    /// export); the two counts above are then all existing items.
+    pub existing_routing_fixed: bool,
+    /// The nets a grouped export put in the routing job; `None` for a
+    /// whole-board export.
+    pub routing_group: Option<Vec<String>>,
+    /// Every net in the manifest's routing job.
+    pub job_nets: Vec<String>,
     /// The board has copper zones; refill them after applying the routes
     /// (schema-2 exports route plane nets as ordinary nets and drop the planes).
     pub refill_zones: bool,
@@ -30,6 +38,67 @@ pub(crate) struct SesImportPlan {
     pub tracks: Vec<SesTrack>,
     pub arcs: Vec<SesArc>,
     pub vias: Vec<SesVia>,
+}
+
+/// One net's share of an import plan.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct NetRoutes {
+    pub net: String,
+    pub tracks: usize,
+    pub arcs: usize,
+    pub vias: usize,
+    /// Length of the planned tracks and arcs (arcs by their chord through the
+    /// midpoint), mm.
+    pub length_mm: f64,
+}
+
+impl SesImportPlan {
+    /// Keep only the routes of `nets`. A name that is not in the routing job
+    /// is refused: it can only be a typo, and silently importing nothing for
+    /// it would read as "the router found no route".
+    pub(crate) fn retain_nets(&mut self, nets: &BTreeSet<String>) -> Result<()> {
+        let unknown: Vec<&String> = nets.iter().filter(|net| !self.job_nets.contains(net)).collect();
+        if !unknown.is_empty() {
+            bail!(
+                "net(s) {} are not in this routing job",
+                unknown.iter().map(|net| format!("'{net}'")).collect::<Vec<_>>().join(", ")
+            );
+        }
+        self.tracks.retain(|track| nets.contains(&track.net_name));
+        self.arcs.retain(|arc| nets.contains(&arc.net_name));
+        self.vias.retain(|via| nets.contains(&via.net_name));
+        Ok(())
+    }
+
+    /// Routes per net, sorted by net name; nets with no route are absent.
+    pub(crate) fn per_net(&self) -> Vec<NetRoutes> {
+        let mut by_net: BTreeMap<&str, NetRoutes> = BTreeMap::new();
+        for track in &self.tracks {
+            let routes = net_routes(&mut by_net, &track.net_name);
+            routes.tracks += 1;
+            routes.length_mm += (track.x2_mm - track.x1_mm).hypot(track.y2_mm - track.y1_mm);
+        }
+        for arc in &self.arcs {
+            let routes = net_routes(&mut by_net, &arc.net_name);
+            routes.arcs += 1;
+            routes.length_mm += (arc.mid_x_mm - arc.start_x_mm).hypot(arc.mid_y_mm - arc.start_y_mm)
+                + (arc.end_x_mm - arc.mid_x_mm).hypot(arc.end_y_mm - arc.mid_y_mm);
+        }
+        for via in &self.vias {
+            net_routes(&mut by_net, &via.net_name).vias += 1;
+        }
+        by_net.into_values().collect()
+    }
+}
+
+fn net_routes<'a, 'b>(by_net: &'b mut BTreeMap<&'a str, NetRoutes>, net: &'a str) -> &'b mut NetRoutes {
+    by_net.entry(net).or_insert_with(|| NetRoutes {
+        net: net.to_string(),
+        tracks: 0,
+        arcs: 0,
+        vias: 0,
+        length_mm: 0.0,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -79,6 +148,8 @@ struct Manifest {
     components: Vec<ManifestComponent>,
     nets: Vec<ManifestNet>,
     padstacks: Vec<ManifestPadstack>,
+    #[serde(default)]
+    routing_group: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +168,8 @@ struct SupportedProfile {
     outline: String,
     #[serde(default)]
     plane_layers: Vec<String>,
+    #[serde(default)]
+    existing_routing_fixed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,9 +279,10 @@ pub(crate) fn parse_import_plan(
         route_resolution,
         &manifest,
     )?;
-    if tracks.is_empty() && arcs.is_empty() && vias.is_empty() {
-        bail!("SES contains no route primitives");
-    }
+    // An empty session is a result, not a malformed file: a grouped job whose
+    // nets the router could not route at all comes back with no wire. The
+    // apply refuses it in `accept: "all"` and reports every net `no_routes`
+    // in `accept: "per_net"`.
     // A power layer is a plane; a trace on it would cut the plane.
     let planes = &manifest.supported_profile.plane_layers;
     if let Some(layer) = tracks
@@ -226,6 +300,9 @@ pub(crate) fn parse_import_plan(
         session_id,
         locked_track_count: manifest.supported_profile.locked_track_count,
         locked_via_count: manifest.supported_profile.locked_via_count,
+        existing_routing_fixed: manifest.supported_profile.existing_routing_fixed,
+        routing_group: manifest.routing_group.clone(),
+        job_nets: manifest.nets.iter().map(|net| net.name.clone()).collect(),
         refill_zones: manifest.supported_profile.copper_zones,
         duplicate_wires_dropped,
         tracks,
@@ -265,7 +342,8 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
     if !profile_ok || profile.outline.is_empty() || profile.pad_shapes.is_empty() {
         bail!("manifest does not describe a supported routing profile");
     }
-    let (locked_track_count, locked_via_count) = locked_routing_counts(board_source)?;
+    let (locked_track_count, locked_via_count) =
+        locked_routing_counts(board_source, profile.existing_routing_fixed)?;
     let has_locked_routing = locked_track_count > 0 || locked_via_count > 0;
     if manifest.supported_profile.existing_routing != has_locked_routing
         || manifest.supported_profile.locked_track_count != locked_track_count
@@ -293,13 +371,18 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
     validate_manifest_relations(manifest)
 }
 
-fn locked_routing_counts(board_source: &str) -> Result<(usize, usize)> {
+/// The existing tracks and vias the export held fixed: the locked ones, or
+/// with `all_fixed` (a grouped export) every one of them.
+fn locked_routing_counts(board_source: &str, all_fixed: bool) -> Result<(usize, usize)> {
     let tree =
         parse_sexp(board_source).context("parse KiCad board for locked-routing inventory")?;
     if !tree.find_all("arc").is_empty() {
         bail!("live board contains an unsupported routed arc");
     }
     let tracks = tree.find_all("segment");
+    if all_fixed {
+        return Ok((tracks.len(), tree.find_all("via").len()));
+    }
     if tracks
         .iter()
         .any(|track| track.find_str("locked") != Some("yes"))
@@ -973,6 +1056,20 @@ mod tests {
         assert_eq!(plan.vias[0].x_mm, 105.0);
         assert_eq!(plan.vias[0].y_mm, 51.0);
         assert_eq!(plan.vias[0].drill_mm, 0.3);
+    }
+
+    /// A job the router could not route at all comes back with an empty
+    /// `network_out`: a valid, empty plan (the apply decides what that means).
+    #[test]
+    fn an_empty_session_is_an_empty_plan() {
+        let (_dir, board, source, manifest) = fixture();
+        let start = sample_ses().find("      (net GND").unwrap();
+        let end = sample_ses().find("    )\n  )\n)").unwrap();
+        let empty = format!("{}{}", &sample_ses()[..start], &sample_ses()[end..]);
+        let plan = parse_import_plan(&board, &source, &manifest, &empty).unwrap();
+        assert!(plan.tracks.is_empty() && plan.vias.is_empty() && plan.arcs.is_empty());
+        assert!(plan.per_net().is_empty());
+        assert!(plan.job_nets.contains(&"GND".to_string()), "the job's nets are still known");
     }
 
     #[test]

@@ -286,13 +286,14 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "plan_specctra_ses_import",
-            "Validate a Freerouting Specctra SES against its revision-bound Konnect manifest and the exact live KiCad board. Returns every track and via that would be created; never mutates or saves the board.",
+            "Validate a Freerouting Specctra SES against its revision-bound Konnect manifest and the exact live KiCad board. Returns every track and via that would be created and a per-net summary (tracks, vias, length); never mutates or saves the board.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Open source .kicad_pcb used for the DSN export" },
                     "ses_path": { "type": "string", "description": "Freerouting .ses result" },
-                    "manifest_path": { "type": "string", "description": "Konnect reverse manifest written with the DSN" }
+                    "manifest_path": { "type": "string", "description": "Konnect reverse manifest written with the DSN" },
+                    "nets": { "type": "array", "items": { "type": "string" }, "description": "Only these nets' routes (each must be in the routing job)" }
                 },
                 "required": ["board", "ses_path", "manifest_path"]
             }),
@@ -301,14 +302,17 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC before committing.",
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC (project rules, zones refilled) against the board before the import. accept 'all' (default) keeps every route or none: any new DRC error by identity rolls everything back. accept 'per_net' judges each net on KiCad's DRC of the board, not the router's log: a net is kept when its routes add no DRC error and join something (fewer unconnected items, or none left); the rest are dropped and the kept ones re-imported in one commit. Every response lists nets[] (status imported/rejected/no_routes, reason, tracks, vias, session and board length, unconnected before/after, complete, new_drc_errors) and unconnected_by_net for the whole board.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Open source .kicad_pcb used for the DSN export" },
                     "ses_path": { "type": "string", "description": "Freerouting .ses result" },
                     "manifest_path": { "type": "string", "description": "Konnect reverse manifest written with the DSN" },
-                    "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced." }
+                    "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced." },
+                    "accept": { "type": "string", "enum": ["all", "per_net"], "default": "all", "description": "'all': all routes or none. 'per_net': keep each net that adds no DRC error and joins something" },
+                    "require_complete": { "type": "boolean", "default": false, "description": "With accept 'per_net', also drop nets left with unconnected items (no partial routes)" },
+                    "nets": { "type": "array", "items": { "type": "string" }, "description": "Import only these nets' routes (each must be in the routing job)" }
                 },
                 "required": ["board", "ses_path", "manifest_path", "candidate_output_path"]
             }),
@@ -1240,6 +1244,251 @@ pub(crate) async fn handle_delete_vias(args: &serde_json::Value, ctx: &ToolConte
     }
 }
 
+/// A track, arc or via as `rip_up_nets` sees it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) struct CopperRecord {
+    pub uuid: String,
+    /// `track`, `arc` or `via`.
+    pub kind: &'static str,
+    pub net: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    pub locked: bool,
+    /// The points that place the item: a track's ends, an arc's start, mid and
+    /// end, a via's centre (mm).
+    #[serde(skip)]
+    pub points: Vec<(f64, f64)>,
+    pub length_mm: f64,
+}
+
+/// A rectangle in board mm, corners in any order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Region {
+    pub x0: f64,
+    pub y0: f64,
+    pub x1: f64,
+    pub y1: f64,
+}
+
+impl Region {
+    fn contains(&self, (x, y): (f64, f64)) -> bool {
+        let (xa, xb) = (self.x0.min(self.x1), self.x0.max(self.x1));
+        let (ya, yb) = (self.y0.min(self.y1), self.y0.max(self.y1));
+        (xa..=xb).contains(&x) && (ya..=yb).contains(&y)
+    }
+}
+
+/// The items of `nets` to rip up: inside `region` when given (any placing
+/// point inside, so a track crossing into the region goes whole), locked ones
+/// only with `include_locked`. Returns the selection and the locked items it
+/// left. Pure, so it is tested without KiCad.
+pub(crate) fn select_rip_up(
+    items: &[CopperRecord],
+    nets: &BTreeSet<String>,
+    region: Option<Region>,
+    include_locked: bool,
+) -> (Vec<CopperRecord>, Vec<CopperRecord>) {
+    let in_scope = |item: &&CopperRecord| {
+        nets.contains(&item.net) && region.is_none_or(|r| item.points.iter().any(|p| r.contains(*p)))
+    };
+    let (locked, unlocked): (Vec<CopperRecord>, Vec<CopperRecord>) =
+        items.iter().filter(in_scope).cloned().partition(|item| item.locked);
+    if include_locked {
+        let mut all = unlocked;
+        all.extend(locked);
+        (all, Vec::new())
+    } else {
+        (unlocked, locked)
+    }
+}
+
+/// Every track, arc and via of the live board as a [`CopperRecord`].
+fn copper_records(items: &[prost_types::Any]) -> anyhow::Result<Vec<CopperRecord>> {
+    use konnect_ipc::gen::kiapi::board::types::{Arc, BoardLayer, Track, Via};
+    use konnect_ipc::gen::kiapi::common::types::LockedState;
+    let mm = |v: &Option<konnect_ipc::gen::kiapi::common::types::Vector2>| {
+        v.as_ref().map(|v| (konnect_ipc::builders::nm_to_mm(v.x_nm), konnect_ipc::builders::nm_to_mm(v.y_nm)))
+    };
+    let layer = |id: i32| {
+        BoardLayer::try_from(id).ok().and_then(konnect_ipc::builders::layer_name).map(str::to_string)
+    };
+    let locked = |state: i32| state == LockedState::LsLocked as i32;
+    let mut out = Vec::new();
+    for item in items {
+        if konnect_ipc::builders::any_is(item, "kiapi.board.types.Track") {
+            let t = Track::decode(item.value.as_slice())?;
+            let (Some(a), Some(b)) = (mm(&t.start), mm(&t.end)) else { continue };
+            out.push(CopperRecord {
+                uuid: t.id.map(|id| id.value).unwrap_or_default(),
+                kind: "track",
+                net: t.net.map(|n| n.name).unwrap_or_default(),
+                layer: layer(t.layer),
+                locked: locked(t.locked),
+                points: vec![a, b],
+                length_mm: (b.0 - a.0).hypot(b.1 - a.1),
+            });
+        } else if konnect_ipc::builders::any_is(item, "kiapi.board.types.Arc") {
+            let t = Arc::decode(item.value.as_slice())?;
+            let (Some(a), Some(m), Some(b)) = (mm(&t.start), mm(&t.mid), mm(&t.end)) else { continue };
+            out.push(CopperRecord {
+                uuid: t.id.map(|id| id.value).unwrap_or_default(),
+                kind: "arc",
+                net: t.net.map(|n| n.name).unwrap_or_default(),
+                layer: layer(t.layer),
+                locked: locked(t.locked),
+                points: vec![a, m, b],
+                length_mm: (m.0 - a.0).hypot(m.1 - a.1) + (b.0 - m.0).hypot(b.1 - m.1),
+            });
+        } else if konnect_ipc::builders::any_is(item, "kiapi.board.types.Via") {
+            let v = Via::decode(item.value.as_slice())?;
+            let Some(p) = mm(&v.position) else { continue };
+            out.push(CopperRecord {
+                uuid: v.id.map(|id| id.value).unwrap_or_default(),
+                kind: "via",
+                net: v.net.map(|n| n.name).unwrap_or_default(),
+                layer: None,
+                locked: locked(v.locked),
+                points: vec![p],
+                length_mm: 0.0,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Per-net totals of a rip-up selection.
+fn rip_up_summary(items: &[CopperRecord]) -> serde_json::Value {
+    let mut by_net: BTreeMap<&str, (usize, usize, usize, f64)> = BTreeMap::new();
+    for item in items {
+        let entry = by_net.entry(item.net.as_str()).or_default();
+        match item.kind {
+            "track" => entry.0 += 1,
+            "arc" => entry.1 += 1,
+            _ => entry.2 += 1,
+        }
+        entry.3 += item.length_mm;
+    }
+    serde_json::Value::Array(
+        by_net
+            .into_iter()
+            .map(|(net, (tracks, arcs, vias, length))| {
+                json!({ "net": net, "tracks": tracks, "arcs": arcs, "vias": vias, "length_mm": (length * 1000.0).round() / 1000.0 })
+            })
+            .collect(),
+    )
+}
+
+pub(crate) async fn handle_rip_up_nets(args: &serde_json::Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as ObjectType;
+    let board = get_path(args, "board")?;
+    let names = |field: &str| -> Result<Vec<String>, CallToolResult> {
+        let value = &args[field];
+        if value.is_null() {
+            return Ok(Vec::new());
+        }
+        let items = value.as_array().ok_or_else(|| invalid_specctra_argument(field, "must be an array of names"))?;
+        items
+            .iter()
+            .map(|item| match item.as_str() {
+                Some(name) if !name.trim().is_empty() => Ok(name.to_string()),
+                _ => Err(invalid_specctra_argument(field, "every entry must be a non-empty name")),
+            })
+            .collect()
+    };
+    let nets = match names("nets") {
+        Ok(nets) => nets,
+        Err(refusal) => return Ok(refusal),
+    };
+    let footprints = match names("footprints") {
+        Ok(footprints) => footprints,
+        Err(refusal) => return Ok(refusal),
+    };
+    if nets.is_empty() && footprints.is_empty() {
+        return Ok(invalid_specctra_argument("nets", "name nets, footprints, or both"));
+    }
+    let region = if args["region"].is_null() {
+        None
+    } else {
+        let r = &args["region"];
+        match (r["x0"].as_f64(), r["y0"].as_f64(), r["x1"].as_f64(), r["y1"].as_f64()) {
+            (Some(x0), Some(y0), Some(x1), Some(y1)) => Some(Region { x0, y0, x1, y1 }),
+            _ => return Ok(invalid_specctra_argument("region", "must be {x0, y0, x1, y1} in mm")),
+        }
+    };
+    let include_locked = args["include_locked"].as_bool().unwrap_or(false);
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let types = [ObjectType::KotPcbTrace, ObjectType::KotPcbArc, ObjectType::KotPcbVia];
+    let result = with_board_ipc_classified(ctx, &board, move |client, document| {
+        let source = client.save_document_to_string_in(document.clone())?;
+        let tree = konnect_sexp::parse_sexp(&source).context("parse the live board")?;
+        let pads = crate::tools::fanout::copper_pads(&tree);
+        let mut selected_nets: BTreeSet<String> = nets.iter().cloned().collect();
+        let board_nets: BTreeSet<&str> = pads.iter().filter_map(|pad| pad.net.as_deref()).collect();
+        let records = copper_records(&client.get_items_of_types_in(document.clone(), &types)?)?;
+        let unknown: Vec<&String> = nets
+            .iter()
+            .filter(|net| !board_nets.contains(net.as_str()) && !records.iter().any(|r| &&r.net == net))
+            .collect();
+        if !unknown.is_empty() {
+            anyhow::bail!("net(s) {} are not on the board", unknown.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", "));
+        }
+        for reference in &footprints {
+            let of_part: Vec<&str> = pads.iter().filter(|pad| &pad.reference == reference).filter_map(|pad| pad.net.as_deref()).collect();
+            if !pads.iter().any(|pad| &pad.reference == reference) {
+                anyhow::bail!("footprint '{reference}' has no copper pad on the board");
+            }
+            selected_nets.extend(of_part.into_iter().map(str::to_string));
+        }
+        let (selected, kept_locked) = select_rip_up(&records, &selected_nets, region, include_locked);
+        if dry_run || selected.is_empty() {
+            return Ok((selected_nets, selected, kept_locked, false));
+        }
+        let ids: Vec<String> = selected.iter().map(|item| item.uuid.clone()).collect();
+        if ids.iter().any(String::is_empty) {
+            anyhow::bail!("KiCad returned a track or via without a KIID; nothing was deleted");
+        }
+        client.run_commit("Rip up nets", |client| client.delete_items_in(document.clone(), ids.clone()))?;
+        let left: Vec<String> = copper_records(&client.get_items_of_types_in(document.clone(), &types)?)?
+            .into_iter()
+            .map(|item| item.uuid)
+            .filter(|uuid| ids.contains(uuid))
+            .collect();
+        if !left.is_empty() {
+            anyhow::bail!("{} item(s) still present after the rip-up: {}", left.len(), left.join(", "));
+        }
+        Ok((selected_nets, selected, kept_locked, true))
+    })
+    .await?;
+    match result {
+        Ok((nets, selected, kept_locked, deleted)) => Ok(CallToolResult::json(&json!({
+            "dry_run": dry_run,
+            "deleted": deleted,
+            "nets": nets,
+            "region": region.map(|r| json!({ "x0": r.x0, "y0": r.y0, "x1": r.x1, "y1": r.y1 })),
+            "count": selected.len(),
+            "by_net": rip_up_summary(&selected),
+            "locked_kept": {
+                "count": kept_locked.len(),
+                "by_net": rip_up_summary(&kept_locked),
+                "note": "locked copper (hand routes, fan-out) is kept unless include_locked is true"
+            },
+            "items": selected,
+            "undo": if deleted { "one KiCad undo step ('Rip up nets')" } else { "nothing changed" },
+            "next_step": if deleted {
+                "Export the nets as a group (export_specctra_dsn with nets) and route them again; refill zones if the board has any."
+            } else if dry_run {
+                "Dry run: call again with dry_run false to delete."
+            } else {
+                "Nothing matched."
+            },
+        }))),
+        Err(failure) => Ok(CallToolResult::error_kind(
+            ToolErrorKind::HandlerError { reason: failure.message().to_string() },
+            format!("rip_up_nets refused: {}", failure.message()),
+        )),
+    }
+}
+
 /// Apply thickness/size/visibility to a footprint field. Pure, for tests.
 fn restyle_field(
     field: &mut konnect_ipc::gen::kiapi::board::types::Field,
@@ -1362,6 +1611,136 @@ mod via_and_text_tool_tests {
         assert_eq!(attributes.stroke_width.unwrap().value_nm, 150_000);
         assert_eq!(attributes.size.unwrap().x_nm, 1_000_000);
         assert!(!field.visible);
+    }
+}
+
+#[cfg(test)]
+mod rip_up_tests {
+    use super::*;
+    use konnect_ipc::gen::kiapi::board::types::{Net, Track, Via};
+    use konnect_ipc::gen::kiapi::common::types::{Kiid, LockedState, Vector2};
+
+    fn record(uuid: &str, kind: &'static str, net: &str, locked: bool, points: &[(f64, f64)]) -> CopperRecord {
+        CopperRecord {
+            uuid: uuid.into(),
+            kind,
+            net: net.into(),
+            layer: None,
+            locked,
+            points: points.to_vec(),
+            length_mm: 1.0,
+        }
+    }
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn names(items: &[CopperRecord]) -> Vec<&str> {
+        items.iter().map(|i| i.uuid.as_str()).collect()
+    }
+
+    #[test]
+    fn nets_are_ripped_up_whole_or_inside_a_region_and_locked_copper_is_kept() {
+        let items = [
+            record("t1", "track", "SDA", false, &[(0.0, 0.0), (5.0, 0.0)]),
+            record("t2", "track", "SDA", false, &[(5.0, 0.0), (20.0, 0.0)]),
+            record("v1", "via", "SDA", true, &[(20.0, 0.0)]),
+            record("t3", "track", "GND", false, &[(1.0, 1.0), (2.0, 1.0)]),
+        ];
+        let sda: BTreeSet<String> = ["SDA".to_string()].into();
+        let (all, kept) = select_rip_up(&items, &sda, None, false);
+        assert_eq!(names(&all), ["t1", "t2"]);
+        assert_eq!(names(&kept), ["v1"]);
+        let (all, kept) = select_rip_up(&items, &sda, None, true);
+        assert_eq!(names(&all), ["t1", "t2", "v1"]);
+        assert!(kept.is_empty());
+        // A region with its corners in any order; a track with one end inside
+        // goes whole.
+        let region = Region { x0: 6.0, y0: 1.0, x1: -1.0, y1: -1.0 };
+        let (inside, _) = select_rip_up(&items, &sda, Some(region), true);
+        assert_eq!(names(&inside), ["t1", "t2"]);
+        let far = Region { x0: 50.0, y0: 50.0, x1: 60.0, y1: 60.0 };
+        assert!(select_rip_up(&items, &sda, Some(far), true).0.is_empty());
+    }
+
+    #[test]
+    fn live_items_become_records_with_lock_state_and_length() {
+        let net = Some(Net { name: "SDA".into(), ..Default::default() });
+        let track = Track {
+            id: Some(Kiid { value: "t".into() }),
+            start: Some(Vector2 { x_nm: 0, y_nm: 0 }),
+            end: Some(Vector2 { x_nm: 3_000_000, y_nm: 4_000_000 }),
+            locked: LockedState::LsLocked as i32,
+            net: net.clone(),
+            ..Default::default()
+        };
+        let via = Via {
+            id: Some(Kiid { value: "v".into() }),
+            position: Some(Vector2 { x_nm: 1_000_000, y_nm: 2_000_000 }),
+            net,
+            ..Default::default()
+        };
+        let records = copper_records(&[
+            konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track"),
+            konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via"),
+        ])
+        .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!((records[0].kind, records[0].locked, records[0].net.as_str()), ("track", true, "SDA"));
+        assert!((records[0].length_mm - 5.0).abs() < 1e-9);
+        assert_eq!((records[1].kind, records[1].locked), ("via", false));
+        assert_eq!(records[1].points, vec![(1.0, 2.0)]);
+        let summary = rip_up_summary(&records);
+        assert_eq!(summary[0]["tracks"], 1);
+        assert_eq!(summary[0]["vias"], 1);
+        assert_eq!(summary[0]["length_mm"], 5.0);
+    }
+
+    #[test]
+    fn the_ses_net_filter_refuses_empty_and_blank_names() {
+        assert_eq!(ses_net_filter(&json!({})).unwrap(), None);
+        assert_eq!(ses_net_filter(&json!({ "nets": ["A", "B"] })).unwrap().unwrap().len(), 2);
+        assert!(ses_net_filter(&json!({ "nets": [] })).is_err());
+        assert!(ses_net_filter(&json!({ "nets": [" "] })).is_err());
+        assert!(ses_net_filter(&json!({ "nets": "A" })).is_err());
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_bad_accept_and_require_complete_without_per_net() {
+        let ctx = test_ctx();
+        let base = json!({ "board": "/x/b.kicad_pcb", "ses_path": "/x/b.ses", "manifest_path": "/x/m.json", "candidate_output_path": "/x/c.kicad_pcb" });
+        let mut bad = base.clone();
+        bad["accept"] = json!("some");
+        let result = handle_apply_specctra_ses(&bad, &ctx).await.unwrap();
+        assert!(result.is_error);
+        let mut lonely = base.clone();
+        lonely["require_complete"] = json!(true);
+        let result = handle_apply_specctra_ses(&lonely, &ctx).await.unwrap();
+        assert!(result.is_error);
+        let text = serde_json::to_string(&result).unwrap();
+        assert!(text.contains("per_net"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn rip_up_needs_nets_or_footprints_and_a_whole_region() {
+        let ctx = test_ctx();
+        let none = handle_rip_up_nets(&json!({ "board": "/x/b.kicad_pcb" }), &ctx).await.unwrap();
+        assert!(none.is_error);
+        let half = handle_rip_up_nets(&json!({ "board": "/x/b.kicad_pcb", "nets": ["A"], "region": { "x0": 1 } }), &ctx).await.unwrap();
+        assert!(half.is_error);
+        assert!(serde_json::to_string(&half).unwrap().contains("region"));
     }
 }
 
@@ -1775,6 +2154,10 @@ async fn handle_plan_specctra_ses_import(
             "must have the .kicad_pcb extension",
         ));
     }
+    let net_filter = match ses_net_filter(args) {
+        Ok(filter) => filter,
+        Err(refusal) => return Ok(refusal),
+    };
     let (_ses_path, ses_source, manifest_source) = match read_specctra_inputs(args).await? {
         Ok(inputs) => inputs,
         Err(error) => return Ok(error),
@@ -1785,12 +2168,15 @@ async fn handle_plan_specctra_ses_import(
     let board_for_ipc = board.clone();
     let result = with_board_ipc_classified(ctx, &board, move |client, document| {
         let before = client.save_document_to_string_in(document.clone())?;
-        let plan = crate::specctra_ses::parse_import_plan(
+        let mut plan = crate::specctra_ses::parse_import_plan(
             &board_for_ipc,
             &before,
             &manifest_source,
             &ses_source,
         )?;
+        if let Some(filter) = &net_filter {
+            plan.retain_nets(filter)?;
+        }
         let after = client.save_document_to_string_in(document)?;
         if before != after {
             anyhow::bail!("KiCad board changed while the SES import was planned; retry from a stable editor revision");
@@ -1810,8 +2196,16 @@ async fn handle_plan_specctra_ses_import(
             "via_count": plan.vias.len(),
             "preserved_locked_routing": {
                 "tracks": plan.locked_track_count,
-                "vias": plan.locked_via_count
+                "vias": plan.locked_via_count,
+                "all_existing_fixed": plan.existing_routing_fixed
             },
+            "routing_group": plan.routing_group,
+            "warning": (plan.tracks.is_empty() && plan.arcs.is_empty() && plan.vias.is_empty())
+                .then_some("The session has no routes (for the requested nets): the router routed nothing. apply_specctra_ses with accept 'per_net' reports each net as no_routes; 'all' refuses it."),
+            "nets": plan.per_net().into_iter().map(|mut routes| {
+                routes.length_mm = (routes.length_mm * 1000.0).round() / 1000.0;
+                routes
+            }).collect::<Vec<_>>(),
             "tracks": plan.tracks,
             "arcs": plan.arcs,
             "vias": plan.vias,
@@ -1829,6 +2223,55 @@ async fn handle_plan_specctra_ses_import(
     }
 }
 
+/// How `apply_specctra_ses` decides what to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Accept {
+    /// Every route or none (the original behaviour).
+    All,
+    /// Each net on its own evidence: kept when it adds no DRC error and joins
+    /// something; the rest are left out and reported.
+    PerNet,
+}
+
+/// Rounds of "import, check, drop the failing nets" before giving up. Each
+/// round costs one DRC; nets interacting so that dropping one exposes an error
+/// in another are rare.
+const MAX_IMPORT_ROUNDS: usize = 4;
+
+/// One net's result in an SES import.
+#[derive(Debug, Clone, serde::Serialize)]
+struct NetOutcome {
+    net: String,
+    /// `imported`, `rejected`, or `no_routes` (the session has nothing for it).
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    tracks: usize,
+    arcs: usize,
+    vias: usize,
+    /// Length of the session's tracks and arcs for the net (imported or
+    /// not), mm.
+    session_length_mm: f64,
+    /// KiCad's unconnected items on the net before the import and after it
+    /// (for a rejected net: with its routes, in the round that rejected it).
+    unconnected_before: Option<usize>,
+    unconnected_after: Option<usize>,
+    /// No unconnected item left on the net, judged by KiCad's DRC of the
+    /// board, never by the router's log.
+    complete: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    new_drc_errors: Vec<crate::tools::route_verdict::ErrorBrief>,
+    /// All copper of the net on the board after the import.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    board_length_mm: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    board_vias: Option<usize>,
+}
+
+fn round3(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
+}
+
 #[derive(Debug)]
 struct ApplyEvidence {
     source_sha256: String,
@@ -1839,12 +2282,17 @@ struct ApplyEvidence {
     created_count: usize,
     preserved_locked_track_count: usize,
     preserved_locked_via_count: usize,
+    existing_routing_fixed: bool,
     drc_errors: usize,
     drc_warnings: usize,
     baseline_drc_errors: usize,
     unconnected_items: usize,
     schematic_parity_violations: usize,
     refill_zones: bool,
+    nets: Vec<NetOutcome>,
+    /// Every net still open on the board after the import, from KiCad's DRC.
+    unconnected_by_net: BTreeMap<String, usize>,
+    rounds: usize,
 }
 
 /// DRC of `source` with the project's own rules: KiCad reads the
@@ -1868,7 +2316,10 @@ async fn drc_with_project_rules(
         }
     }
     let report = cli::run_drc(cli_path, &copy, refill_zones).await?;
-    let json = std::fs::read_to_string(copy.with_extension("drc.json")).unwrap_or_default();
+    // `run_drc` deletes KiCad's own JSON once it has parsed it (the file this
+    // used to read, so `apply_specctra_ses` wrote an empty `.drc.json`); the
+    // parsed report is what is kept.
+    let json = serde_json::to_string_pretty(&report).context("serialize DRC report")?;
     Ok((report, json))
 }
 
@@ -2054,10 +2505,45 @@ fn created_route_item_ids(items: &[prost_types::Any]) -> anyhow::Result<Vec<Stri
     Ok(ids)
 }
 
+/// The optional `nets` filter of the SES tools: `None` when absent.
+fn ses_net_filter(args: &serde_json::Value) -> Result<Option<BTreeSet<String>>, CallToolResult> {
+    let value = &args["nets"];
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(items) = value.as_array() else {
+        return Err(invalid_specctra_argument("nets", "must be an array of net names"));
+    };
+    let mut nets = BTreeSet::new();
+    for item in items {
+        match item.as_str() {
+            Some(name) if !name.trim().is_empty() => {
+                nets.insert(name.to_string());
+            }
+            _ => return Err(invalid_specctra_argument("nets", "every entry must be a non-empty net name")),
+        }
+    }
+    if nets.is_empty() {
+        return Err(invalid_specctra_argument("nets", "must name at least one net; omit it to import every net"));
+    }
+    Ok(Some(nets))
+}
+
+/// What one import round found.
+struct RoundCheck {
+    candidate_source: String,
+    report: cli::DrcReport,
+    report_json: String,
+    added: usize,
+    blame: crate::tools::route_verdict::Attribution,
+    unconnected: BTreeMap<String, usize>,
+}
+
 async fn handle_apply_specctra_ses(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    use crate::tools::route_verdict as verdict;
     let board = get_path(args, "board")?;
     let candidate = get_path(args, "candidate_output_path")?;
     if !extension_is(&board, "kicad_pcb") {
@@ -2072,6 +2558,22 @@ async fn handle_apply_specctra_ses(
             "must have the .kicad_pcb extension",
         ));
     }
+    let accept = match args["accept"].as_str() {
+        None | Some("all") => Accept::All,
+        Some("per_net") => Accept::PerNet,
+        Some(_) => return Ok(invalid_specctra_argument("accept", "must be 'all' or 'per_net'")),
+    };
+    let require_complete = args["require_complete"].as_bool().unwrap_or(false);
+    if require_complete && accept == Accept::All {
+        return Ok(invalid_specctra_argument(
+            "require_complete",
+            "applies only with accept 'per_net'",
+        ));
+    }
+    let net_filter = match ses_net_filter(args) {
+        Ok(filter) => filter,
+        Err(refusal) => return Ok(refusal),
+    };
     let drc_output = candidate.with_extension("drc.json");
     let conflicts = [&candidate, &drc_output]
         .into_iter()
@@ -2122,12 +2624,18 @@ async fn handle_apply_specctra_ses(
             );
         }
         let before = client.save_document_to_string_in(document.clone())?;
-        let plan = crate::specctra_ses::parse_import_plan(
+        let mut plan = crate::specctra_ses::parse_import_plan(
             &board_for_ipc,
             &before,
             &manifest_source,
             &ses_source,
         )?;
+        if let Some(filter) = &net_filter {
+            plan.retain_nets(filter)?;
+        }
+        if accept == Accept::All && plan.tracks.is_empty() && plan.arcs.is_empty() && plan.vias.is_empty() {
+            anyhow::bail!("the session has no routes for the requested nets");
+        }
 
         use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as ObjectType;
         let existing_tracks = client.get_items_in(document.clone(), ObjectType::KotPcbTrace)?;
@@ -2138,7 +2646,8 @@ async fn handle_apply_specctra_ses(
             || existing_vias.len() != plan.locked_via_count
         {
             anyhow::bail!(
-                "live locked-routing inventory changed: manifest has {} track(s)/{} via(s), IPC read {} track(s)/{} arc(s)/{} via(s)",
+                "live {}routing inventory changed: manifest has {} track(s)/{} via(s), IPC read {} track(s)/{} arc(s)/{} via(s)",
+                if plan.existing_routing_fixed { "" } else { "locked-" },
                 plan.locked_track_count,
                 plan.locked_via_count,
                 existing_tracks.len(),
@@ -2151,7 +2660,9 @@ async fn handle_apply_specctra_ses(
             .into_iter()
             .map(|net| (net.name, net.netcode))
             .collect::<BTreeMap<_, _>>();
-        let mut items = Vec::with_capacity(plan.tracks.len() + plan.arcs.len() + plan.vias.len());
+        // Every planned primitive with its net, in plan order.
+        let mut items: Vec<(String, prost_types::Any)> =
+            Vec::with_capacity(plan.tracks.len() + plan.arcs.len() + plan.vias.len());
         for track in &plan.tracks {
             konnect_ipc::builders::try_layer_from_name(&track.layer)?;
             let net_code = *net_codes
@@ -2167,10 +2678,7 @@ async fn handle_apply_specctra_ses(
                 track.x2_mm,
                 track.y2_mm,
             );
-            items.push(konnect_ipc::builders::pack_any(
-                &item,
-                "kiapi.board.types.Track",
-            ));
+            items.push((track.net_name.clone(), konnect_ipc::builders::pack_any(&item, "kiapi.board.types.Track")));
         }
         for arc in &plan.arcs {
             konnect_ipc::builders::try_layer_from_name(&arc.layer)?;
@@ -2182,7 +2690,7 @@ async fn handle_apply_specctra_ses(
                 arc.start_x_mm, arc.start_y_mm, arc.mid_x_mm, arc.mid_y_mm,
                 arc.end_x_mm, arc.end_y_mm,
             );
-            items.push(konnect_ipc::builders::pack_any(&item, "kiapi.board.types.Arc"));
+            items.push((arc.net_name.clone(), konnect_ipc::builders::pack_any(&item, "kiapi.board.types.Arc")));
         }
         for via in &plan.vias {
             let net_code = *net_codes
@@ -2196,149 +2704,308 @@ async fn handle_apply_specctra_ses(
                 via.drill_mm,
                 via.size_mm,
             );
-            items.push(konnect_ipc::builders::pack_any(
-                &item,
-                "kiapi.board.types.Via",
-            ));
+            items.push((via.net_name.clone(), konnect_ipc::builders::pack_any(&item, "kiapi.board.types.Via")));
         }
         let stable = client.save_document_to_string_in(document.clone())?;
         if stable != before {
             anyhow::bail!("KiCad board changed while route items were prepared; retry from a stable editor revision");
         }
-        let expected_count = items.len();
-        let created_ids = client.run_commit("Import Freerouting SES", |client| {
-            let created = client.create_items_in_returning(document.clone(), items)?;
-            if created.len() != expected_count {
-                anyhow::bail!(
-                    "KiCad returned {} created items for {} planned route primitives",
-                    created.len(),
-                    expected_count
-                );
-            }
-            created_route_item_ids(&created)
-        })?;
 
-        // KiCad 10 publishes neither GetItems nor SaveDocumentToString changes
-        // while a commit is open. End the single user-visible undo transaction,
-        // then validate the exact live inventory and serialized candidate. If
-        // any post-commit gate fails, delete only the KIIDs returned by
-        // CreateItems in a compensating transaction and prove the original
-        // serialized board was restored.
-        let operation = (|| {
-            let read_tracks = client.get_items_in(document.clone(), ObjectType::KotPcbTrace)?;
-            let read_arcs = client.get_items_in(document.clone(), ObjectType::KotPcbArc)?;
-            let read_vias = client.get_items_in(document.clone(), ObjectType::KotPcbVia)?;
-            if read_tracks.len() != plan.locked_track_count + plan.tracks.len()
-                || read_arcs.len() != plan.arcs.len()
-                || read_vias.len() != plan.locked_via_count + plan.vias.len()
-            {
+        // The baseline: the board as it is, with the project's rules and
+        // zones refilled when it has any.
+        let (baseline, baseline_json) = runtime.block_on(drc_with_project_rules(
+            &cli_path,
+            &board_for_ipc,
+            &before,
+            plan.refill_zones,
+        ))?;
+        let before_tree = konnect_sexp::parse_sexp(&before).context("parse the board before the import")?;
+        let before_nets = verdict::item_nets(&before_tree);
+        let unconnected_before = verdict::unconnected_by_net(&baseline, &before_nets);
+        if accept == Accept::PerNet && unconnected_before.is_none() {
+            anyhow::bail!("this kicad-cli reports no unconnected items, so no net's routing can be verified; use accept 'all'");
+        }
+        let unconnected_before = unconnected_before.unwrap_or_default();
+        let routes = plan.per_net();
+        let routes_of = |net: &str| routes.iter().find(|r| r.net == net);
+
+        // Delete exactly the created KIIDs and prove the board serialises as
+        // it did before the import.
+        let rollback = |client: &konnect_ipc::client::KiCadIpcClient, ids: &[String], why: &str| -> anyhow::Result<()> {
+            client
+                .run_commit("Rollback failed Freerouting SES import", |client| {
+                    client.delete_items_in(document.clone(), ids.to_vec())
+                })
+                .with_context(|| format!("{why}; the compensating deletion also failed"))?;
+            let restored = client.save_document_to_string_in(document.clone())?;
+            if restored != before {
+                anyhow::bail!("{why}; compensating deletion completed but the live board did not return to its exact pre-import serialization");
+            }
+            Ok(())
+        };
+
+        let mut importing: BTreeSet<String> = items.iter().map(|(net, _)| net.clone()).collect();
+        let mut outcomes: BTreeMap<String, NetOutcome> = BTreeMap::new();
+        let mut rounds = 0;
+        let mut accepted: Option<(Vec<String>, RoundCheck)> = None;
+        while !importing.is_empty() {
+            rounds += 1;
+            if rounds > MAX_IMPORT_ROUNDS {
                 anyhow::bail!(
-                    "post-commit IPC read-back mismatch: expected {} tracks/{} arcs/{} vias, read {} tracks/{} arcs/{} vias",
-                    plan.locked_track_count + plan.tracks.len(),
-                    plan.arcs.len(),
-                    plan.locked_via_count + plan.vias.len(),
-                    read_tracks.len(), read_arcs.len(), read_vias.len()
+                    "nets kept failing after {MAX_IMPORT_ROUNDS} rounds of dropping the failing ones; nothing was imported"
                 );
             }
-            let candidate_source = client.save_document_to_string_in(document.clone())?;
-            konnect_sexp::write_new_atomic(&candidate_for_ipc, &candidate_source)
-                .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
-            // Both DRCs use the project's own rules, and a board with zones is
-            // checked with them refilled: the planes only reconnect once the
-            // zones are refilled around the new copper.
-            let (baseline, _) = runtime.block_on(drc_with_project_rules(
-                &cli_path,
-                &board_for_ipc,
-                &before,
-                plan.refill_zones,
-            ))?;
-            let (drc, drc_json) = runtime.block_on(drc_with_project_rules(
-                &cli_path,
-                &board_for_ipc,
-                &candidate_source,
-                plan.refill_zones,
-            ))?;
-            std::fs::write(&drc_output_for_ipc, drc_json)
-                .with_context(|| format!("write {}", drc_output_for_ipc.display()))?;
-            // The import may not add a DRC error the board did not already
-            // have (a short through a plane-net via, a clearance violation):
-            // any new error rolls the whole import back.
-            // Compared by identity (rule + involved KIIDs), not by count per
-            // rule: a new short must not hide behind an error the routes fixed.
-            let before_errors = drc_errors_by_rule(&baseline);
-            let after_errors = drc_errors_by_rule(&drc);
-            let added = new_drc_errors(&baseline, &drc);
-            if !added.is_empty() {
-                anyhow::bail!(
-                    "the routes add DRC errors ({}); the import was rolled back",
-                    describe_new_errors(&added)
-                );
+            let subset: Vec<(String, prost_types::Any)> =
+                items.iter().filter(|(net, _)| importing.contains(net)).cloned().collect();
+            let expected_count = subset.len();
+            let nets_in_order: Vec<String> = subset.iter().map(|(net, _)| net.clone()).collect();
+            let label = if accept == Accept::PerNet && importing.len() < routes.len() {
+                format!("Import Freerouting SES ({} of {} nets)", importing.len(), routes.len())
+            } else {
+                "Import Freerouting SES".to_string()
+            };
+            let created_ids = client.run_commit(&label, |client| {
+                let created = client.create_items_in_returning(
+                    document.clone(),
+                    subset.into_iter().map(|(_, item)| item).collect(),
+                )?;
+                if created.len() != expected_count {
+                    anyhow::bail!(
+                        "KiCad returned {} created items for {} planned route primitives",
+                        created.len(),
+                        expected_count
+                    );
+                }
+                created_route_item_ids(&created)
+            })?;
+            let created_nets: std::collections::HashMap<String, String> =
+                created_ids.iter().cloned().zip(nets_in_order.iter().cloned()).collect();
+            let count = |kind: &str| items.iter().filter(|(net, item)| importing.contains(net) && item.type_url.ends_with(kind)).count();
+            let (new_tracks, new_arcs, new_vias) = (count(".Track"), count(".Arc"), count(".Via"));
+
+            // KiCad 10 publishes neither GetItems nor SaveDocumentToString
+            // changes while a commit is open, so the checks run after it.
+            let check = (|| -> anyhow::Result<RoundCheck> {
+                let read_tracks = client.get_items_in(document.clone(), ObjectType::KotPcbTrace)?;
+                let read_arcs = client.get_items_in(document.clone(), ObjectType::KotPcbArc)?;
+                let read_vias = client.get_items_in(document.clone(), ObjectType::KotPcbVia)?;
+                if read_tracks.len() != plan.locked_track_count + new_tracks
+                    || read_arcs.len() != new_arcs
+                    || read_vias.len() != plan.locked_via_count + new_vias
+                {
+                    anyhow::bail!(
+                        "post-commit IPC read-back mismatch: expected {} tracks/{} arcs/{} vias, read {} tracks/{} arcs/{} vias",
+                        plan.locked_track_count + new_tracks,
+                        new_arcs,
+                        plan.locked_via_count + new_vias,
+                        read_tracks.len(), read_arcs.len(), read_vias.len()
+                    );
+                }
+                let candidate_source = client.save_document_to_string_in(document.clone())?;
+                let (report, report_json) = runtime.block_on(drc_with_project_rules(
+                    &cli_path,
+                    &board_for_ipc,
+                    &candidate_source,
+                    plan.refill_zones,
+                ))?;
+                let tree = konnect_sexp::parse_sexp(&candidate_source).context("parse the candidate board")?;
+                let mut nets = before_nets.clone();
+                nets.extend(verdict::item_nets(&tree));
+                let added = new_drc_errors(&baseline, &report);
+                let blame = verdict::attribute_errors(&added, &created_nets, &importing, &nets);
+                let unconnected = verdict::unconnected_by_net(&report, &nets).unwrap_or_default();
+                Ok(RoundCheck { candidate_source, added: added.len(), blame, unconnected, report, report_json })
+            })();
+            let check = match check {
+                Ok(check) => check,
+                Err(error) => {
+                    rollback(client, &created_ids, &format!("SES import failed ({error:#})"))?;
+                    return Err(error);
+                }
+            };
+            if accept == Accept::All {
+                if check.added > 0 {
+                    let added = new_drc_errors(&baseline, &check.report);
+                    let by_net = check
+                        .blame
+                        .by_net
+                        .iter()
+                        .map(|(net, errors)| format!("{net}: {}", errors.len()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let why = format!(
+                        "the routes add DRC errors ({}); the import was rolled back. Errors by net: {}. \
+                         accept 'per_net' keeps the nets that add none",
+                        describe_new_errors(&added),
+                        if by_net.is_empty() { "none attributable".to_string() } else { by_net }
+                    );
+                    rollback(client, &created_ids, &why)?;
+                    anyhow::bail!(why);
+                }
+                accepted = Some((created_ids, check));
+                break;
             }
-            let parity_count = drc.schematic_parity.as_ref().map_or(0, Vec::len);
-            Ok(ApplyEvidence {
-                source_sha256: plan.source_sha256.clone(),
-                session_id: plan.session_id.clone(),
-                track_count: plan.tracks.len(),
-                arc_count: plan.arcs.len(),
-                via_count: plan.vias.len(),
-                created_count: created_ids.len(),
-                preserved_locked_track_count: plan.locked_track_count,
-                preserved_locked_via_count: plan.locked_via_count,
-                drc_errors: after_errors.values().sum(),
-                drc_warnings: drc.violations.iter().filter(|v| v.severity != "error").count(),
-                baseline_drc_errors: before_errors.values().sum(),
-                unconnected_items: drc.unconnected_items.as_ref().map_or(0, Vec::len),
-                schematic_parity_violations: parity_count,
-                refill_zones: plan.refill_zones,
-            })
-        })();
-        match operation {
-            Ok(evidence) => Ok(evidence),
-            Err(error) => {
-                let rollback = client.run_commit("Rollback failed Freerouting SES import", |client| {
-                    client.delete_items_in(document.clone(), created_ids.clone())
-                });
-                if let Err(rollback_error) = rollback {
-                    anyhow::bail!(
-                        "SES import failed ({error}); compensating deletion also failed ({rollback_error})"
-                    );
-                }
-                let restored = client.save_document_to_string_in(document.clone())?;
-                if restored != before {
-                    anyhow::bail!(
-                        "SES import failed ({error}); compensating deletion completed but the live board did not return to its exact pre-import serialization"
-                    );
-                }
-                if candidate_for_ipc.exists() {
-                    std::fs::remove_file(&candidate_for_ipc).with_context(|| {
+            // Per net: errors no imported net can be blamed for, or another
+            // net cut open, leave nothing to decide net by net.
+            let worse = verdict::other_nets_worse(&unconnected_before, &check.unconnected, &importing);
+            if !check.blame.unattributed.is_empty() || !worse.is_empty() {
+                let why = format!(
+                    "the import cannot be kept net by net: {}{}; it was rolled back",
+                    if check.blame.unattributed.is_empty() {
+                        String::new()
+                    } else {
                         format!(
-                            "SES import failed ({error}); also failed to remove candidate {}",
-                            candidate_for_ipc.display()
+                            "{} new DRC error(s) involve no imported net (e.g. {})",
+                            check.blame.unattributed.len(),
+                            check.blame.unattributed[0].description
                         )
-                    })?;
-                }
-                if drc_output_for_ipc.exists() {
-                    std::fs::remove_file(&drc_output_for_ipc).with_context(|| {
+                    },
+                    if worse.is_empty() {
+                        String::new()
+                    } else {
                         format!(
-                            "SES import failed ({error}); also failed to remove DRC output {}",
-                            drc_output_for_ipc.display()
+                            "{}nets outside the import lost connections once zones refilled ({})",
+                            if check.blame.unattributed.is_empty() { "" } else { "; " },
+                            worse.iter().map(|(net, was, now)| format!("{net} {was}→{now}")).collect::<Vec<_>>().join(", ")
                         )
-                    })?;
+                    }
+                );
+                rollback(client, &created_ids, &why)?;
+                anyhow::bail!(why);
+            }
+            let mut rejected = Vec::new();
+            for net in &importing {
+                let errors = check.blame.by_net.get(net).cloned().unwrap_or_default();
+                let was = unconnected_before.get(net).copied().unwrap_or(0);
+                let now = check.unconnected.get(net).copied().unwrap_or(0);
+                if let Some(rejection) = verdict::judge_net(errors.len(), was, now, require_complete) {
+                    let r = routes_of(net);
+                    outcomes.insert(net.clone(), NetOutcome {
+                        net: net.clone(),
+                        status: "rejected",
+                        reason: Some(rejection.reason(was, now)),
+                        tracks: r.map_or(0, |r| r.tracks),
+                        arcs: r.map_or(0, |r| r.arcs),
+                        vias: r.map_or(0, |r| r.vias),
+                        session_length_mm: round3(r.map_or(0.0, |r| r.length_mm)),
+                        unconnected_before: Some(was),
+                        unconnected_after: Some(now),
+                        complete: Some(now == 0),
+                        new_drc_errors: errors.into_iter().take(3).collect(),
+                        board_length_mm: None,
+                        board_vias: None,
+                    });
+                    rejected.push(net.clone());
                 }
-                Err(error)
+            }
+            if rejected.is_empty() {
+                accepted = Some((created_ids, check));
+                break;
+            }
+            rollback(client, &created_ids, "dropping the rejected nets")?;
+            for net in &rejected {
+                importing.remove(net);
             }
         }
+
+        // The final board: with the accepted routes, or as it was.
+        let (created_count, final_source, final_report, final_json, final_unconnected) = match accepted {
+            Some((ids, check)) => (ids.len(), check.candidate_source, check.report, check.report_json, check.unconnected),
+            None => (0, before.clone(), baseline.clone(), baseline_json, unconnected_before.clone()),
+        };
+        let final_tree = konnect_sexp::parse_sexp(&final_source).context("parse the final board")?;
+        let copper = verdict::copper_by_net(&final_tree);
+        for net in &importing {
+            let r = routes_of(net);
+            let was = unconnected_before.get(net).copied().unwrap_or(0);
+            let now = final_unconnected.get(net).copied().unwrap_or(0);
+            let (length, vias) = copper.get(net).copied().unwrap_or((0.0, 0));
+            outcomes.insert(net.clone(), NetOutcome {
+                net: net.clone(),
+                status: "imported",
+                reason: None,
+                tracks: r.map_or(0, |r| r.tracks),
+                arcs: r.map_or(0, |r| r.arcs),
+                vias: r.map_or(0, |r| r.vias),
+                session_length_mm: round3(r.map_or(0.0, |r| r.length_mm)),
+                unconnected_before: Some(was),
+                unconnected_after: Some(now),
+                complete: Some(now == 0),
+                new_drc_errors: Vec::new(),
+                board_length_mm: Some(round3(length)),
+                board_vias: Some(vias),
+            });
+        }
+        // Nets the group or the filter asked for that the session left empty.
+        let asked: BTreeSet<String> = net_filter
+            .clone()
+            .or_else(|| plan.routing_group.clone().map(|nets| nets.into_iter().collect()))
+            .unwrap_or_default();
+        let missing: Vec<&String> = asked.iter().filter(|net| !outcomes.contains_key(*net)).collect();
+        for net in missing {
+            let was = unconnected_before.get(net).copied().unwrap_or(0);
+            let now = final_unconnected.get(net).copied().unwrap_or(0);
+            outcomes.insert(net.clone(), NetOutcome {
+                net: net.clone(),
+                status: "no_routes",
+                reason: Some(if now == 0 {
+                    "the session has no new copper for it; it is already connected".to_string()
+                } else {
+                    "the session has no new copper for it: the router did not route it".to_string()
+                }),
+                tracks: 0,
+                arcs: 0,
+                vias: 0,
+                session_length_mm: 0.0,
+                unconnected_before: Some(was),
+                unconnected_after: Some(now),
+                complete: Some(now == 0),
+                new_drc_errors: Vec::new(),
+                board_length_mm: None,
+                board_vias: None,
+            });
+        }
+
+        konnect_sexp::write_new_atomic(&candidate_for_ipc, &final_source)
+            .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
+        std::fs::write(&drc_output_for_ipc, final_json)
+            .with_context(|| format!("write {}", drc_output_for_ipc.display()))?;
+        let imported: Vec<&NetOutcome> = outcomes.values().filter(|o| o.status == "imported").collect();
+        Ok(ApplyEvidence {
+            source_sha256: plan.source_sha256.clone(),
+            session_id: plan.session_id.clone(),
+            track_count: imported.iter().map(|o| o.tracks).sum(),
+            arc_count: imported.iter().map(|o| o.arcs).sum(),
+            via_count: imported.iter().map(|o| o.vias).sum(),
+            created_count,
+            preserved_locked_track_count: plan.locked_track_count,
+            preserved_locked_via_count: plan.locked_via_count,
+            existing_routing_fixed: plan.existing_routing_fixed,
+            drc_errors: drc_errors_by_rule(&final_report).values().sum(),
+            drc_warnings: final_report.violations.iter().filter(|v| v.severity != "error").count(),
+            baseline_drc_errors: drc_errors_by_rule(&baseline).values().sum(),
+            unconnected_items: final_report.unconnected_items.as_ref().map_or(0, Vec::len),
+            schematic_parity_violations: final_report.schematic_parity.as_ref().map_or(0, Vec::len),
+            refill_zones: plan.refill_zones,
+            nets: outcomes.into_values().collect(),
+            unconnected_by_net: final_unconnected,
+            rounds,
+        })
     })
     .await?;
 
     match result {
-        Ok(evidence) => Ok(CallToolResult::json(&json!({
+        Ok(evidence) => {
+            let count = |status: &str| evidence.nets.iter().filter(|o| o.status == status).count();
+            let complete = evidence.nets.iter().filter(|o| o.status == "imported" && o.complete == Some(true)).count();
+            Ok(CallToolResult::json(&json!({
             "success": true,
             "method": "strict_atomic_kicad_ipc_import",
+            "accept": if accept == Accept::PerNet { "per_net" } else { "all" },
             "board": board,
             "candidate_output_path": candidate,
             "source_overwritten": false,
-            "undo_description": "Import Freerouting SES",
+            "undo_description": if evidence.created_count == 0 { "nothing imported" } else { "Import Freerouting SES" },
             "source_sha256": evidence.source_sha256,
             "session_id": evidence.session_id,
             "track_count": evidence.track_count,
@@ -2347,9 +3014,21 @@ async fn handle_apply_specctra_ses(
             "created_count": evidence.created_count,
             "preserved_locked_routing": {
                 "tracks": evidence.preserved_locked_track_count,
-                "vias": evidence.preserved_locked_via_count
+                "vias": evidence.preserved_locked_via_count,
+                "all_existing_fixed": evidence.existing_routing_fixed
             },
             "ipc_readback": "exact_count_match",
+            "summary": {
+                "nets_imported": count("imported"),
+                "nets_complete": complete,
+                "nets_incomplete": count("imported") - complete,
+                "nets_rejected": count("rejected"),
+                "nets_without_routes": count("no_routes"),
+                "rounds": evidence.rounds,
+                "verified_by": "KiCad DRC of the board with the routes (unconnected items per net), not the router's log"
+            },
+            "nets": evidence.nets,
+            "unconnected_by_net": evidence.unconnected_by_net,
             "drc": {
                 // Errors and unconnected items only: warnings (silkscreen,
                 // library drift) and schematic parity never made this true.
@@ -2362,12 +3041,15 @@ async fn handle_apply_specctra_ses(
                 "schematic_parity_violations": evidence.schematic_parity_violations,
                 "zones_refilled": evidence.refill_zones
             },
-            "next_step": if evidence.refill_zones {
+            "next_step": if evidence.created_count == 0 {
+                "Nothing was imported; see nets[].reason. Re-route those nets (rip_up_nets first if they carry partial copper) or change the placement."
+            } else if evidence.refill_zones {
                 "The live board's zones were not refilled; call refill_zones, then save."
             } else {
                 "Save the board."
             }
-        }))),
+        })))
+        }
         Err(failure) => {
             let reason = failure.message().to_string();
             Ok(CallToolResult::error_kind(

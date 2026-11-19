@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 10 categories
-- **244 registered tools** + **7 always-visible meta-tools** = **251 total**
+- **248 registered tools** + **7 always-visible meta-tools** = **255 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -232,7 +232,7 @@ and Windows servers do not.
 
 ## PCB
 
-### `pcb_board` · 16 tools
+### `pcb_board` · 19 tools
 **Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
@@ -254,6 +254,9 @@ and Windows servers do not.
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
+| `delete_vias` | Delete vias from the live board in one undo step, selected by UUID and/or position (`{x, y}` within `tolerance_mm`, optionally by net); dry run by default; vias are verified absent afterwards. |
+| `rip_up_nets` | Rip up the tracks, arcs and vias of named nets (and/or every net on the pads of named footprints) in one undo step, optionally only inside a region; locked copper is kept unless `include_locked`. Dry run by default; per-net counts and length; items verified absent. Retry a group without a checkpoint restore, or move a part and re-route its nets (Pass 20). |
+| `set_footprint_text` | Restyle the reference or value text of placed footprints (stroke thickness, size, visibility) in one undo step, by reference and/or side. |
 
 ### `pcb_components` · 20 tools
 **Purpose:** Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics and 3D models.
@@ -282,7 +285,7 @@ and Windows servers do not.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
-### `pcb_routing` · 19 tools
+### `pcb_routing` · 20 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
@@ -294,10 +297,11 @@ and Windows servers do not.
 | `add_via` | Add a via at a position and assign it to a net via IPC: through by default, or blind/buried/micro with `start_layer`/`end_layer`/`via_type`. |
 | `lock_routing` | Lock or unlock existing tracks, arcs and vias, optionally only on named nets, in one undoable commit with read-back. Freeze hand-routed critical nets before autorouting. |
 | `fanout_to_plane` | Drop every SMD pad on a plane net to its plane with a short stub and a through via placed clear of other nets, keep-outs and the edge; locked by default; `dry_run` returns the plan. In-pad vias are checked against other-net copper on every layer; "reaches the plane" is judged on the zone fill when the file has one (`plane_source`). With `drc_gate` (default) KiCad DRC runs before and after with zones refilled and the fan-out is undone if it adds any error or unconnected item. |
+| `add_keepout_area` | Add a rule-area keep-out (polygon on chosen copper layers forbidding tracks, vias, pours, optionally pads and footprints) in one undo step; KiCad's DRC enforces it and its Specctra export passes it to the router. Remove with `delete_zones(names=[…])`. |
 | `delete_zones` | Delete copper zones and rule-area keep-outs from the live board in one undo step, selected by net, layer and/or name; dry run by default. Zones are matched in the board's saved text (KiCad's zone API has no net) and deleted by UUID. |
 | `route_path` | Route one net as polylines in one undo step: points `{x, y}` or `{ref, pad}` (ends exactly on pads), plus through/blind/buried vias; net given or inferred from the pads; widths and via sizes default to the net class; optional lock. With `drc_gate` (default) it is undone, leaving the board byte-identical, if KiCad DRC finds any new error (compared by rule and item UUIDs; shorts and clearance block even if downgraded to warnings) or more unconnected items. `routes` takes several nets (each `{net, width, paths, vias}`) in one undo step and one gate, so a differential pair goes in together. |
-| `plan_specctra_ses_import` | Strictly validate a Freerouting SES against its revision-bound manifest and the exact live board, returning every planned route item and the preserved locked-track/via inventory without mutation. |
-| `apply_specctra_ses` | Preserve the manifest-bound locked straight tracks and through vias, apply a validated SES through KiCad IPC as one undo transaction, verify post-commit IPC read-back, create a separate candidate board, and report direct KiCad DRC evidence (including whether it is clean). New DRC errors are found by identity (rule + item UUIDs), so a new short cannot hide behind an error the routes fixed. |
+| `plan_specctra_ses_import` | Strictly validate a Freerouting SES against its revision-bound manifest and the exact live board, returning every planned route item, a per-net summary (tracks, vias, length) and the preserved track/via inventory without mutation. `nets` keeps only those nets' routes. |
+| `apply_specctra_ses` | Preserve the manifest-bound fixed tracks and vias, apply a validated SES through KiCad IPC as one undo transaction, verify post-commit IPC read-back, create a separate candidate board, and report direct KiCad DRC evidence. New DRC errors are found by identity (rule + item UUIDs). `accept: "all"` (default) keeps every route or none; `accept: "per_net"` keeps each net whose routes add no DRC error and join something, drops the rest and re-imports the kept ones in one commit (`require_complete` also drops partial nets; `nets` imports a subset). Every response has `nets[]` (status, reason, tracks, vias, session and board length, unconnected before/after, `complete`, `new_drc_errors`) and `unconnected_by_net`, judged by KiCad's DRC, not the router's log (Pass 20). |
 | `add_copper_pour` | Alias of `add_zone`, kept for compatibility: same arguments, same defaults, same IPC-first behaviour. (Its `min_width` default was 0.25 and is now 0.2, matching `add_zone` and KiCad.) |
 | `delete_trace` | Delete one observed trace segment by UUID via KiCad IPC. Refuses non-trace or stale UUIDs before deletion, targets the requested board, and reports the observed preimage only after readback proves the segment is absent. |
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
@@ -348,7 +352,7 @@ and Windows servers do not.
 | `export_3d` | Export the PCB as a 3D model using kicad-cli, with explicit control over unspecified footprint models. |
 | `export_bom` | Generate KiCad 10's CSV Bill of Materials from schematic fields. |
 | `export_netlist` | Export the PCB netlist in KiCAD or IPC-D-356 format. |
-| `export_specctra_dsn` | Export a deterministic, revision-bound Specctra DSN plus reverse manifest from a supported live KiCad board. The Rust exporter is the default. On KiCad 10, explicitly set `native_bridge_mode` to `prefer` or `require` for the optional authenticated ActionPlugin native exporter. Preserves locked straight tracks and through vias as fixed wiring; refuses unlocked routing, arcs, unsupported geometry, or incomplete rules. The board's copper-to-edge clearance (largest of the `.kicad_dru` edge rules and the project setting) goes to the router as keep-out bands along each outline edge. |
+| `export_specctra_dsn` | Export a deterministic, revision-bound Specctra DSN plus reverse manifest from a supported live KiCad board. The Rust exporter is the default. On KiCad 10, explicitly set `native_bridge_mode` to `prefer` or `require` for the optional authenticated ActionPlugin native exporter. Preserves locked straight tracks and through vias as fixed wiring; refuses unlocked routing, arcs, unsupported geometry, or incomplete rules. The board's copper-to-edge clearance (largest of the `.kicad_dru` edge rules and the project setting) goes to the router as keep-out bands along each outline edge. `nets` / `net_classes` make a grouped export: only those nets are routed, every other net and all existing copper (locked or not) are fixed obstacles, and the session holds only the group's new copper (`group.nets`, `group.not_in_job`; Pass 20). |
 | `render_board_png` | Render the live or saved board as a PNG for visual review: chosen layers on a dark background, whole board or a region in board mm, with `px_per_mm` so pixels map back to board coordinates. |
 | `export_position_file` | Generate a component placement (pick-and-place) position file for SMT assembly. |
 | `export_dxf` | Export the PCB to DXF, one file per requested layer, using kicad-cli. `layers` is required — there is no all-layers default. For mechanical CAD interchange. |

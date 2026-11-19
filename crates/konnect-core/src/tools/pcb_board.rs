@@ -1539,6 +1539,37 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
+            "rip_up_nets",
+            "Rip up (delete) the tracks, arcs and vias of named nets on the live board in one \
+             undo step, so a group can be routed again without a checkpoint restore. Nets are \
+             named directly and/or as every net on the pads of named footprints (move a part, \
+             rip up its nets, re-route them). Optionally only inside a region (an item goes \
+             whole when any of its end points or its centre is inside). Locked copper (hand \
+             routes, fan-out) is kept unless include_locked is true and is listed in \
+             locked_kept. Dry run by default; the response gives per-net counts and length, \
+             and the items are verified absent afterwards.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "nets": { "type": "array", "items": { "type": "string" } },
+                    "footprints": { "type": "array", "items": { "type": "string" }, "description": "References; every net on their copper pads is ripped up" },
+                    "region": {
+                        "type": "object",
+                        "description": "Board-mm rectangle; omit for the whole board",
+                        "properties": { "x0": { "type": "number" }, "y0": { "type": "number" }, "x1": { "type": "number" }, "y1": { "type": "number" } },
+                        "required": ["x0", "y0", "x1", "y1"],
+                        "additionalProperties": false
+                    },
+                    "include_locked": { "type": "boolean", "default": false },
+                    "dry_run": { "type": "boolean", "default": true }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { super::pcb_routing::handle_rip_up_nets(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "set_footprint_text",
             "Restyle the reference or value text of placed footprints on the live board in one \
              undo step: stroke thickness, character size and visibility. Selects footprints by \

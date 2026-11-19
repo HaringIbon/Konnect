@@ -121,6 +121,11 @@ struct Manifest {
     components: Vec<ManifestComponent>,
     nets: Vec<ManifestNet>,
     padstacks: Vec<ManifestPadstack>,
+    /// The nets of a grouped export (`export_specctra_dsn` with `nets` or
+    /// `net_classes`): the only nets in the routing job. Absent for a whole-board
+    /// export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    routing_group: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -139,6 +144,12 @@ struct SupportedProfile {
     /// Layers KiCad typed `power`; Freerouting does not route on them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     plane_layers: Vec<String>,
+    /// A grouped export fixes every existing track and via, locked or not:
+    /// the group's own copper is written `(type fix)` and every other net's
+    /// copper becomes a keep-out. The counts above are then all existing
+    /// tracks and vias, not only the locked ones.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    existing_routing_fixed: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1554,6 +1565,7 @@ fn build_manifest(
             custom_rules: false,
             outline: "one closed loop of straight Edge.Cuts lines".to_string(),
             plane_layers: Vec::new(),
+            existing_routing_fixed: false,
         },
         layers: copper_layers
             .iter()
@@ -1567,6 +1579,7 @@ fn build_manifest(
         components,
         nets,
         padstacks,
+        routing_group: None,
     })
     .context("serialize routing manifest")
 }

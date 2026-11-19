@@ -2522,3 +2522,25 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
 - **`export_specctra_dsn`.** Adds `kept_for_partial_planes` (fully fanned plane nets kept in the job because their solid-plane pour does not lie under every via and through-hole pad) and a warning. `left_to_planes` no longer lists those nets. The refusal for a renamed copper layer has a longer message.
 - **Graph (internal).** `net_graph` joins overlapping track nodes with `Track` edges as long as their distance; path lengths over such joins grow by that distance.
 
+
+## Unreleased (fork): grouped autoroute, per-net SES import, rip-up (Pass 20)
+
+- **`export_specctra_dsn`: new optional `nets` and `net_classes`** (arrays of names). Either makes a *grouped* export:
+  - Only the named nets (and every member of the named KiCad net classes; `Default` means the nets with no other class) are in the routing job. Every other net leaves the DSN network: its pads stay as obstacles with no net, its copper becomes keep-outs.
+  - All existing tracks and vias, locked or not, are held fixed: the group's own copper is written `(type fix)` and is not echoed in the session. The "existing routing must be locked" refusal does not apply to a grouped export. Arcs are still refused.
+  - Always uses KiCad's exporter (`exporter: "strict"` with a group is refused).
+  - Response adds `group`: `nets` (in the job), `not_in_job` (`[{net, reason}]`: single pad, left to its plane, no pad), `nets_held_fixed`, `fixed_group_wiring`; and a warning.
+  - An unknown net or class is refused; a group with no routable net is refused.
+  - The manifest gains `routing_group` and `supported_profile.existing_routing_fixed` (all existing items are counted, not only locked ones). Older Konnect builds refuse these manifests (unknown field).
+- **`plan_specctra_ses_import`:** new optional `nets` (only those nets' routes; each must be in the job). Response adds `nets` (`[{net, tracks, arcs, vias, length_mm}]`), `routing_group`, and `preserved_locked_routing.all_existing_fixed`.
+- **`apply_specctra_ses`:**
+  - New optional `accept` (`"all"`, default and unchanged behaviour, or `"per_net"`), `require_complete` (per-net only; drops partial nets) and `nets` (import a subset).
+  - `per_net`: each net is judged on KiCad's DRC of the board with the routes (project rules, zones refilled): kept when it adds no DRC error (by identity, blamed on the nets of the created items involved) and joins something (fewer unconnected items or none left). Rejected nets are dropped and the kept ones re-imported in one commit (`Import Freerouting SES (k of n nets)`), up to 4 rounds. New errors that no imported net can be blamed for, or another net losing connections after the zone refill, roll the whole import back.
+  - Every response (both modes) adds `accept`, `summary` (`nets_imported`, `nets_complete`, `nets_incomplete`, `nets_rejected`, `nets_without_routes`, `rounds`, `verified_by`), `nets[]` (`net`, `status` imported/rejected/no_routes, `reason`, `tracks`, `arcs`, `vias`, `session_length_mm` (the session's length for the net, imported or not), `unconnected_before`, `unconnected_after`, `complete`, `new_drc_errors`, `board_length_mm`, `board_vias`) and `unconnected_by_net` (the whole board after the import), plus `preserved_locked_routing.all_existing_fixed`.
+  - `track_count` / `arc_count` / `via_count` now count what was imported (equal to the plan in `all` mode).
+  - With `per_net` and nothing kept the call succeeds with `created_count: 0`, `undo_description: "nothing imported"`, and the candidate is the unchanged board.
+  - The `all`-mode rollback message now lists new errors by net and points at `per_net`.
+- **New tool `rip_up_nets`** (`pcb_board`, live only): deletes the tracks, arcs and vias of `nets` and/or every net on the pads of `footprints`, optionally inside `region` (`{x0, y0, x1, y1}` mm), keeping locked copper unless `include_locked`. Dry run by default. One undo step (`Rip up nets`), items verified absent. Response: `count`, `by_net` (tracks, arcs, vias, length), `locked_kept`, `items`, `undo`, `next_step`.
+- **Empty sessions.** A session with no wire or via (the router routed nothing) is no longer refused as malformed. `plan_specctra_ses_import` returns an empty plan with a `warning`; `apply_specctra_ses` refuses it with `accept: "all"` and reports every net `no_routes` with `accept: "per_net"`.
+- **`apply_specctra_ses` `<candidate>.drc.json`** now holds Konnect's parsed DRC report of the final board (violations, `unconnected_items`, `schematic_parity`). It used to be written empty, because `run_drc` deletes KiCad's own JSON after parsing it.
+- **Counts:** 248 registered tools (255 with meta-tools); `pcb_board` has 19.

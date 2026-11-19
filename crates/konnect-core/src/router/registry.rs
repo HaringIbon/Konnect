@@ -78,7 +78,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_board",
         description: "Board outline, layers, zones, mounting holes, board text, SVG logo import, board checkpoints, diff and restore",
         category: "pcb",
-        tool_count: 18,
+        tool_count: 19,
     },
     ToolsetMeta {
         name: "pcb_components",

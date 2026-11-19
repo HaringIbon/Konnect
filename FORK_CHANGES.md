@@ -973,3 +973,126 @@ Pass 18 had already made the graph join copper that overlaps without sharing coo
 - Pads in the graph: superseded by Pass 18's real pad outlines (merged after this pass).
 - Kept plane nets are not routed at a power width, and pour pieces are counted, not traced for which pads each piece serves.
 
+
+## Pass 20: grouped autoroute, per-net import, rip-up (Tier 2, item 1)
+
+**Problem (WORKFLOW §3.1, §4.2):** routing was most of the time spent, and every failure cost a full cycle.
+- The SES import was all or nothing: one length or width violation (USB_C 19.6 mm against 15 mm; VBUS at 0.112 mm against 0.15 mm) rolled back an otherwise good autoroute.
+- There was no "route these nets again, keep the rest": a retry meant restoring a checkpoint, which needs KiCad closed (about 2 minutes).
+- Freerouting ends every job `COMPLETED` with nets still open (Pass 15), so the router's word cannot decide what was routed.
+
+**Sources (doc DB):**
+- `freerouting-2-3-0-wiring-java` (`calc_fixed`): DSN `(type fix)` is `SYSTEM_FIXED`; `protect` is `USER_FIXED`. A wire whose net is not in the network is inserted with no net.
+- `freerouting-2-3-0-seswriter-java` (`writeNet`): the session skips `SYSTEM_FIXED` items, so fixed copper never comes back in the SES. `USER_FIXED` items come back marked `protect`.
+- `freerouting-2-3-0-network-java` (`insert_component`): a pin whose net is not in the network becomes a pin with no net, with the default class clearance; every net keeps clear of it.
+- `freerouting-2-3-0-routersettings-java`: `ignore_net_classes` is `transient`, so it cannot be set through the API; no DSN form sets a class's "ignored by the autorouter" flag. Leaving nets out of the DSN is the router-independent way to exclude them.
+- `freerouting-2-3-0-batchautorouter-java`: the batch router routes every incomplete connection of every net in the network.
+- `kicad-10-0-8-specctra-export`: KiCad writes locked tracks and vias `(type fix)` ("not returned in .ses files") and unlocked ones `(type route)`. An arc is written as the straight chord between its ends.
+- `kicad-10-0-8-specctra-import`: KiCad's own SES import deletes every unlocked track and re-creates the whole session, so it is all or nothing too.
+
+**`export_specctra_dsn` with `nets` / `net_classes`: a grouped export** (`specctra/native.rs`, `restrict_to_group`, `fix_wiring`):
+- Only the group's nets stay in the `(network …)`.
+  - Every other net is removed with the Pass 4 lowering: its class membership goes, and its copper becomes keep-outs of the copper's own size.
+  - Its pads stay in the placement as obstacles with no net.
+- All existing copper is held fixed, locked or not.
+  - The group's own tracks and vias are rewritten `(type fix)`. The router connects to them, never moves them, and does not echo them in the session, so the import cannot duplicate a track.
+  - The whole-board "unlock means refuse" rule does not apply. Arcs are still refused, because KiCad exports them as chords.
+- Net classes are matched by KiCad name:
+  - `Power` matches the DSN class `Power,Default`.
+  - `Default` matches only `kicad_default`, the nets with no other class.
+- The response gives `group.nets` and `group.not_in_job`, each with its reason: a single pad, left to its plane, or no pad. Unknown nets or classes are refused.
+- A grouped export always uses KiCad's exporter.
+- The manifest records `routing_group` and `existing_routing_fixed`. The import then counts all existing tracks and vias, not only the locked ones.
+
+**`apply_specctra_ses` `accept: "per_net"`** (`tools/route_verdict.rs`, pure, plus the IPC flow in `pcb_routing.rs`):
+1. Import everything in one commit. DRC the board (project rules, zones refilled) against the baseline DRC.
+2. Blame each new error, found by identity, on the nets of the created items it names. If it names no created item, blame the importing nets its items are on. Failing that, blame the nets its description names as whole names (a pair's skew rule names no track).
+3. Count KiCad's unconnected items per net, by item KIID with `[NET]` in the description as fallback.
+4. Judge each net. A net is rejected for DRC errors, for more unconnected items than before, for "joins nothing new" (still `n > 0`), or, with `require_complete`, for being incomplete.
+5. If any net is rejected: delete exactly the created KIIDs, prove the board serialises as before, and re-import the survivors in one commit (`Import Freerouting SES (k of n nets)`). At most 4 rounds.
+6. Roll everything back if a new error cannot be blamed on any net, or if a net outside the import loses connections after the refill. Both would mean a plane cut that no net owns.
+- **Response, both modes:**
+  - `nets[]`: status `imported`, `rejected` or `no_routes`, with the reason, tracks, vias, session and board length, unconnected before and after, `complete`, and up to 3 `new_drc_errors`.
+  - `unconnected_by_net` for the whole board, and a `summary`.
+  - `all` mode keeps its behaviour. Its rollback message now gives the errors by net.
+- `nets` imports a subset of a session. `plan_specctra_ses_import` gives the same per-net summary.
+- An empty session (the router routed nothing) is now a result, not a parse error.
+- **Fix:** `<candidate>.drc.json` was always written empty, because `run_drc` deletes KiCad's JSON after parsing it. It now holds the parsed report.
+
+**New tool `rip_up_nets`** (`pcb_board`, handler in `pcb_routing.rs`):
+- Deletes the tracks, arcs and vias of `nets` and/or of every net on the pads of `footprints` ("move a part and re-route its nets").
+- `region` limits it: an item goes whole if any end point or its centre is inside.
+- Locked copper is kept unless `include_locked`, and listed in `locked_kept`.
+- Dry run by default. One undo step. Items are verified absent afterwards.
+
+**Docs:**
+- `tool-directory.md` now lists `delete_vias`, `set_footprint_text` and `add_keepout_area`, which earlier passes registered but never documented.
+- The tool counts were stale since Pass 14. The `doc_tool_counts` guards were failing on `safe-writes`; they now pass.
+- 248 registered tools, 255 with the meta-tools.
+
+**Tests:** 21 new; `konnect-core --lib` 1922 passed (was 1901). Whole workspace: 2624 passed, 1 failed (the environmental `conformance_test` pin-label test).
+- `route_verdict` (7): item→net map and copper per net; KIID and description fallback; unconnected counts (absent is not zero); error blame including two imported nets, refills and rule-level errors by name (`/PA1` is not in `/PA10`); the net judge; other nets made worse.
+- `specctra::native::group_tests` (7), on the real 4-layer fixture:
+  - only the group is in the job and the manifest;
+  - class selection (`Power,Default`, `Default`);
+  - unknown nets refused, single-pad nets reported;
+  - unlocked copper: fixed for the group, keep-outs for others, refused on a whole-board export;
+  - a grouped session imports over unlocked copper, and a session with a stranger net is refused;
+  - `retain_nets`;
+  - `fix_wiring`.
+- `rip_up_tests` (5): selection by net, region and lock; IPC records; argument refusals.
+- One test each for `routing_group_argument` and the empty session.
+
+**Live validation** (KiCad 10.0.8 headless, Freerouting 2.3.0, on copies in the session scratchpad; the originals were not touched):
+
+*`stm32_nrf_module` (the benchmark):*
+
+| Step | Time | Unconnected after |
+|---|---|---|
+| Saved board as built | | 5 |
+| `rip_up_nets` on every net (327 unlocked items; 140 locked hand-route and fan-out items kept) | 0.2 s | 38 |
+| Whole-board export, 40 passes, `per_net` | route 155 s, apply 5.6 s | 8 |
+| Group retry, 4 open nets | export 0.4 s, route 21 s, apply 3.4 s | 8 |
+| Region rip-up (190 items, 14 nets) and re-route of a 17-net group | route 69 s, apply 4.0 s | 8 |
+| Group retry, 3 nets, 60 passes | route 12 s, apply 1.7 s | 8 |
+| `accept: "all"` on VBUS | route 9 s, apply 3.4 s | rolled back |
+| Move D3 0.5 mm, `rip_up_nets(footprints: [D3])`, re-route its nets | rip-up 0.1 s, route 9 s, apply 4.2 s | |
+
+- **Whole-board run:** Freerouting reported 45 → 7 unrouted with 52 router-side violations.
+  - The per-net import kept 22 nets (21 complete) in 2 rounds and rejected VBUS: 3 `track_width` errors, intent 0.15 mm against Freerouting's 0.112 mm.
+  - The old all-or-nothing import would have rolled back all 254 tracks.
+  - Still open: VBUS 3, GND 2 (the J2/J7 pad-5 fan-out gap seen in Pass 17), and /BOOT_SW, /NRF_TX and /SWDIO 1 each.
+- **Group retry (4 open nets):** VBUS was rejected again (`track_width`). The router routed nothing for the 3 signals, and they are reported `no_routes`.
+- **Region rip-up and 17-net group:**
+  - 14 nets imported, all complete; /BOOT_SW was fixed.
+  - /LDO_EN, /NRF_TX and /SWDIO got no routes, so the total stayed at 8.
+  - 83 partial wires of the group were held fixed (`(type fix)`).
+- **3-net retry at 60 passes:** an empty session, reported `no_routes` per net. This is the placement-limited case in WORKFLOW §4.2.
+- **`accept: "all"` on VBUS:** the rollback message names "VBUS: 6", and the board is restored exactly.
+- **Move-and-re-route:** D3's net /STATUS_K was imported complete. GND was reported `not_in_job` (left to its plane).
+
+*`stm32_demo`:*
+
+| Step | Time | Unconnected after |
+|---|---|---|
+| Saved board | | 0 |
+| `rip_up_nets` on every net (586 unlocked items) | 0.2 s | 63 |
+| Group: net classes `intent_*` (power and USB) | route 18 s | rolled back |
+| Group: `net_classes: ["Default"]`, 46 nets, 50 passes | route 108 s, apply 3.6 s | 9 |
+| Power group again (after the description-blame fix) | route 26 s, apply 3.9 s | 1 |
+| `rip_up_nets(VBUS)` and VBUS alone | | 3 |
+
+- **First power group:** it was rolled back as "involve no imported net". A pair-skew error names its nets only in the rule text. That led to the description fallback in the error blame, which is unit-tested.
+- **Default group:** all 45 routed nets imported complete. /SWDIO was already connected by its fixed hand route (`no_routes`). The router said 1 unrouted; the board said 9, all of them in the power classes, which were not in this group.
+- **Power group again:** +5V and /VBUS_F were imported complete, and VBUS was partial (3 → 1, kept).
+- **VBUS alone, after ripping up its partial copper:** the router routed nothing, so VBUS went back to 3 open. Partial progress is worth keeping, and VBUS is a trunk to hand-route (§4.2).
+
+**Limits and things not done:**
+- Freerouting sees the other nets' pads with the default class clearance and does not see `.kicad_dru` rules (intent widths, lengths, skew). The DRC import catches violations per net, but the router does not avoid them. VBUS failed on width for this reason; give such nets a net class with the width, or hand-route them.
+- Plane cuts cannot be blamed on a net. If a refill leaves another net with more unconnected items, the whole import is rolled back.
+- Arcs on the board still refuse an export.
+- Rejected nets' partial copper is not kept. Accepted partial nets are kept unless `require_complete`.
+- A net that was already complete and receives tiny stubs (Freerouting's 0.001 mm pad snaps on the locked USB pair) is accepted, because it adds no error.
+- The undo history holds one entry per round. The last one ("Import Freerouting SES (k of n nets)") removes the import.
+- No orchestrating tool: export → route → apply is still three calls (`route_specctra_dsn` sits in another toolset).
+- There is no `undo` tool, so a rip-up that made things worse (VBUS on the demo) needs the earlier copper re-imported or a checkpoint.
