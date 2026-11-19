@@ -486,8 +486,11 @@ async fn handle_export_manufacturing_package(
 
     let complete = warnings.is_empty();
 
+    // Non-blocking: what the package changed on its own, for the caller to
+    // see without making the package incomplete.
+    let notes = bom_removal_notes(&cpl_not_placed, &bom_not_placed_removed);
     let summary = format!(
-        "{} for {}. {} verified non-empty files. {}",
+        "{} for {}. {} verified non-empty files. {}{}",
         if complete {
             "Complete package"
         } else {
@@ -499,6 +502,14 @@ async fn handle_export_manufacturing_package(
             "No warnings.".to_string()
         } else {
             format!("{} warnings.", warnings.len())
+        },
+        if bom_not_placed_removed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Removed from the BOM as not placements (see notes): {}.",
+                bom_not_placed_removed.join(", ")
+            )
         }
     );
 
@@ -536,6 +547,7 @@ async fn handle_export_manufacturing_package(
         "position_side": if include_assembly { Some(position_side) } else { None },
         "placement_orientation": cpl_orientation_evidence,
         "not_placed": not_placed_report(&cpl_not_placed, &bom_not_placed_removed),
+        "notes": notes,
         "board_source": if snapshot.is_some() { "stable_live_ipc_snapshot" } else { "saved_file" },
         "project_settings_source": "saved_kicad_pro_if_present",
         "warnings": warnings,
@@ -605,23 +617,35 @@ pub(super) async fn export_jlcpcb_cpl(
 
 /// Footprint attributes that keep a footprint out of the JLCPCB CPL.
 /// `exclude_from_pos_files` and `dnp` are dropped by KiCad's exporter itself
-/// (Konnect passes `--exclude-dnp`); `exclude_from_bom` and `board_only` are
-/// dropped by [`drop_cpl_rows`], because JLCPCB places only BOM lines and a
-/// `board_only` footprint has no symbol, so no BOM line.
-const NOT_PLACED_ATTRIBUTES: [&str; 4] =
-    ["exclude_from_pos_files", "exclude_from_bom", "board_only", "dnp"];
+/// (Konnect passes `--exclude-dnp`); `exclude_from_bom` is dropped by
+/// [`drop_cpl_rows`], because JLCPCB places only BOM lines.
+const NOT_PLACED_ATTRIBUTES: [&str; 3] = ["exclude_from_pos_files", "exclude_from_bom", "dnp"];
 
-/// Every footprint carrying one of [`NOT_PLACED_ATTRIBUTES`], by reference.
+/// Every footprint that is not a placement, by reference.
+///
+/// `board_only` alone does not make one: KiCad's position file keeps such a
+/// footprint (`GenPositionData` never tests it), and a real part placed in
+/// the PCB editor without a symbol must still surface as "missing from BOM".
+/// It counts only alongside another exclusion attribute (it is then listed
+/// as a reason too) or on a footprint with no pads at all (a logo or a
+/// graphic), reported as `board_only` + `no_pads` and dropped from the CPL.
 fn not_placed_footprints(board: &str) -> Vec<NotPlaced> {
     let Ok(tree) = konnect_sexp::parse_sexp(board) else { return Vec::new() };
     let mut out = konnect_sexp::board::footprints(&tree)
         .into_iter()
         .filter_map(|fp| {
             let attr = fp.find("attr").and_then(|a| a.children()).unwrap_or_default();
-            let reasons = NOT_PLACED_ATTRIBUTES
+            let mut reasons = NOT_PLACED_ATTRIBUTES
                 .into_iter()
                 .filter(|wanted| attr.iter().any(|n| n.as_str() == Some(wanted)))
                 .collect::<Vec<_>>();
+            if attr.iter().any(|n| n.as_str() == Some("board_only")) {
+                if !reasons.is_empty() {
+                    reasons.push("board_only");
+                } else if fp.find("pad").is_none() {
+                    reasons.extend(["board_only", "no_pads"]);
+                }
+            }
             if reasons.is_empty() {
                 return None;
             }
@@ -640,11 +664,11 @@ fn not_placed_footprints(board: &str) -> Vec<NotPlaced> {
 }
 
 /// References the CPL must drop itself: KiCad's exporter keeps footprints
-/// marked `exclude_from_bom` or `board_only`.
+/// marked `exclude_from_bom`, and pad-less `board_only` ones.
 fn not_in_bom(not_placed: &[NotPlaced]) -> BTreeSet<String> {
     not_placed
         .iter()
-        .filter(|fp| fp.reasons.iter().any(|r| matches!(*r, "exclude_from_bom" | "board_only")))
+        .filter(|fp| fp.reasons.iter().any(|r| matches!(*r, "exclude_from_bom" | "no_pads")))
         .map(|fp| fp.reference.clone())
         .collect()
 }
@@ -1297,6 +1321,24 @@ fn jlcpcb_designator_mismatch(
         ));
     }
     Some(message)
+}
+
+/// One note per designator taken out of the JLCPCB BOM, naming the footprint
+/// attributes that made it a non-placement.
+fn bom_removal_notes(not_placed: &[NotPlaced], removed_from_bom: &[String]) -> Vec<String> {
+    removed_from_bom
+        .iter()
+        .map(|reference| {
+            let reasons = not_placed
+                .iter()
+                .find(|fp| &fp.reference == reference)
+                .map(|fp| fp.reasons.join(", "))
+                .unwrap_or_default();
+            format!(
+                "{reference} removed from the JLCPCB BOM: its footprint is not a placement ({reasons}) and the row has no LCSC number"
+            )
+        })
+        .collect()
 }
 
 /// The response's `not_placed` list: each footprint the CPL leaves out on
@@ -2646,6 +2688,8 @@ mod cpl_bom_exclusion_tests {
       (footprint \"Connector:Tag-Connect_TC2030-IDC-NL_2x03_P1.27mm_Vertical\" (layer \"F.Cu\") (at 5 5) (property \"Reference\" \"J3\") (attr exclude_from_pos_files exclude_from_bom))
       (footprint \"MountingHole:MountingHole_3.2mm_M3\" (layer \"F.Cu\") (at 1 1) (property \"Reference\" \"H1\") (attr exclude_from_pos_files exclude_from_bom))
       (footprint \"Logo\" (layer \"F.Cu\") (at 1 9) (property \"Reference\" \"G1\") (attr board_only))
+      (footprint \"C\" (layer \"F.Cu\") (at 4 4) (property \"Reference\" \"C99\") (attr smd board_only) (pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\")))
+      (footprint \"TP\" (layer \"F.Cu\") (at 6 6) (property \"Reference\" \"TP1\") (attr smd board_only exclude_from_pos_files) (pad \"1\" smd circle (at 0 0) (size 1 1) (layers \"F.Cu\")))
       (footprint \"R\" (layer \"F.Cu\") (at 3 3) (property \"Reference\" \"R2\") (attr smd dnp))
       (footprint \"R\" (layer \"F.Cu\") (at 2 2) (property \"Reference\" \"R1\") (attr smd)))";
 
@@ -2662,10 +2706,11 @@ mod cpl_bom_exclusion_tests {
         assert_eq!(
             found,
             vec![
-                ("G1".to_string(), vec!["board_only"]),
+                ("G1".to_string(), vec!["board_only", "no_pads"]),
                 ("H1".to_string(), vec!["exclude_from_pos_files", "exclude_from_bom"]),
                 ("J3".to_string(), vec!["exclude_from_pos_files", "exclude_from_bom"]),
                 ("R2".to_string(), vec!["dnp"]),
+                ("TP1".to_string(), vec!["exclude_from_pos_files", "board_only"]),
             ]
         );
         // KiCad's exporter keeps board_only and exclude_from_bom rows; the
@@ -2693,6 +2738,9 @@ mod cpl_bom_exclusion_tests {
         let bom_refs = jlcpcb_bom_designators(&rewritten).unwrap();
         let cpl_refs = BTreeSet::from(["R1".to_string()]);
         assert_eq!(jlcpcb_designator_mismatch(&cpl_refs, &bom_refs, &not_placed()), None);
+        let notes = super::bom_removal_notes(&not_placed(), &removed);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("J3 removed from the JLCPCB BOM") && notes[0].contains("exclude_from_pos_files"), "{notes:?}");
         let report = not_placed_report(&not_placed(), &removed);
         let j3 = report.as_array().unwrap().iter().find(|e| e["reference"] == "J3").unwrap();
         assert_eq!(j3["removed_from_bom"], true);
@@ -2722,6 +2770,33 @@ mod cpl_bom_exclusion_tests {
         let mismatch = jlcpcb_designator_mismatch(&cpl_refs, &bom_refs, &not_placed()).unwrap();
         assert!(mismatch.contains("missing from CPL [J3]"), "{mismatch}");
         assert!(mismatch.contains("J3 (exclude_from_pos_files, exclude_from_bom)"), "{mismatch}");
+    }
+
+    /// A real part placed in the PCB editor without a symbol (`board_only`
+    /// with pads, no exclusion) is a placement: it stays in the CPL, and the
+    /// BOM/CPL check still reports it missing from the BOM.
+    #[test]
+    fn a_board_only_part_with_pads_stays_a_placement() {
+        let fps = not_placed();
+        assert!(!fps.iter().any(|fp| fp.reference == "C99"));
+        assert!(!not_in_bom(&fps).contains("C99"));
+        let csv = "Ref,Val,Package,PosX,PosY,Rot,Side\n\"C99\",\"1u\",\"c\",4,4,0,top\n\"R1\",\"1k\",\"r\",2,2,0,top\n";
+        assert!(drop_cpl_rows(csv, &not_in_bom(&fps)).contains("C99"));
+        let cpl = BTreeSet::from(["C99".to_string(), "R1".to_string()]);
+        let bom = BTreeSet::from(["R1".to_string()]);
+        let mismatch = jlcpcb_designator_mismatch(&cpl, &bom, &fps).unwrap();
+        assert!(mismatch.contains("missing from BOM [C99]"), "{mismatch}");
+    }
+
+    /// A pad-less `board_only` footprint (a logo) and one also marked
+    /// `exclude_from_pos_files` are not placements.
+    #[test]
+    fn a_board_only_logo_or_excluded_footprint_is_not_a_placement() {
+        let fps = not_placed();
+        let refs = not_in_bom(&fps);
+        assert!(refs.contains("G1"), "pad-less board_only leaves the CPL");
+        assert!(!refs.contains("TP1"), "KiCad's exporter drops TP1 itself");
+        assert!(fps.iter().any(|fp| fp.reference == "TP1"));
     }
 
     #[test]
