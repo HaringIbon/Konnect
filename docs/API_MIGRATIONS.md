@@ -2415,3 +2415,8 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
 - **Edge-rate skew default:** it now converts time to length at the slowest routable signal layer (a stripline, where one is modelled), not the outer microstrip, so it can come out tighter.
 - **Older builds cannot read new intent files:** the intent schema uses `deny_unknown_fields`, so an intent with `standard`, `rise_time_ns`, `kind`, `max_path_mm` or `max_vias` (or a tie without `max_mm`) is refused by builds before this change.
 
+## Unreleased (fork): Tier 1 fixes (mixed-layer plane nets, CPL pads-only, mirrored bottom text)
+
+- **`export_specctra_dsn`:** a fully fanned plane net whose inner pours are all on `mixed` layers now stays in the routing job; it used to be dropped like a `power`-plane net. The response gains `kept_for_mixed_planes` (list of net names) and a warning naming them. `left_to_planes` no longer lists those nets.
+- **`export_manufacturing_package` (JLCPCB):** footprints marked `exclude_from_pos_files`, `exclude_from_bom`, `board_only` or `dnp` no longer make the package incomplete. Their designators are removed from the BOM when the row has no LCSC number, `board_only` rows are dropped from the CPL, and the response gains `not_placed: [{reference, reasons, removed_from_bom}]`. A sourced row whose footprint is not placed still fails, and the mismatch warning names the attribute. `allow_unsourced` is no longer needed for pads-only footprints.
+- **`add_board_text`:** text on a back layer (`B.SilkS`, `B.Cu`, `B.Fab`, …) is now mirrored by default, on both the IPC and the file path. New optional `mirror` (boolean) overrides that. The response gains `mirrored`.

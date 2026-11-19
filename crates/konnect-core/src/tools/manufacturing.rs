@@ -236,6 +236,8 @@ async fn handle_export_manufacturing_package(
     let mut cpl_designators = None;
     let mut bom_designators = None;
     let mut cpl_orientation_evidence = None;
+    let mut cpl_not_placed: Vec<NotPlaced> = Vec::new();
+    let mut bom_not_placed_removed: Vec<String> = Vec::new();
 
     // 1. Export Gerbers
     let gerber_dir = output_dir.join("gerbers");
@@ -347,6 +349,7 @@ async fn handle_export_manufacturing_package(
                 if let Some(export) = export {
                     cpl_designators = Some(export.designators);
                     cpl_orientation_evidence = Some(export.orientation_evidence.clone());
+                    cpl_not_placed = export.not_placed;
                 }
                 verified_paths.push(pos_path.clone());
                 let mut generated = json!({
@@ -401,7 +404,23 @@ async fn handle_export_manufacturing_package(
             match bom_result {
                 Ok(()) => {
                     let parsed = if is_jlcpcb {
-                        let source = tokio::fs::read_to_string(&bom_path).await?;
+                        let mut source = tokio::fs::read_to_string(&bom_path).await?;
+                        // Footprints that are not placements leave the BOM
+                        // too, so they neither need an LCSC number nor make
+                        // the CPL look short.
+                        match drop_unplaced_bom_designators(&source, &cpl_not_placed) {
+                            Ok((Some(rewritten), removed)) => {
+                                match cli::publish_verified_bytes(&bom_path, rewritten.as_bytes(), "JLCPCB BOM").await {
+                                    Ok(()) => {
+                                        source = rewritten;
+                                        bom_not_placed_removed = removed;
+                                    }
+                                    Err(e) => warnings.push(format!("JLCPCB BOM rewrite failed: {e:#}")),
+                                }
+                            }
+                            Ok((None, _)) => {}
+                            Err(e) => warnings.push(format!("JLCPCB BOM placement filter failed: {e:#}")),
+                        }
                         let allowed: BTreeSet<String> = args["allow_unsourced"]
                             .as_array()
                             .map(|refs| refs.iter().filter_map(|r| r.as_str().map(str::to_string)).collect())
@@ -443,7 +462,7 @@ async fn handle_export_manufacturing_package(
 
         if is_jlcpcb {
             if let (Some(cpl), Some(bom)) = (&cpl_designators, &bom_designators) {
-                if let Some(mismatch) = jlcpcb_designator_mismatch(cpl, bom) {
+                if let Some(mismatch) = jlcpcb_designator_mismatch(cpl, bom, &cpl_not_placed) {
                     warnings.push(mismatch);
                 }
             }
@@ -516,6 +535,7 @@ async fn handle_export_manufacturing_package(
         "position_units": if include_assembly { Some(position_units) } else { None },
         "position_side": if include_assembly { Some(position_side) } else { None },
         "placement_orientation": cpl_orientation_evidence,
+        "not_placed": not_placed_report(&cpl_not_placed, &bom_not_placed_removed),
         "board_source": if snapshot.is_some() { "stable_live_ipc_snapshot" } else { "saved_file" },
         "project_settings_source": "saved_kicad_pro_if_present",
         "warnings": warnings,
@@ -572,34 +592,136 @@ pub(super) async fn export_jlcpcb_cpl(
     // JLCPCB places only what its BOM lists: a footprint excluded from the
     // BOM (fiducials, logos, test pads) is not a placement either.
     let board_text = tokio::fs::read_to_string(board).await?;
-    let source = drop_cpl_rows(&source, &not_in_bom(&board_text));
+    let not_placed = not_placed_footprints(&board_text);
+    let source = drop_cpl_rows(&source, &not_in_bom(&not_placed));
     let policies = JlcpcbCorrectionPolicies::load(project_policy_path).await?;
     let (source, geometry) = jlcpcb_midpoints::convert_positions(&source, midpoints)?;
     let mut export = jlcpcb_cpl_from_kicad_csv(&source, &policies)?;
     export.orientation_evidence.geometry = geometry;
+    export.not_placed = not_placed;
     cli::publish_verified_bytes(output, &export.bytes, "JLCPCB CPL").await?;
     Ok(export)
 }
 
-/// References of footprints marked `exclude_from_bom`.
-fn not_in_bom(board: &str) -> BTreeSet<String> {
-    let Ok(tree) = konnect_sexp::parse_sexp(board) else { return BTreeSet::new() };
-    konnect_sexp::board::footprints(&tree)
+/// Footprint attributes that keep a footprint out of the JLCPCB CPL.
+/// `exclude_from_pos_files` and `dnp` are dropped by KiCad's exporter itself
+/// (Konnect passes `--exclude-dnp`); `exclude_from_bom` and `board_only` are
+/// dropped by [`drop_cpl_rows`], because JLCPCB places only BOM lines and a
+/// `board_only` footprint has no symbol, so no BOM line.
+const NOT_PLACED_ATTRIBUTES: [&str; 4] =
+    ["exclude_from_pos_files", "exclude_from_bom", "board_only", "dnp"];
+
+/// Every footprint carrying one of [`NOT_PLACED_ATTRIBUTES`], by reference.
+fn not_placed_footprints(board: &str) -> Vec<NotPlaced> {
+    let Ok(tree) = konnect_sexp::parse_sexp(board) else { return Vec::new() };
+    let mut out = konnect_sexp::board::footprints(&tree)
         .into_iter()
-        .filter(|fp| {
-            fp.find("attr")
-                .and_then(|a| a.children())
-                .is_some_and(|c| c.iter().any(|n| n.as_str() == Some("exclude_from_bom")))
-        })
         .filter_map(|fp| {
-            fp.find_all("property")
+            let attr = fp.find("attr").and_then(|a| a.children()).unwrap_or_default();
+            let reasons = NOT_PLACED_ATTRIBUTES
+                .into_iter()
+                .filter(|wanted| attr.iter().any(|n| n.as_str() == Some(wanted)))
+                .collect::<Vec<_>>();
+            if reasons.is_empty() {
+                return None;
+            }
+            let reference = fp
+                .find_all("property")
                 .into_iter()
                 .find(|p| p.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("Reference"))
                 .and_then(|p| p.get(2))
-                .and_then(konnect_sexp::SexpNode::as_str)
-                .map(str::to_string)
+                .and_then(konnect_sexp::SexpNode::as_str)?
+                .to_string();
+            Some(NotPlaced { reference, reasons })
         })
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| a.reference.cmp(&b.reference));
+    out
+}
+
+/// References the CPL must drop itself: KiCad's exporter keeps footprints
+/// marked `exclude_from_bom` or `board_only`.
+fn not_in_bom(not_placed: &[NotPlaced]) -> BTreeSet<String> {
+    not_placed
+        .iter()
+        .filter(|fp| fp.reasons.iter().any(|r| matches!(*r, "exclude_from_bom" | "board_only")))
+        .map(|fp| fp.reference.clone())
         .collect()
+}
+
+/// Take the designators of footprints that are not placements out of a
+/// JLCPCB BOM, so the package is complete without them and JLCPCB is not
+/// asked to source a part it cannot place (a pads-only Tag-Connect, a
+/// mounting hole). A row that carries an LCSC number is left alone: a sourced
+/// part that is not placed is a real inconsistency, and the BOM/CPL check
+/// still reports it. Returns the rewritten BOM (None when unchanged) and the
+/// designators removed.
+fn drop_unplaced_bom_designators(
+    source: &str,
+    not_placed: &[NotPlaced],
+) -> anyhow::Result<(Option<String>, Vec<String>)> {
+    let refs = not_placed.iter().map(|fp| fp.reference.as_str()).collect::<BTreeSet<_>>();
+    if refs.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .from_reader(source.as_bytes());
+    let headers = reader.headers()?.clone();
+    let reference = headers
+        .iter()
+        .position(|h| matches!(h, "Designator" | "Reference" | "Refs"))
+        .context("JLCPCB BOM has no Designator/Reference/Refs column")?;
+    let lcsc = headers.iter().position(|h| {
+        let h = h.to_ascii_lowercase();
+        h.starts_with("lcsc") || h.starts_with("jlcpcb part")
+    });
+    let quantity = headers.iter().position(|h| {
+        let h = h.to_ascii_lowercase();
+        h == "qty" || h == "quantity"
+    });
+    let mut writer = csv::WriterBuilder::new()
+        .quote_style(csv::QuoteStyle::Always)
+        .from_writer(Vec::new());
+    writer.write_record(&headers)?;
+    let mut removed = Vec::new();
+    for row in reader.records() {
+        let row = row?;
+        let sourced = lcsc
+            .and_then(|i| row.get(i))
+            .map(str::trim)
+            .is_some_and(|n| !n.is_empty() && n != "~");
+        let designators = row
+            .get(reference)
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .collect::<Vec<_>>();
+        let (gone, kept): (Vec<&str>, Vec<&str>) =
+            designators.iter().partition(|r| refs.contains(*r) && !sourced);
+        if gone.is_empty() {
+            writer.write_record(&row)?;
+            continue;
+        }
+        removed.extend(gone.iter().map(|r| r.to_string()));
+        if kept.is_empty() {
+            continue;
+        }
+        let mut fields = row.iter().map(str::to_string).collect::<Vec<_>>();
+        fields[reference] = kept.join(",");
+        if let Some(q) = quantity {
+            if fields[q].trim().parse::<usize>().ok() == Some(designators.len()) {
+                fields[q] = kept.len().to_string();
+            }
+        }
+        writer.write_record(&fields)?;
+    }
+    if removed.is_empty() {
+        return Ok((None, removed));
+    }
+    let bytes = writer.into_inner().map_err(|e| anyhow::anyhow!("write JLCPCB BOM: {e}"))?;
+    Ok((Some(String::from_utf8(bytes)?), removed))
 }
 
 /// KiCad's position CSV without the rows of `refs` (first column).
@@ -877,6 +999,19 @@ pub(super) struct JlcpcbCplExport {
     pub(super) bytes: Vec<u8>,
     designators: BTreeSet<String>,
     orientation_evidence: JlcpcbOrientationEvidence,
+    /// Footprints the CPL leaves out on purpose, with the attribute that
+    /// says so.
+    not_placed: Vec<NotPlaced>,
+}
+
+/// A footprint that is not a placement: its attributes keep it out of the
+/// position file (KiCad's `PLACE_FILE_EXPORTER::GenPositionData`, doc DB
+/// `kicad-10-0-8-place-file-exporter`) or out of the JLCPCB CPL (no BOM line
+/// to place it from).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct NotPlaced {
+    pub(super) reference: String,
+    pub(super) reasons: Vec<&'static str>,
 }
 
 /// Translate KiCad 10's native position CSV into JLCPCB's documented CPL
@@ -1012,6 +1147,7 @@ fn jlcpcb_cpl_from_kicad_csv(
     Ok(JlcpcbCplExport {
         bytes: writer.into_inner()?,
         designators,
+        not_placed: Vec::new(),
         orientation_evidence: JlcpcbOrientationEvidence {
             status: "PREVIEW_REQUIRED",
             physical_validation: false,
@@ -1132,18 +1268,48 @@ fn jlcpcb_bom_sourcing(source: &str, allowed: &BTreeSet<String>) -> anyhow::Resu
     Ok(problems)
 }
 
-fn jlcpcb_designator_mismatch(cpl: &BTreeSet<String>, bom: &BTreeSet<String>) -> Option<String> {
+fn jlcpcb_designator_mismatch(
+    cpl: &BTreeSet<String>,
+    bom: &BTreeSet<String>,
+    not_placed: &[NotPlaced],
+) -> Option<String> {
     let missing_from_bom = cpl.difference(bom).cloned().collect::<Vec<_>>();
     let missing_from_cpl = bom.difference(cpl).cloned().collect::<Vec<_>>();
     if missing_from_bom.is_empty() && missing_from_cpl.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "JLCPCB BOM/CPL designators do not match: missing from BOM [{}]; missing from CPL [{}]",
-            missing_from_bom.join(", "),
-            missing_from_cpl.join(", ")
-        ))
+        return None;
     }
+    let mut message = format!(
+        "JLCPCB BOM/CPL designators do not match: missing from BOM [{}]; missing from CPL [{}]",
+        missing_from_bom.join(", "),
+        missing_from_cpl.join(", ")
+    );
+    // A sourced BOM row whose footprint is marked not-placed stays in the BOM
+    // (see `drop_unplaced_bom_designators`); say which attribute hides it.
+    let explained = missing_from_cpl
+        .iter()
+        .filter_map(|r| not_placed.iter().find(|fp| &fp.reference == r))
+        .map(|fp| format!("{} ({})", fp.reference, fp.reasons.join(", ")))
+        .collect::<Vec<_>>();
+    if !explained.is_empty() {
+        message.push_str(&format!(
+            ". Sourced BOM rows whose footprint is not a placement: {} — clear the footprint attribute to have it placed, or remove the LCSC number",
+            explained.join("; ")
+        ));
+    }
+    Some(message)
+}
+
+/// The response's `not_placed` list: each footprint the CPL leaves out on
+/// purpose, why, and whether it was also taken out of the BOM.
+fn not_placed_report(not_placed: &[NotPlaced], removed_from_bom: &[String]) -> serde_json::Value {
+    json!(not_placed
+        .iter()
+        .map(|fp| json!({
+            "reference": fp.reference,
+            "reasons": fp.reasons,
+            "removed_from_bom": removed_from_bom.contains(&fp.reference),
+        }))
+        .collect::<Vec<_>>())
 }
 
 fn invalid_manufacturing_argument(field: &str, reason: impl Into<String>) -> CallToolResult {
@@ -1836,7 +2002,7 @@ mod jlcpcb_assembly_tests {
             .into_iter()
             .map(str::to_string)
             .collect();
-        assert_eq!(jlcpcb_designator_mismatch(&cpl_refs, &bom_refs), None);
+        assert_eq!(jlcpcb_designator_mismatch(&cpl_refs, &bom_refs, &[]), None);
     }
 
     #[test]
@@ -1849,7 +2015,7 @@ mod jlcpcb_assembly_tests {
 
         let cpl = ["C1", "C2", "U1"].into_iter().map(str::to_string).collect();
         let bom = ["C1", "C2", "R1"].into_iter().map(str::to_string).collect();
-        let mismatch = jlcpcb_designator_mismatch(&cpl, &bom).unwrap();
+        let mismatch = jlcpcb_designator_mismatch(&cpl, &bom, &[]).unwrap();
         assert!(mismatch.contains("missing from BOM [U1]"));
         assert!(mismatch.contains("missing from CPL [R1]"));
     }
@@ -1938,7 +2104,7 @@ mod jlcpcb_assembly_tests {
         let bom_source = tokio::fs::read_to_string(&bom).await.unwrap();
         let bom_refs = jlcpcb_bom_designators(&bom_source).unwrap();
         assert_eq!(
-            jlcpcb_designator_mismatch(&cpl_export.designators, &bom_refs),
+            jlcpcb_designator_mismatch(&cpl_export.designators, &bom_refs, &cpl_export.not_placed),
             None
         );
     }
@@ -2457,17 +2623,110 @@ mod jlcpcb_sourcing_tests {
 
 #[cfg(test)]
 mod cpl_bom_exclusion_tests {
-    use super::{drop_cpl_rows, not_in_bom};
+    use super::{
+        drop_cpl_rows, drop_unplaced_bom_designators, jlcpcb_bom_designators, jlcpcb_bom_sourcing,
+        jlcpcb_designator_mismatch, not_in_bom, not_placed_footprints, not_placed_report, NotPlaced,
+    };
+    use std::collections::BTreeSet;
 
     #[test]
     fn fiducials_excluded_from_the_bom_leave_the_cpl() {
         let board = "(kicad_pcb
           (footprint \"Fiducial:Fiducial_1mm_Mask2mm\" (layer \"F.Cu\") (at 1 1) (property \"Reference\" \"FID1\") (attr smd exclude_from_bom))
           (footprint \"R\" (layer \"F.Cu\") (at 2 2) (property \"Reference\" \"R1\") (attr smd)))";
-        let refs = not_in_bom(board);
+        let refs = not_in_bom(&not_placed_footprints(board));
         assert_eq!(refs.into_iter().collect::<Vec<_>>(), ["FID1"]);
         let csv = "Ref,Val,Package,PosX,PosY,Rot,Side\n\"FID1\",\"x\",\"f\",1,1,0,top\n\"R1\",\"1k\",\"r\",2,2,0,top\n";
-        let out = drop_cpl_rows(csv, &not_in_bom(board));
+        let out = drop_cpl_rows(csv, &not_in_bom(&not_placed_footprints(board)));
         assert!(!out.contains("FID1") && out.contains("R1") && out.starts_with("Ref,"), "{out}");
+    }
+
+    /// The Ethernet board's footprints, attributes as KiCad 10 writes them.
+    const BOARD: &str = "(kicad_pcb
+      (footprint \"Connector:Tag-Connect_TC2030-IDC-NL_2x03_P1.27mm_Vertical\" (layer \"F.Cu\") (at 5 5) (property \"Reference\" \"J3\") (attr exclude_from_pos_files exclude_from_bom))
+      (footprint \"MountingHole:MountingHole_3.2mm_M3\" (layer \"F.Cu\") (at 1 1) (property \"Reference\" \"H1\") (attr exclude_from_pos_files exclude_from_bom))
+      (footprint \"Logo\" (layer \"F.Cu\") (at 1 9) (property \"Reference\" \"G1\") (attr board_only))
+      (footprint \"R\" (layer \"F.Cu\") (at 3 3) (property \"Reference\" \"R2\") (attr smd dnp))
+      (footprint \"R\" (layer \"F.Cu\") (at 2 2) (property \"Reference\" \"R1\") (attr smd)))";
+
+    fn not_placed() -> Vec<NotPlaced> {
+        not_placed_footprints(BOARD)
+    }
+
+    #[test]
+    fn each_not_placed_footprint_carries_its_attributes() {
+        let found = not_placed()
+            .into_iter()
+            .map(|fp| (fp.reference, fp.reasons))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            vec![
+                ("G1".to_string(), vec!["board_only"]),
+                ("H1".to_string(), vec!["exclude_from_pos_files", "exclude_from_bom"]),
+                ("J3".to_string(), vec!["exclude_from_pos_files", "exclude_from_bom"]),
+                ("R2".to_string(), vec!["dnp"]),
+            ]
+        );
+        // KiCad's exporter keeps board_only and exclude_from_bom rows; the
+        // CPL drops them itself.
+        assert_eq!(
+            not_in_bom(&not_placed()).into_iter().collect::<Vec<_>>(),
+            ["G1", "H1", "J3"]
+        );
+    }
+
+    /// The Tag-Connect symbol is in the schematic BOM with no LCSC number;
+    /// its footprint is pads only. Before: "missing from CPL [J3]" and an
+    /// unsourced row, so the package read incomplete.
+    #[test]
+    fn a_pads_only_footprint_leaves_the_bom_and_the_package_is_complete() {
+        let bom = "\"Comment\",\"Designator\",\"Footprint\",\"LCSC Part #\"\n\
+                   \"TC2030\",\"J3\",\"Tag-Connect\",\"\"\n\
+                   \"1k\",\"R1\",\"R_0402\",\"C11702\"\n";
+        let (rewritten, removed) = drop_unplaced_bom_designators(bom, &not_placed()).unwrap();
+        let rewritten = rewritten.expect("J3 removed");
+        assert_eq!(removed, ["J3"]);
+        assert!(rewritten.starts_with("\"Comment\",\"Designator\""), "{rewritten}");
+        assert!(!rewritten.contains("J3") && rewritten.contains("C11702"), "{rewritten}");
+        assert!(jlcpcb_bom_sourcing(&rewritten, &BTreeSet::new()).unwrap().is_empty());
+        let bom_refs = jlcpcb_bom_designators(&rewritten).unwrap();
+        let cpl_refs = BTreeSet::from(["R1".to_string()]);
+        assert_eq!(jlcpcb_designator_mismatch(&cpl_refs, &bom_refs, &not_placed()), None);
+        let report = not_placed_report(&not_placed(), &removed);
+        let j3 = report.as_array().unwrap().iter().find(|e| e["reference"] == "J3").unwrap();
+        assert_eq!(j3["removed_from_bom"], true);
+        assert_eq!(j3["reasons"][0], "exclude_from_pos_files");
+    }
+
+    #[test]
+    fn a_grouped_row_keeps_its_other_designators_and_quantity() {
+        let bom = "Comment,Designator,Footprint,LCSC Part #,Quantity\n\
+                   MountingHole,\"H1,H2\",M3,,2\n";
+        let fps = vec![NotPlaced { reference: "H1".into(), reasons: vec!["exclude_from_pos_files"] }];
+        let (rewritten, removed) = drop_unplaced_bom_designators(bom, &fps).unwrap();
+        let rewritten = rewritten.unwrap();
+        assert_eq!(removed, ["H1"]);
+        assert!(rewritten.contains("\"H2\"") && rewritten.contains("\"1\"") && !rewritten.contains("H1"), "{rewritten}");
+    }
+
+    /// A sourced part whose footprint is excluded from placement is a real
+    /// inconsistency: it stays in the BOM and the mismatch names the cause.
+    #[test]
+    fn a_sourced_row_with_a_not_placed_footprint_still_fails_with_the_reason() {
+        let bom = "Comment,Designator,Footprint,LCSC Part #\nTC2030,J3,Tag-Connect,C123456\n1k,R1,R_0402,C11702\n";
+        let (rewritten, removed) = drop_unplaced_bom_designators(bom, &not_placed()).unwrap();
+        assert!(rewritten.is_none() && removed.is_empty());
+        let bom_refs = jlcpcb_bom_designators(bom).unwrap();
+        let cpl_refs = BTreeSet::from(["R1".to_string()]);
+        let mismatch = jlcpcb_designator_mismatch(&cpl_refs, &bom_refs, &not_placed()).unwrap();
+        assert!(mismatch.contains("missing from CPL [J3]"), "{mismatch}");
+        assert!(mismatch.contains("J3 (exclude_from_pos_files, exclude_from_bom)"), "{mismatch}");
+    }
+
+    #[test]
+    fn a_board_without_exclusions_leaves_the_bom_untouched() {
+        let bom = "Comment,Designator,Footprint,LCSC Part #\n1k,R1,R_0402,C11702\n";
+        assert_eq!(drop_unplaced_bom_designators(bom, &[]).unwrap(), (None, vec![]));
     }
 }

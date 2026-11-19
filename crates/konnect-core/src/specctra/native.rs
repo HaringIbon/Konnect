@@ -61,6 +61,11 @@ pub(crate) struct NativeExport {
     /// `fanout_to_plane`): left out of the routing job entirely, because the
     /// refilled planes connect them.
     pub left_to_planes: Vec<String>,
+    /// Plane nets that are fully fanned out but kept in the routing job,
+    /// because every inner pour of theirs is on a `mixed` layer: routes on
+    /// that layer can cut the pour into islands, so the net's own traces must
+    /// connect its pads.
+    pub kept_for_mixed_planes: Vec<String>,
     pub copper_layers: usize,
     pub power_layers: Vec<String>,
     pub custom_rules: bool,
@@ -160,7 +165,9 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
         .map(|plane| plane.layer.clone())
         .collect::<BTreeSet<_>>();
     let dsn = retype_as_power(&dsn, &plane_layers)?;
-    let left_to_planes = fully_fanned_plane_nets(&board, &removed_planes);
+    let fully_fanned = fully_fanned_plane_nets(&board, &removed_planes);
+    let (left_to_planes, kept_for_mixed_planes) =
+        split_by_plane_layer(fully_fanned, &removed_planes, &mixed);
     let dsn = drop_nets(&dsn, &left_to_planes)?;
     let dsn = edge_clearance_keepouts(&dsn, board_edge_clearance_mm(board_path))?;
     // Not `validate_dsn_syntax`: Topola's reader rejects KiCad's own image
@@ -465,6 +472,7 @@ pub(crate) fn lower(board_path: &Path, snapshot: &str, raw_dsn: &str) -> Result<
         },
         removed_planes,
         left_to_planes,
+        kept_for_mixed_planes,
         copper_layers,
         power_layers,
         custom_rules,
@@ -515,6 +523,32 @@ fn fully_fanned_plane_nets(board: &SexpNode, planes: &[RemovedPlane]) -> Vec<Str
                 .all_pads_reach_planes()
         })
         .collect()
+}
+
+/// Split fully fanned plane nets into those left to their planes and those
+/// kept in the routing job.
+///
+/// A net is left out only when at least one of its inner pours is on a layer
+/// that stays a solid plane (KiCad `power`, written `(type power)` in the
+/// DSN). Freerouting never routes on such a layer (`read_layer_scope` sets
+/// `is_signal = false` for `(type power)`; doc DB
+/// `freerouting-2-3-0-structure-java`), so the refilled pour joins every
+/// fan-out via. A `mixed` layer is written `(type signal)` and Freerouting
+/// routes other nets across it; a net dropped from the network
+/// (`freerouting-2-3-0-network-java`) has nothing that rejoins the pour
+/// islands those routes cut. Such a net stays in the job and is routed as
+/// an ordinary net (its stripped plane gives no `contains_plane` via
+/// discount, `freerouting-2-3-0-layerstructure-java`).
+fn split_by_plane_layer(
+    fully_fanned: Vec<String>,
+    planes: &[RemovedPlane],
+    mixed: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    fully_fanned.into_iter().partition(|net| {
+        planes
+            .iter()
+            .any(|plane| &plane.net == net && plane.layer.starts_with("In") && !mixed.contains(&plane.layer))
+    })
 }
 
 /// Remove nets from a DSN: their `(net …)` in the network, their names in
@@ -956,6 +990,9 @@ mod tests {
 mod round_trip_tests {
     //! The real KiCad 10.0.8 + Freerouting 2.1.0 round trip in
     //! `tests/fixtures/specctra_native_4layer.README.md`.
+    use super::{balanced_len, parse_dsn_sexp, split_by_plane_layer, RemovedPlane};
+    use konnect_sexp::SexpNode;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     const BOARD: &str = include_str!("../../tests/fixtures/specctra_native_4layer.kicad_pcb");
@@ -1009,6 +1046,100 @@ mod round_trip_tests {
         assert_eq!(export.power_layers, vec!["In1.Cu"]);
         assert!(export.bundle.dsn.contains("(layer In2.Cu\n      (type signal)"));
         assert!(!export.bundle.dsn.contains("(plane "));
+    }
+
+    /// The fixture board with every `+3V3` pad made through-hole: such pads
+    /// reach the planes on their own, so the fan-out planner reports the net
+    /// fully fanned without a via per pad.
+    fn board_with_fanned_3v3(board: &str) -> String {
+        let mut out = String::with_capacity(board.len());
+        let mut rest = board;
+        while let Some(start) = rest.find("(pad ") {
+            let end = start + balanced_len(&rest[start..]).unwrap();
+            let form = &rest[start..end];
+            out.push_str(&rest[..start]);
+            if form.contains("(net \"+3V3\")") {
+                out.push_str(&form.replacen(" smd ", " thru_hole ", 1));
+            } else {
+                out.push_str(form);
+            }
+            rest = &rest[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn with_in2_typed(board: &str, kind: &str) -> String {
+        let line = board.lines().find(|line| line.contains("(6 \"In2.Cu\"")).expect("fixture has In2.Cu");
+        board.replacen(line, &line.replacen("power", kind, 1), 1)
+    }
+
+    /// On a `power` plane layer a fully fanned plane net leaves the routing
+    /// job (the solid plane connects every via): Pass 4 behaviour.
+    #[test]
+    fn a_fully_fanned_net_on_a_power_plane_leaves_the_job() {
+        let (_dir, path) = board();
+        let fanned = board_with_fanned_3v3(BOARD);
+        assert_ne!(fanned, BOARD);
+        let export = super::lower(&path, &fanned, DSN).unwrap();
+        assert_eq!(export.left_to_planes, vec!["+3V3"]);
+        assert!(export.kept_for_mixed_planes.is_empty());
+        let root = super::super::parse_dsn_sexp(&export.bundle.dsn).unwrap();
+        let network = root.find("network").unwrap();
+        assert!(network.find_all("net").iter().all(|net| net.get(1).and_then(SexpNode::as_str) != Some("+3V3")));
+    }
+
+    /// Tier 1 fix: when the net's pour is on a `mixed` layer Freerouting may
+    /// cut it into islands, so the net stays in the job with all its pins.
+    #[test]
+    fn a_fully_fanned_net_on_a_mixed_layer_stays_in_the_job() {
+        let (_dir, path) = board();
+        let mixed_board = with_in2_typed(&board_with_fanned_3v3(BOARD), "mixed");
+        let dsn = DSN.replacen("(layer In2.Cu\n      (type power)", "(layer In2.Cu\n      (type signal)", 1);
+        let export = super::lower(&path, &mixed_board, &dsn).unwrap();
+        assert!(export.left_to_planes.is_empty(), "{:?}", export.left_to_planes);
+        assert_eq!(export.kept_for_mixed_planes, vec!["+3V3"]);
+        assert_eq!(export.power_layers, vec!["In1.Cu"]);
+        let root = super::super::parse_dsn_sexp(&export.bundle.dsn).unwrap();
+        let net = root
+            .find("network")
+            .unwrap()
+            .find_all("net")
+            .into_iter()
+            .find(|net| net.get(1).and_then(SexpNode::as_str) == Some("+3V3"))
+            .expect("+3V3 stays in the network");
+        let pins = net.find("pins").and_then(SexpNode::children).unwrap().len() - 1;
+        let raw = parse_dsn_sexp(&dsn).unwrap();
+        let raw_pins = raw
+            .find("network")
+            .unwrap()
+            .find_all("net")
+            .into_iter()
+            .find(|net| net.get(1).and_then(SexpNode::as_str) == Some("+3V3"))
+            .and_then(|net| net.find("pins").and_then(SexpNode::children))
+            .unwrap()
+            .len()
+            - 1;
+        assert_eq!(pins, raw_pins);
+        let manifest: serde_json::Value = serde_json::from_str(&export.bundle.manifest).unwrap();
+        assert!(manifest["nets"].as_array().unwrap().iter().any(|net| net["name"] == "+3V3"));
+    }
+
+    #[test]
+    fn a_net_with_a_pour_on_a_power_layer_too_still_leaves_the_job() {
+        let planes = [
+            RemovedPlane { net: "GND".into(), layer: "In1.Cu".into() },
+            RemovedPlane { net: "GND".into(), layer: "In2.Cu".into() },
+            RemovedPlane { net: "+3V3".into(), layer: "In2.Cu".into() },
+            RemovedPlane { net: "+5V".into(), layer: "B.Cu".into() },
+            RemovedPlane { net: "+5V".into(), layer: "In2.Cu".into() },
+        ];
+        let mixed = BTreeSet::from(["In2.Cu".to_string()]);
+        let fanned = vec!["+3V3".to_string(), "+5V".to_string(), "GND".to_string()];
+        let (left, kept) = split_by_plane_layer(fanned, &planes, &mixed);
+        assert_eq!(left, vec!["GND"]);
+        // An outer-layer pour is never a solid plane.
+        assert_eq!(kept, vec!["+3V3", "+5V"]);
     }
 
     /// A pad rotated within its footprint is written
