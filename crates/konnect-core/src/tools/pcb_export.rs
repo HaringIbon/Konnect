@@ -788,6 +788,14 @@ async fn export_specctra_with_kicad(
             native.left_to_planes
         ));
     }
+    if !native.kept_for_mixed_planes.is_empty() {
+        warnings.push(format!(
+            "Plane nets {:?} are fully fanned out but their pour is on a 'mixed' layer, which \
+             the router may cross; they stay in the routing job and are routed as traces so the \
+             pads stay connected even where other routes split the pour.",
+            native.kept_for_mixed_planes
+        ));
+    }
     if !native.removed_planes.is_empty() {
         warnings.push(
             "Zones were removed from the routing job (Freerouting cannot route through Specctra \
@@ -819,6 +827,7 @@ async fn export_specctra_with_kicad(
             "power_layers_not_routed": native.power_layers,
             "removed_planes": native.removed_planes,
             "left_to_planes": native.left_to_planes,
+            "kept_for_mixed_planes": native.kept_for_mixed_planes,
             "warnings": warnings,
             "capabilities": {
                 "dsn_export_available": true,

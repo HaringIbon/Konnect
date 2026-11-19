@@ -674,3 +674,45 @@ Code: `design_intent.rs`, `eecalc.rs`, `layer_stack.rs` (and a 3-line `Tie` lite
   - 41 ties measured in about 0.25 s (debug build). 37 pass. 4 are unverified: +3V3 caps joined only by the 3V3 pour (C7, C11, C25, C26).
   - The figures are plausible: Y2 crystal 5.5 mm, 0 vias, 0.41 pF. C15 VCAP 2.4 mm, 1 via, 0.79 nH. C10 VBAT 10.8 mm, 3 vias. R1 CC1 27.2 mm, 3 vias.
 - **Not done:** DRC rules from crystal and pair defaults; RMII group matching; re-reading ST AN2867 (st.com unreachable); migrating the board scripts (`eth_board/build.py` still sets explicit skews and tie lengths, so user values win there).
+
+## Pass 17: Tier 1 fixes (mixed-layer plane nets, CPL pads-only, mirrored bottom text)
+
+### Mixed layers keep the plane net in the routing job
+
+- **Problem (Pass 13 limit):** a plane net whose every pad already reaches its pour through fan-out was dropped from the Freerouting job even when the pour sat on a `mixed` layer. Freerouting then routed other nets across that layer, cut the pour into islands, and nothing rejoined them (five +3V3 islands on the module board).
+- **Freerouting's side** (2.3.0 source, doc DB `freerouting-2-3-0-structure-java`, `-layerstructure-java`, `-network-java`, `-net-java`):
+  - `(type power)` sets `is_signal = false`, and the router never routes on such a layer. `signal` and `jumper` layers stay routable. KiCad writes a `mixed` layer as `(type signal)`.
+  - A net counts as a plane net (`contains_plane`, which only buys cheaper vias) only through a non-signal layer's `use_net` or a `(plane …)`. Konnect strips every plane, so a net kept in the job is an ordinary net and is routed as traces.
+  - A net left out of `(network …)` is invisible to the router, so nothing it routes connects that net's islands.
+- **Change** (`specctra/native.rs`, `split_by_plane_layer`): a fully fanned plane net leaves the job only when at least one of its inner pours is on a layer that stays a solid plane (not `mixed`). Nets whose inner pours are all on `mixed` layers stay in the job and are reported.
+  - A net that also has a pour on a `power` layer still leaves the job: the solid plane joins every fan-out via.
+  - On a board without `mixed` layers nothing changes.
+- **Response:** `export_specctra_dsn` gains `kept_for_mixed_planes` and a warning naming those nets.
+- **Tests:** `a_fully_fanned_net_on_a_power_plane_leaves_the_job`, `a_fully_fanned_net_on_a_mixed_layer_stays_in_the_job` (the real 4-layer fixture with +3V3 pads made fully fanned: all pins stay in the network and the manifest), `a_net_with_a_pour_on_a_power_layer_too_still_leaves_the_job`.
+- **Live** (copy of the module board, signal routing stripped, GND/+3V3 fan-out locked):
+  - In2 `power`: `left_to_planes: ["+3V3", "GND"]`, In2 `(type power)`, neither net in the DSN network (unchanged behaviour).
+  - In2 retyped `mixed` with `add_layer`: `left_to_planes: ["GND"]`, `kept_for_mixed_planes: ["+3V3"]`, In2 `(type signal)`, +3V3 in the network.
+  - Freerouting 2.3.0 on the mixed DSN (25 passes): 28 → 4 unrouted, 46 router-side violations; 112 tracks on In2, 3 of them +3V3. `apply_specctra_ses` rolled the import back for reasons outside this fix (the board's intent rules for the stripped USB pair and VBUS width, then Freerouting's 0.112 mm tracks against the 0.127 mm board minimum).
+  - The same SES imported offline with `pcbnew.ImportSpecctraSES`, zones refilled, then `kicad-cli pcb drc --refill-zones`: the In2 pour is cut into 8 pieces, yet **+3V3 has 0 unconnected items**, because its own traces join the pads. The 4 unconnected items left are 2 GND (J2/J7 pad 5 to their vias), 1 VBUS and 1 USB_D_P, all outside this fix.
+  - Not measured: the same route with the old behaviour, for a side-by-side count. The Pass 13 record (five +3V3 islands left unjoined) is the baseline.
+
+### CPL completeness ignores footprints that are not placements
+
+- **Problem:** the schematic BOM lists a pads-only footprint (the Tag-Connect J3), but KiCad's position file omits it (`exclude_from_pos_files`), so `export_manufacturing_package` for JLCPCB reported "missing from CPL [J3]" plus an unsourced BOM row, and the package read INCOMPLETE. `allow_unsourced` only silenced the second warning.
+- **Which footprints the position file omits:** KiCad 10.0.8 `PLACE_FILE_EXPORTER::GenPositionData` (doc DB `kicad-10-0-8-place-file-exporter`) skips `exclude_from_pos_files`, and with Konnect's `--exclude-dnp` also `dnp`. Konnect already drops `exclude_from_bom` rows from the JLCPCB CPL. KiCad never skips `board_only`, so `board_only` counts only alongside another exclusion attribute, or on a footprint with no pads (a logo, reported as `board_only` + `no_pads` and dropped from the CPL). A real part placed without a symbol (`board_only` with pads) is still a placement and still reported "missing from BOM".
+- **Change** (`tools/manufacturing.rs`):
+  - `not_placed_footprints` lists every footprint carrying one of those four attributes, with the attributes as reasons.
+  - `drop_unplaced_bom_designators` takes those designators out of the JLCPCB BOM (whole rows, or one designator of a grouped row, with a Qty column kept in step), so they need no LCSC number and the BOM and CPL match. The file is rewritten through the verified-publish path.
+  - A row that carries an LCSC number is left alone: a sourced part whose footprint is excluded from placement is a real inconsistency. The BOM/CPL mismatch warning now names the attribute that hides it.
+- **Response:** `not_placed: [{reference, reasons, removed_from_bom}]`, and a non-blocking `notes` array with one line per designator removed from the BOM (and its attributes). The summary names the removed designators. Neither affects `complete`.
+- **Tests:** `cpl_bom_exclusion_tests` (8): attribute reading, the J3 case end to end (BOM rewrite, LCSC check, designator match, notes, report), grouped rows and quantity, sourced rows still failing with the reason, a `board_only` part with pads staying a placement ("missing from BOM [C99]"), pad-less and excluded `board_only` footprints, untouched BOM without exclusions.
+- **Review fix:** the first version dropped every `board_only` footprint from the CPL, which would have marked a package complete while a symbol-less real part was never placed.
+- **Live** (copy of the Ethernet board, pcbnew open): without `allow_unsourced`, `complete: true`, no warnings. `not_placed` lists FID1–3 (`exclude_from_bom`), H1–4 and J3 (`exclude_from_pos_files`, `exclude_from_bom`); only J3 was in the schematic BOM and was removed from it. The BOM is otherwise identical to the board's last package apart from parts removed from the design since.
+
+### Bottom-side `add_board_text` is mirrored
+
+- **Problem:** text on B.SilkS, B.Cu, B.Fab and the other back layers was written unmirrored, so it read backwards from the bottom.
+- **KiCad's behaviour:** its text tool sets `m_Mirrored = IsBackLayer(layer)` (doc DB `kicad-10-0-8-drawing-tool`), and the file form is `(justify mirror)` inside `(effects …)` (`kicad-10-0-8-eda-text`).
+- **Change** (`tools/pcb_board.rs`): `board_text_mirrored` mirrors text on any `B.` layer by default; the IPC path sets `TextAttributes.mirrored`, and the file fallback writes `(justify mirror)`. A new optional `mirror` argument overrides the default. The response reports `mirrored`.
+- **Tests:** `bottom_side_board_text_is_mirrored_in_the_file` (8 layer/override cases, parsed back), `bottom_side_board_text_is_mirrored_over_ipc` (the BoardText sent in `CreateItems`, and the file left untouched).
+- **Live** (copy of the Ethernet board): over IPC, B.SilkS and B.Fab text saved by pcbnew as `(justify mirror)`, F.SilkS text without; through the file fallback (KiCad closed), B.SilkS and B.Cu text. `pcbnew.LoadBoard` reads `IsMirrored()` true for all four back-layer texts and false for both front ones, and `kicad-cli pcb export svg` loads the board.
