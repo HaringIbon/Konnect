@@ -336,9 +336,43 @@ struct PadInfo {
     smd: bool,
     layer: &'static str,
     footprint_center: Point,
+    /// KiCad pad shape (`rect`, `circle`, `oval`, `roundrect`, …) and the
+    /// roundrect corner ratio.
+    shape: String,
+    roundrect_ratio: f64,
 }
 
 impl PadInfo {
+    /// The pad's true outline in board coordinates (circle, oval and
+    /// roundrect sampled; other shapes as their rectangle). Convex.
+    fn outline(&self) -> Vec<Point> {
+        let (w, h) = (self.size.0 / 2.0, self.size.1 / 2.0);
+        let arc = |cx: f64, cy: f64, r: f64, from: f64, steps: usize| -> Vec<Point> {
+            (0..=steps).map(|i| {
+                let a = from + std::f64::consts::FRAC_PI_2 * i as f64 / steps as f64;
+                (cx + r * a.cos(), cy + r * a.sin())
+            }).collect()
+        };
+        // Corner radius r: rounded rectangle with quarter arcs at the corners.
+        let rounded = |r: f64| -> Vec<Point> {
+            let r = r.min(w).min(h).max(0.0);
+            let half_pi = std::f64::consts::FRAC_PI_2;
+            let mut pts = Vec::new();
+            pts.extend(arc(w - r, h - r, r, 0.0, 6));
+            pts.extend(arc(-w + r, h - r, r, half_pi, 6));
+            pts.extend(arc(-w + r, -h + r, r, 2.0 * half_pi, 6));
+            pts.extend(arc(w - r, -h + r, r, 3.0 * half_pi, 6));
+            pts
+        };
+        let local: Vec<Point> = match self.shape.as_str() {
+            "circle" => rounded(w.min(h)),
+            "oval" => rounded(w.min(h)),
+            "roundrect" => rounded(self.roundrect_ratio * 2.0 * w.min(h)),
+            _ => vec![(-w, -h), (w, -h), (w, h), (-w, h)],
+        };
+        local.into_iter().map(|(x, y)| konnect_sexp::geometry::transform_pad(x, y, self.center.0, self.center.1, self.angle)).collect()
+    }
+
     /// The pad's rectangle in board coordinates, rotation included.
     fn corners(&self) -> [Point; 4] {
         let (w, h) = (self.size.0 / 2.0, self.size.1 / 2.0);
@@ -397,6 +431,8 @@ fn collect_pads(tree: &SexpNode) -> Vec<PadInfo> {
                 smd: kind == "smd",
                 layer: if back { "B.Cu" } else { "F.Cu" },
                 footprint_center: (fx, fy),
+                shape: pad.get(3).and_then(SexpNode::as_str).unwrap_or("rect").to_string(),
+                roundrect_ratio: pad.find_f64("roundrect_rratio").unwrap_or(0.25),
             });
         }
     }
@@ -1178,6 +1214,8 @@ pub(crate) struct CopperPad {
     pub layer: &'static str,
     /// Surface-mount (one layer) rather than plated through (every layer).
     pub smd: bool,
+    /// The true pad outline (circle, oval, roundrect sampled), convex.
+    pub outline: Vec<(f64, f64)>,
 }
 
 pub(crate) fn copper_pads(tree: &SexpNode) -> Vec<CopperPad> {
@@ -1185,6 +1223,7 @@ pub(crate) fn copper_pads(tree: &SexpNode) -> Vec<CopperPad> {
         .into_iter()
         .map(|pad| CopperPad {
             corners: pad.corners(),
+            outline: pad.outline(),
             reference: pad.reference,
             number: pad.number,
             net: pad.net,
