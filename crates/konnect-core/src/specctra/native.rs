@@ -567,46 +567,60 @@ fn split_by_plane_layer(
     })
 }
 
-/// Whether a pour of `net` on a solid plane layer (inner, not `mixed`) lies
-/// under every via and every through-hole pad of the net.
+/// Whether the filled copper of `net` on a solid plane layer (inner, not
+/// `mixed`) reaches every via and every through-hole pad of the net.
 ///
 /// A net leaves the routing job only because its plane joins all its
 /// fan-out vias. A partial pour (a +5V island on a layer that is mostly
 /// ground, beside the net's main pour on a `mixed` layer) joins only the
 /// vias inside it, so such a net must stay in the job. The pour is read by
-/// its outline: clearances and thermal gaps inside it are not considered,
-/// which errs towards leaving a net to its plane only when the outline says
-/// the plane is there.
+/// its `filled_polygon`s, so clearances, voids and islands count; a pour
+/// with no fill in the file keeps the net in the job (refill, then export).
 fn solid_plane_reaches_every_drop(board: &SexpNode, net: &str, mixed: &BTreeSet<String>) -> bool {
-    let zones = konnect_sexp::board::zones(board).items;
-    let solid = zones
-        .iter()
-        .filter(|zone| zone.net.as_deref() == Some(net))
-        .filter(|zone| {
-            zone.layers
-                .iter()
-                .any(|layer| layer.starts_with("In") && layer.ends_with(".Cu") && !mixed.contains(layer))
-        })
-        .collect::<Vec<_>>();
-    let under_plane = |point: (f64, f64)| {
-        solid
+    let solid_layer = |layer: &str| layer.starts_with("In") && layer.ends_with(".Cu") && !mixed.contains(layer);
+    let mut zone_nodes: Vec<&SexpNode> = board.find_all("zone");
+    for footprint in konnect_sexp::board::footprints(board) {
+        zone_nodes.extend(footprint.find_all("zone"));
+    }
+    let mut fills: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut unfilled = false;
+    for zone in zone_nodes {
+        if zone.find("net").and_then(konnect_sexp::net::net_name) != Some(net) {
+            continue;
+        }
+        let layers: Vec<&str> = ["layers", "layer"]
             .iter()
-            .any(|zone| crate::tools::fanout::point_in_polygon(point, &zone.points))
-    };
+            .filter_map(|tag| zone.find(tag))
+            .flat_map(|n| n.children().unwrap_or_default().iter().skip(1).filter_map(SexpNode::as_str))
+            .collect();
+        if !layers.iter().any(|l| solid_layer(l)) {
+            continue;
+        }
+        let mut found = false;
+        for fill in zone.find_all("filled_polygon") {
+            if fill.find_str("layer").is_some_and(solid_layer) {
+                let points: Vec<(f64, f64)> = fill
+                    .find("pts")
+                    .map(|pts| pts.find_all("xy").iter().filter_map(|xy| Some((xy.get_f64(1)?, xy.get_f64(2)?))).collect())
+                    .unwrap_or_default();
+                if points.len() >= 3 {
+                    fills.push(points);
+                    found = true;
+                }
+            }
+        }
+        unfilled |= !found;
+    }
+    if unfilled || fills.is_empty() {
+        return false;
+    }
+    // The fill reaches a drop of radius `r` at `p` (KiCad joins a via whose
+    // copper the fill touches; vias are solid-connected).
+    let reaches = |p: (f64, f64), r: f64| fills.iter().any(|f| crate::tools::fanout::polygon_distance(&[p, p, p], f) <= r + 1e-6);
     let vias = konnect_sexp::board::vias(board).items;
     let pads = crate::tools::fanout::copper_pads(board);
-    vias.iter()
-        .filter(|via| via.net.as_deref() == Some(net))
-        .all(|via| under_plane((via.x, via.y)))
-        && pads
-            .iter()
-            .filter(|pad| !pad.smd && pad.net.as_deref() == Some(net))
-            .all(|pad| {
-                under_plane((
-                    pad.corners.iter().map(|c| c.0).sum::<f64>() / 4.0,
-                    pad.corners.iter().map(|c| c.1).sum::<f64>() / 4.0,
-                ))
-            })
+    vias.iter().filter(|via| via.net.as_deref() == Some(net)).all(|via| reaches((via.x, via.y), via.size / 2.0))
+        && pads.iter().filter(|pad| !pad.smd && pad.net.as_deref() == Some(net)).all(|pad| fills.iter().any(|f| crate::tools::fanout::polygon_distance(&pad.outline, f) <= 0.01))
 }
 
 /// Remove nets from a DSN: their `(net …)` in the network, their names in
@@ -1216,8 +1230,10 @@ mod round_trip_tests {
             .unwrap()
         };
         let mixed = BTreeSet::from(["In2.Cu".to_string()]);
-        let island = "(zone (net \"+5V\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10))))";
-        let main = "(zone (net \"+5V\") (layers \"In2.Cu\") (polygon (pts (xy 0 0) (xy 40 0) (xy 40 40) (xy 0 40))))";
+        let island = "(zone (net \"+5V\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10)))
+            (filled_polygon (layer \"In1.Cu\") (pts (xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10))))";
+        let main = "(zone (net \"+5V\") (layers \"In2.Cu\") (polygon (pts (xy 0 0) (xy 40 0) (xy 40 40) (xy 0 40)))
+            (filled_polygon (layer \"In2.Cu\") (pts (xy 0 0) (xy 40 0) (xy 40 40) (xy 0 40))))";
         // The In1 island covers one of the two vias; the pour that covers
         // both is on the mixed layer, which routes may cut.
         assert!(!super::solid_plane_reaches_every_drop(&synthetic(&format!("{island} {main}"), ""), "+5V", &mixed));
@@ -1230,6 +1246,14 @@ mod round_trip_tests {
         assert!(!super::solid_plane_reaches_every_drop(&synthetic(&solid, pad), "+5V", &mixed));
         // Other nets' vias do not matter, and a net without any solid pour is not reached.
         assert!(!super::solid_plane_reaches_every_drop(&synthetic(main, ""), "+5V", &mixed));
+        // Review L1: the fill, not the outline, decides. An unfilled pour
+        // keeps the net in the job, and so does a fill that misses a via
+        // (a void around (30, 5)) although the outline covers it.
+        let unfilled = "(zone (net \"+5V\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 40 0) (xy 40 40) (xy 0 40))))";
+        assert!(!super::solid_plane_reaches_every_drop(&synthetic(unfilled, ""), "+5V", &mixed));
+        let void = "(zone (net \"+5V\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 40 0) (xy 40 40) (xy 0 40)))
+            (filled_polygon (layer \"In1.Cu\") (pts (xy 0 0) (xy 20 0) (xy 20 40) (xy 0 40))))";
+        assert!(!super::solid_plane_reaches_every_drop(&synthetic(void, ""), "+5V", &mixed));
         // End to end on the real fixture: +3V3's In2 pour shrunk to a corner
         // no longer takes the fully fanned net out of the job.
         let (_dir, path) = board();
@@ -1245,8 +1269,8 @@ mod round_trip_tests {
         assert!(root.find("network").unwrap().find_all("net").iter().any(|net| net.get(1).and_then(SexpNode::as_str) == Some("+3V3")));
     }
 
-    /// The fixture with the outline of every `+3V3` zone replaced by a 1 mm
-    /// triangle far from the board.
+    /// The fixture with the outline and fill of every `+3V3` zone replaced
+    /// by a 1 mm triangle far from the board.
     fn with_3v3_pour_shrunk(board: &str) -> String {
         let mut out = String::with_capacity(board.len());
         let mut rest = board;
@@ -1260,7 +1284,15 @@ mod round_trip_tests {
                     let polygon_end = at + balanced_len(&form[at..]).unwrap();
                     out.push_str(&form[..at]);
                     out.push_str("(polygon (pts (xy 900 900) (xy 901 900) (xy 901 901)))");
-                    out.push_str(&form[polygon_end..]);
+                    // The fill shrinks with it: a refill would leave only the corner.
+                    let mut tail = &form[polygon_end..];
+                    while let Some(f) = tail.find("(filled_polygon") {
+                        let fe = f + balanced_len(&tail[f..]).unwrap();
+                        out.push_str(&tail[..f]);
+                        out.push_str("(filled_polygon (layer \"In2.Cu\") (pts (xy 900 900) (xy 901 900) (xy 901 901)))");
+                        tail = &tail[fe..];
+                    }
+                    out.push_str(tail);
                     changed += 1;
                 }
                 _ => out.push_str(form),

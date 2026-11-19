@@ -768,10 +768,11 @@ Code: `design_intent.rs`, plus doc updates. Pass 17 is on another branch, so the
     - The PGND node needs `min_vias` (default 2, Konnect judgement) plane vias within the plane-stub limit of the PGND pins or the regulator's PGND pads (thermal pad).
     - Source: TI LMR33630 §10.1 [`ti-lmr33630-layout`]: "the most critical PCB feature is the loop formed by the input capacitor … and power ground"; caps "as close as possible to the VIN and GND terminals"; "an array of heat-sinking vias" to the thermal pad.
   - **`crystal_local_ground`** `{crystal, load_caps, vss_pin, max_path_mm?}`:
-    - The load caps' and the crystal's pads on the VSS net must join `vss_pin` within the crystal trace budget (about 5.5 mm). Vias are reported, not failed.
+    - The load caps' and the crystal's pads on the VSS net must join `vss_pin` within the crystal tie's `max_path_mm` (6 mm since Pass 19). Vias are reported, not failed.
     - Source: ST AN2867, cited by title and flagged as not retrieved (st.com unreachable). It is opt-in, because guidance is mixed (guard ring versus plane).
   - **`split_ground`** `{analog_net, digital_net, tie: "REF.PAD|REF.PAD" | REF, converter?, max_tie_mm?, allowed_bridges?}`:
-    - There must be exactly one DC tie between the nets. Counted as ties: net-tie footprints (`net_tie_pad_groups` or a NetTie library name), and parts with an R, FB, L, JP or NT reference with pads on both nets, besides the named tie and converter. Capacitors and other parts on both nets are listed in `other_parts_on_both_nets`, not counted.
+    - There must be exactly one tie between the nets. Every part with pads on both nets counts as a tie (net ties, 0 Ω, beads, solder bridges, jumpers, connectors), besides the named tie and converter. Capacitors and parts listed in `allowed_bridges` are not counted; they are listed in `other_parts_on_both_nets`.
+    - A tie given as a part needs `converter`, and is refused without one.
     - A tie part must be within `max_tie_mm` (default 5 mm, Konnect judgement) of `converter`. Without `converter` the position is `unverified`.
     - `analog_net` pads are plane-checked against that net's own zones.
     - Sources: Johnson [`johnson-edn-adc-grounding`]: one connection "underneath the ADC, and nowhere else". The note also cites ADI MT-031 by title (not retrieved: analog.com returns 502) for its current preference for one solid plane with partitioned placement.
@@ -870,6 +871,18 @@ Code: `design_intent.rs`, plus doc updates. Pass 17 is on another branch, so the
   - `zone_copper` expands `*.Cu` and `F&B.Cu` but no other wildcards.
   - Nothing has been checked against a live KiCad session or against KiCad's own connectivity; the board results above have not been verified by hand, apart from C9/C10 and C49.
 
+- **Final-review fixes:**
+  - **M1:** a tie's plane leg (`plane_leg`) now reads the zone's filled copper (`zone_copper`), as `plane_connection` does. A zone with no fill in the file falls back to its outline; the leg is then a lower bound and the tie is `unverified` ("has no fill in the file").
+  - **M2:** a crystal (pF budget) leg with track that has no reference plane is never a pass. It fails above the length guide, and is `unverified` below it, as the inductive branch already was.
+  - **M3:** a through-hole pad used as the way down is owned like a via. Two capacitors reaching the plane through one connector pin are judged as sharing (capacitor–capacitor fails). The pad's own part may always use it.
+  - **M4:** a capacitor sharing with a connector pin (J, CN, P, X) fails (UG483's one via per land). With a part Konnect cannot classify, the result is `unverified` (`shared_via`, or `shared_pad` for a chained path). Sharing between non-capacitors still passes with a warning.
+  - **L1:** the Specctra partial-pour guard (`solid_plane_reaches_every_drop`) reads `filled_polygon`s. An unfilled pour, or a fill that misses a via or through-hole pad, keeps the net in the routing job.
+  - **L2:** `via_shared_with` is listed on every pad using a way down, the first owner included.
+  - **L4:** with no plane nets, `plane_connection` in the response says so ("no plane nets found").
+  - **L5:** a `split_ground` whose tie is a part needs `converter`; it is refused on load without one.
+  - **L6:** docs corrected (crystal 6 mm, split-ground tie list, pad shapes).
+  - Tests: `a_crystal_leg_without_a_reference_plane_is_not_a_pass`, the unfilled-outline case in `a_leg_through_the_plane_is_measured_stub_via_plane_via_stub`, `a_through_hole_pad_is_owned_like_a_via` (covers L2 too), `a_capacitor_sharing_with_an_unclassified_part_is_unverified_and_with_a_connector_fails`, `a_split_ground_tie_part_needs_a_converter_and_an_empty_board_says_so`, and the unfilled and voided cases in `a_partial_pour_on_a_solid_plane_does_not_take_the_net_out_of_the_job`.
+
 ## Pass 19: Tier 1 review fixes (second independent review)
 
 Code: `design_intent.rs`, `eecalc.rs`, `specctra/native.rs`, `pcb_export.rs`. Built on Pass 18's branch (its `net_graph` joins and `NetGraph::pos` are used, not replaced). New sources in the document database: `johnson-sigcon-via-inductance`, `johnson-sigcon-via-inductance-2` (Howard Johnson's two "Via Inductance" newsletters; the formulas on those pages are images and are transcribed, with the check against his table, at the top of the stored text).
@@ -911,7 +924,7 @@ Pass 18 had already made the graph join copper that overlaps without sharing coo
 
 - **Found:** the rule that joined a dangling track end to its *nearest* overlapping node failed when the end's last piece was shorter than the gap to the other track: the nearest node was then the end's own neighbour, and the two tracks stayed apart. A track corner (not an end) touching another track was not joined at all.
 - **Change:** every track node is joined to every track node of its layer whose copper overlaps it ((w1 + w2) / 2 apart or less) and that it has no edge to, by a `Track` edge as long as their distance (a grid keeps this near-linear). Because the join has its real length, joining the close nodes of one finely segmented track cannot shorten a path below the straight line through copper that is there. Via-annulus and pad joins stay Pass 18's zero-length `Pad` edges.
-- Not changed: pads are rectangles (their rotated bounding box), so a track clipping the corner of a round or oval pad's box counts as on the pad.
+- Pads: in Pass 19 they were still rectangles; Pass 18's review fixes (merged after it) join copper by the real circle, oval or roundrect outline.
 - The overlap rule is copper overlap, a little wider than KiCad's "end inside the other item".
 
 ### Specctra export
@@ -957,6 +970,6 @@ Pass 18 had already made the graph join copper that overlaps without sharing coo
 - The inductance model is an estimate from closed-form terms. It was checked against the published numbers it comes from, not against a field solver or a measurement of these boards.
 - A leg whose pad is a through-hole pad sitting in the plane, or that is carried by an outer-layer pour, is not measured (`unverified`).
 - The plane leg reads zones by outline: clearances, thermal reliefs and cuts inside the outline are not seen.
-- Pads are treated as rectangles in the graph.
+- Pads in the graph: superseded by Pass 18's real pad outlines (merged after this pass).
 - Kept plane nets are not routed at a power width, and pour pieces are counted, not traced for which pads each piece serves.
 

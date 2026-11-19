@@ -2456,7 +2456,7 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
   ```json
   {"kind": "crystal_local_ground", "crystal": "Y1", "load_caps": ["C3", "C4"], "vss_pin": "U1.47", "source": "ST AN2867 §5"}
   ```
-  The load caps' and the crystal's pads on the VSS net must join `vss_pin` within `max_path_mm` (default: the crystal trace budget, about 5.5 mm). Vias are allowed but reported.
+  The load caps' and the crystal's pads on the VSS net must join `vss_pin` within `max_path_mm` (default: the crystal tie's 6 mm). Vias are allowed but reported.
 
   ```json
   {"kind": "split_ground", "analog_net": "AGND", "digital_net": "GND", "tie": "U5.4|U5.9", "source": "ADS1115 datasheet §10"}
@@ -2487,6 +2487,16 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
   - a track crossing a pad without ending in it.
 
   As a result, `tie_path` and `voltage_drop` can turn "not routed" or `unverified` into a measured result.
+
+- **Final-review changes:**
+  - A tie's plane leg reads the zone fill. With an unfilled zone the tie is `unverified`.
+  - A crystal leg over track with no reference plane is `unverified`, or fails above the guide.
+  - A through-hole pad is owned like a via.
+  - A capacitor sharing with a connector pin fails; sharing with an unclassified part is `unverified` (new `connection` value `shared_pad`).
+  - `via_shared_with` now appears on the owner too.
+  - `plane_connection` in the response is `{"note": "no plane nets found …"}` when no plane net exists.
+  - A `split_ground` tie given as a part needs `converter` (refused on load without one).
+  - The Specctra export leaves a net to its plane only when the zone's fill reaches every via and through-hole pad. An unfilled zone keeps the net in the job.
 
 ## Unreleased (fork): Tier 1 review fixes (tie legs and budgets, validation on load, plane pieces)
 
