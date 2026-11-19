@@ -1376,7 +1376,7 @@ pub(crate) fn tie_limits(tie: &Tie, layers: &LayerStack, planes: &BTreeSet<Strin
             };
             sources.insert(
                 "budget_pf".to_string(),
-                format!("crystal: {CRYSTAL_TRACE_PF} pF of routed track per node, compared with Σ C′·len of the routed path ({equivalent}); Microchip AVR186 typical parasitics (XTALIN 1 pF) less the pads [docdb microchip-avr186-oscillator-layout]"),
+                format!("crystal: {CRYSTAL_TRACE_PF} pF of routed track per node, compared with Σ C′·len of every track of the net, the whole node, + 0.4 pF per via ({equivalent}); Microchip AVR186 typical parasitics (XTALIN 1 pF) less the pads [docdb microchip-avr186-oscillator-layout]"),
             );
             (
                 Some((CRYSTAL_PATH_MM, format!("crystal: {CRYSTAL_PATH_MM} mm length guide per node (Konnect judgement, WORKFLOW.md §5 item 6); ST AN5711 §3.1, TI AM67 §8.3.1, LAN8742 routing checklist say only: as short as possible, outer layer"))),
@@ -1498,14 +1498,16 @@ fn board_copper(tree: &SexpNode) -> BTreeMap<String, NetCopper> {
             entry(&mut nets, net).segments.push(((t.x1, t.y1), (t.x2, t.y2), t.width, t.layer.clone()));
         }
     }
+    let table = konnect_sexp::board::net_table(tree);
     for arc in tree.find_all("arc") {
         let point = |tag: &str| arc.find(tag).and_then(|n| Some((n.get_f64(1)?, n.get_f64(2)?)));
         let (Some(s), Some(m), Some(e)) = (point("start"), point("mid"), point("end")) else { continue };
-        let Some(net) = arc.find("net").and_then(konnect_sexp::net::net_name).filter(|n| !n.is_empty()) else { continue };
+        // `(net "GND")` (KiCad 10) or `(net 3)` through the table (KiCad ≤ 9).
+        let Some(net) = table.item_net(arc) else { continue };
         let width = arc.find_f64("width").unwrap_or(0.2);
         let layer = arc.find_str("layer").unwrap_or("").to_string();
         let points = sample_arc(s, m, e, 16);
-        let target = entry(&mut nets, net);
+        let target = entry(&mut nets, &net);
         for w in points.windows(2) {
             target.segments.push((w[0], w[1], width, layer.clone()));
         }
@@ -1524,9 +1526,9 @@ fn board_copper(tree: &SexpNode) -> BTreeMap<String, NetCopper> {
 /// islands by the zone's own setting; every piece left counts.
 fn pour_pieces(tree: &SexpNode, net: &str) -> BTreeMap<String, usize> {
     let mut pieces = BTreeMap::new();
+    let table = konnect_sexp::board::net_table(tree);
     for zone in tree.find_all("zone") {
-        let name = zone.find_str("net_name").or_else(|| zone.find("net").and_then(konnect_sexp::net::net_name));
-        if name != Some(net) {
+        if table.item_net(zone).as_deref() != Some(net) {
             continue;
         }
         for fill in zone.find_all("filled_polygon") {
@@ -1809,7 +1811,20 @@ fn net_graph(net: &str, copper: &NetCopper, pads: &[CopperPad], vias: &[konnect_
             }
         }
     }
-    // Pads join every node on their layers that lies on them.
+    // How far each node's copper reaches around it: half the widest track
+    // through it, or a via's radius at its centre.
+    let mut reach: Vec<f64> = (0..ids.len()).map(|n| node_width.get(n).map_or(0.0, |w| w / 2.0)).collect();
+    for (v, layers_of) in net_vias.iter().zip(&via_spans) {
+        for l in layers_of {
+            if let Some(&n) = ids.get(&(l.clone(), snap((v.x, v.y)))) {
+                reach[n] = reach[n].max(v.size / 2.0);
+            }
+        }
+    }
+    // Pads join every node on their layers whose copper touches them: a
+    // track end or via centre on the pad, and a via annulus or track end
+    // overlapping its edge (UG483 p.30: the via butted against the land
+    // [docdb xilinx-ug483-7series-pcb]; KiCad connects overlapping copper).
     let endpoint_list: Vec<(NodeKey, usize)> = ids.iter().map(|(k, v)| (k.clone(), *v)).collect();
     let mut pad_nodes: Vec<(String, usize)> = Vec::new();
     let mut pad_centres: Vec<(f64, f64)> = Vec::new();
@@ -1822,7 +1837,7 @@ fn net_graph(net: &str, copper: &NetCopper, pads: &[CopperPad], vias: &[konnect_
                 continue;
             }
             let p = (key.0 as f64 / 100.0, key.1 as f64 / 100.0);
-            if polygon_distance(&[p, p, p], &pad.outline) <= 0.02 {
+            if polygon_distance(&[p, p, p], &pad.outline) <= reach[*endpoint].max(0.02) + 1e-6 {
                 edges.push((pad_node, *endpoint, EdgeKind::Pad));
             }
         }
@@ -2024,6 +2039,20 @@ struct TiePath {
     est_inductance_nh: f64,
     /// Σ C′·len over the modelled tracks plus [`VIA_PF`] per via.
     est_capacitance_pf: f64,
+    /// A pF budget (crystal): the whole node, Σ C′·len over every track of
+    /// the net plus [`VIA_PF`] per via of the net, path or not (AVR186's
+    /// "XTALIN to ground 1pF" is the node's parasitic capacitance
+    /// [docdb microchip-avr186-oscillator-layout]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    net_capacitance_pf: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    net_track_mm: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    net_vias: Option<u32>,
+    /// Track of the net on layers without a line model, left out of
+    /// `net_capacitance_pf`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    net_unmodelled_mm: Option<f64>,
     /// Track length on layers without a line model (no reference plane),
     /// left out of both estimates.
     unmodelled_mm: f64,
@@ -2058,6 +2087,10 @@ impl TiePath {
             plane_inductance_nh: None,
             est_inductance_nh: 0.0,
             est_capacitance_pf: r3(walk.track_pf + VIA_PF * vias.len() as f64),
+            net_capacitance_pf: None,
+            net_track_mm: None,
+            net_vias: None,
+            net_unmodelled_mm: None,
             unmodelled_mm: r3(walk.unmodelled_mm),
             barrels: walk.barrels,
             plane_layer: None,
@@ -2179,8 +2212,24 @@ fn plane_leg(
         let pad = starts.iter().find(|s| s.1 == at).map(|s| s.0.clone()).unwrap_or_default();
         Some((pad, walk, *node, layer.to_string()))
     };
-    let (from_pad, near, drop_a, plane_layer) = stub(from, None)?;
-    let (to_pad, far, drop_b, _) = stub(to, Some(&plane_layer))?;
+    // Each plane layer the drops reach, nearest stub from both ends on that
+    // layer; the lowest-inductance leg wins (the near side's nearest drop
+    // may be on a layer the far side does not reach, or reaches further).
+    let mut plane_layers: Vec<&str> = drops.iter().map(|d| d.2).collect();
+    plane_layers.sort_unstable();
+    plane_layers.dedup();
+    plane_layers
+        .into_iter()
+        .filter_map(|layer| {
+            let (from_pad, near, drop_a, plane_layer) = stub(from, Some(layer))?;
+            let (to_pad, far, drop_b, _) = stub(to, Some(layer))?;
+            Some(plane_leg_on(graph, net, zone, (from_pad, near, drop_a), (to_pad, far, drop_b), plane_layer))
+        })
+        .min_by(|x, y| x.est_inductance_nh.total_cmp(&y.est_inductance_nh).then(x.path_mm.total_cmp(&y.path_mm)))
+}
+
+/// A plane leg from its two stubs (pad, walk, drop node) on `plane_layer`.
+fn plane_leg_on(graph: &NetGraph, net: &str, zone: &ZoneLayers, (from_pad, near, drop_a): (String, Walk, usize), (to_pad, far, drop_b): (String, Walk, usize), plane_layer: String) -> TiePath {
     let (a, b) = (graph.pos[drop_a], graph.pos[drop_b]);
     let mut walk = near;
     walk.path_mm += far.path_mm;
@@ -2204,7 +2253,7 @@ fn plane_leg(
     leg.plane_unfilled = !zone.has_fill(&plane_layer);
     leg.plane_span_mm = Some(r3((a.0 - b.0).hypot(a.1 - b.1)));
     leg.plane_layer = Some(plane_layer);
-    Some(leg)
+    leg
 }
 
 /// Dielectric between two copper layers of the stack, mm.
@@ -2305,12 +2354,18 @@ fn tie_path_check(
         let plane = if inductive { plane_leg(graph, net, &from, &to, fills.get(*net), layers, planes) } else { None };
         // Copper that could carry the leg without being measured: any zone
         // for a tie measured over tracks only; for a loop, a pour on an outer
-        // layer, or an inner pour a through-hole pad sits in directly (an
-        // inner pour is otherwise reached only through vias, which
-        // `plane_leg` follows).
+        // layer, an inner pour a through-hole pad sits in directly, or an
+        // inner pour that a via of the net drops into although `plane_leg`
+        // found no way through it from both ends (surface pads joined to it
+        // in a way the track graph misses). A zone could only shorten the
+        // leg, so a failure over it is not proven. An inner pour no via or
+        // through-hole pad of the net reaches carries nothing.
         let outer_pour = zones.iter().any(|z| z.net.as_deref() == Some(*net) && z.layers.iter().any(|l| layers.is_outer(l)));
         let through_hole = from.iter().chain(&to).any(|p| !p.smd);
-        if c.has_zone && plane.is_none() && (!inductive || outer_pour || through_hole) {
+        let inner_drop = fills.get(*net).is_some_and(|z| {
+            vias.iter().filter(|v| v.net.as_deref() == Some(*net)).any(|v| via_lands_on(z, v, layers).iter().any(|(l, _)| !layers.is_outer(l)))
+        });
+        if c.has_zone && plane.is_none() && (!inductive || outer_pour || through_hole || inner_drop) {
             unmeasured_zone.push(net.to_string());
         }
         let leg = match (tracks, plane) {
@@ -2356,6 +2411,10 @@ fn tie_path_check(
     }
 
     let mut over: Vec<String> = Vec::new();
+    // Some excess stands whatever the unmeasured zones do: a zone can only
+    // shorten the leg of its own net.
+    let mut proven = false;
+    let zone_leg = |net: &str| unmeasured_zone.iter().any(|n| n == net);
     let mut open: Vec<String> = Vec::new();
     let mut measured = json!({});
     if inductive {
@@ -2364,17 +2423,25 @@ fn tie_path_check(
         let total: f64 = legs.iter().map(|l| l.est_inductance_nh).sum();
         if total > budget {
             over.push(format!("loop inductance {} nH > {budget} nH", r3(total)));
+            // The legs a zone could shorten taken out, the rest still exceeds.
+            let fixed: f64 = legs.iter().filter(|l| !zone_leg(&l.net)).map(|l| l.est_inductance_nh).sum();
+            proven |= fixed > budget;
         }
         for leg in &legs {
             if let Some(max) = limits.max_path_mm.filter(|m| leg.path_mm > *m) {
                 over.push(format!("{}: path {} mm > {max} mm", leg.net, leg.path_mm));
+                proven |= !zone_leg(&leg.net);
             }
             if let Some(max) = limits.max_vias.filter(|m| leg.carried_by == "tracks" && leg.vias > *m) {
                 over.push(format!("{}: {} vias > {max}", leg.net, leg.vias));
+                proven |= !zone_leg(&leg.net);
             }
             if leg.unmodelled_mm > 0.0 {
                 match limits.unmodelled_path_mm.filter(|m| leg.path_mm > *m) {
-                    Some(guide) => over.push(format!("{}: {} mm of track has no reference plane and the path {} mm exceeds the {guide} mm guide", leg.net, leg.unmodelled_mm, leg.path_mm)),
+                    Some(guide) => {
+                        over.push(format!("{}: {} mm of track has no reference plane and the path {} mm exceeds the {guide} mm guide", leg.net, leg.unmodelled_mm, leg.path_mm));
+                        proven |= !zone_leg(&leg.net);
+                    }
                     None => open.push(format!("{}: {} mm of track has no reference plane, so its inductance is not in the estimate", leg.net, leg.unmodelled_mm)),
                 }
             } else if leg.lower_bound_only() {
@@ -2390,24 +2457,43 @@ fn tie_path_check(
         measured["loop_inductance_nh"] = json!(r3(total));
     } else {
         for r in results.iter_mut() {
-            let Some(leg) = r.leg.as_ref() else {
+            let Some(leg) = r.leg.as_mut() else {
                 if r.status == "unverified" {
                     open.push(format!("{}: {}", r.net, r.detail));
                 }
                 continue;
             };
             let mut leg_over = Vec::new();
-            if let Some(max) = limits.budget_pf().filter(|m| leg.est_capacitance_pf > *m) {
-                leg_over.push(format!("{} pF > {max} pF", leg.est_capacitance_pf));
-            }
-            // Track with no reference plane is left out of C, so a pF budget
-            // cannot pass on it: fail above the length guide, else unverified.
-            if limits.budget_pf().is_some() && leg.unmodelled_mm > 0.0 {
-                match limits.unmodelled_path_mm.filter(|m| leg.path_mm > *m) {
-                    Some(guide) => leg_over.push(format!("{} mm of track has no reference plane and the path {} mm exceeds the {guide} mm guide", leg.unmodelled_mm, leg.path_mm)),
-                    None => open.push(format!("{}: {} mm of track has no reference plane, so its capacitance is not in the estimate", r.net, leg.unmodelled_mm)),
+            if let Some(max) = limits.budget_pf() {
+                // The whole node: every track and via of the net, not only
+                // the path (a stub left beside a short path loads the pin too).
+                let c = copper.get(r.net.as_str()).unwrap_or(&empty);
+                let mut lc = LcSum::new(layers, planes);
+                for (a, b, w, layer) in &c.segments {
+                    lc.add(layer, *w, (b.0 - a.0).hypot(b.1 - a.1));
+                }
+                let net_vias = vias.iter().filter(|v| v.net.as_deref() == Some(r.net.as_str())).count() as u32;
+                let pf = r3(lc.c_pf + VIA_PF * net_vias as f64);
+                leg.net_capacitance_pf = Some(pf);
+                leg.net_track_mm = Some(r3(length(&c.segments)));
+                leg.net_vias = Some(net_vias);
+                leg.net_unmodelled_mm = Some(r3(lc.unmodelled_mm));
+                if pf > max {
+                    // More copper (a zone) only adds to the node's capacitance.
+                    proven = true;
+                    leg_over.push(format!("{pf} pF > {max} pF on the whole node ({} mm of track, {net_vias} vias)", r3(length(&c.segments))));
+                }
+                // Track with no reference plane is left out of C, so a pF
+                // budget cannot pass on it: fail above the length guide, else
+                // unverified.
+                if lc.unmodelled_mm > 0.0 {
+                    match limits.unmodelled_path_mm.filter(|m| leg.path_mm > *m) {
+                        Some(guide) => leg_over.push(format!("{} mm of track has no reference plane and the path {} mm exceeds the {guide} mm guide", r3(lc.unmodelled_mm), leg.path_mm)),
+                        None => open.push(format!("{}: {} mm of track has no reference plane, so its capacitance is not in the estimate", r.net, r3(lc.unmodelled_mm))),
+                    }
                 }
             }
+            let leg = &*leg;
             if let Some(max) = limits.max_path_mm.filter(|m| leg.path_mm > *m) {
                 leg_over.push(format!("path {} mm > {max} mm", leg.path_mm));
             }
@@ -2415,6 +2501,7 @@ fn tie_path_check(
                 leg_over.push(format!("{} vias > {max}", leg.vias));
             }
             if !leg_over.is_empty() {
+                proven |= !zone_leg(&r.net);
                 r.status = "fail";
                 r.detail = leg_over.join(", ");
                 over.push(format!("{}: {}", r.net, r.detail));
@@ -2437,7 +2524,7 @@ fn tie_path_check(
     // A zone could only shorten a leg, so a pass stands; a failure over a
     // net whose zone was not measured is not proven.
     let status = if !over.is_empty() {
-        if unmeasured_zone.is_empty() { "fail" } else { "unverified" }
+        if proven { "fail" } else { "unverified" }
     } else if !open.is_empty() {
         "unverified"
     } else {
@@ -2451,7 +2538,7 @@ fn tie_path_check(
     measured["legs"] = Value::Array(results.iter().map(LegResult::to_json).collect());
     let mut detail = match (inductive, status) {
         (true, _) => "loop = every net of the part to the target; each leg is the lower-inductance of its routed tracks and its path through the net's plane; L = Σ L′·len of the tracks at their own width and layer + via barrels (Johnson: (μ/2π)·h·ln(s/r), return at the nearest via of another leg, at most 2e·h) + the plane between the vias".to_string(),
-        (false, _) => "every shared net is a leg and each must meet the limits; C = Σ C′·len of the tracks at their own width and layer + 0.4 pF per via".to_string(),
+        (false, _) => "every shared net is a leg and each must meet the limits; a pF budget is for the whole node: C = Σ C′·len of every track of the net at its own width and layer + 0.4 pF per via of the net (est_capacitance_pf is the path's share)".to_string(),
     };
     if !over.is_empty() {
         detail.push_str(&format!("; exceeds the limit: {}", over.join("; ")));
@@ -2582,6 +2669,56 @@ impl ZoneLayers {
     fn touching_pad(&self, layer: &str, corners: &[Pt]) -> Vec<usize> {
         self.copper(layer).iter().enumerate().filter(|(_, poly)| polygon_distance(corners, poly) <= 0.01).map(|(i, _)| i).collect()
     }
+
+    /// Index (into [`Self::copper`]) of the largest polygon on `layer`: the
+    /// main piece of a filled pour.
+    fn main_piece(&self, layer: &str) -> Option<usize> {
+        self.copper(layer).iter().enumerate().max_by(|a, b| polygon_area(a.1).total_cmp(&polygon_area(b.1))).map(|(i, _)| i)
+    }
+
+    /// How copper that `touches` a polygon lands on `layer`'s pour: `None`
+    /// when it misses.
+    fn landing(&self, layer: &str, touches: impl Fn(&[Pt]) -> bool) -> Option<Landing> {
+        let touched: Vec<usize> = self.copper(layer).iter().enumerate().filter(|(_, p)| touches(p)).map(|(i, _)| i).collect();
+        if touched.is_empty() {
+            None
+        } else if !self.has_fill(layer) {
+            Some(Landing::Unfilled)
+        } else if self.main_piece(layer).is_some_and(|m| touched.contains(&m)) {
+            Some(Landing::Main)
+        } else {
+            Some(Landing::Island)
+        }
+    }
+}
+
+/// Where a via or through-hole pad lands on a plane layer's pour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Landing {
+    /// On the largest filled piece: the plane.
+    Main,
+    /// Only on a smaller filled piece (an island, or a part of a cut plane):
+    /// whether it joins the plane is not known here.
+    Island,
+    /// On a zone without a fill in the file (outline used): nothing is
+    /// joined until the zone is filled.
+    Unfilled,
+}
+
+impl Landing {
+    /// Why a way down landing like this is not proven, `None` for the plane.
+    fn doubt(self, layer: &str) -> Option<String> {
+        match self {
+            Landing::Main => None,
+            Landing::Island => Some(format!("it lands only on a smaller piece of the pour on {layer}, not its main piece: check that piece joins the plane")),
+            Landing::Unfilled => Some(format!("the zone on {layer} has no fill in the file (outline used): refill zones and check again")),
+        }
+    }
+}
+
+/// The best landing among `lands` (layer, landing), with its layer.
+fn best_landing(lands: &[(String, Landing)]) -> Option<&(String, Landing)> {
+    lands.iter().min_by_key(|l| l.1)
 }
 
 /// Every net's zone copper, per copper layer (footprint zones included;
@@ -2602,8 +2739,10 @@ fn zone_copper(tree: &SexpNode, copper_names: &[String]) -> BTreeMap<String, Zon
         nodes.extend(fp.find_all("zone"));
     }
     let mut out: BTreeMap<String, ZoneLayers> = BTreeMap::new();
+    let table = konnect_sexp::board::net_table(tree);
     for zone in nodes {
-        let Some(net) = zone.find("net").and_then(konnect_sexp::net::net_name).filter(|n| !n.is_empty()) else { continue };
+        // KiCad 10 `(net "GND")`, or KiCad ≤ 9 `(net 3) (net_name "GND")`.
+        let Some(net) = table.item_net(zone) else { continue };
         let mut layers = Vec::new();
         for tag in ["layers", "layer"] {
             if let Some(node) = zone.find(tag) {
@@ -2683,7 +2822,7 @@ fn length_inside_circle(a: Pt, b: Pt, centre: Pt, r: f64) -> f64 {
 }
 
 /// What a plane-net pad reaches its plane through.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 enum PlaneTarget {
     /// The net's `k`-th via.
     Via(usize),
@@ -2886,19 +3025,33 @@ fn plane_connection_checks(
         let graph = net_graph(net, copper.get(net).unwrap_or(&empty), pads, vias, layers);
         let net_vias: Vec<&konnect_sexp::board::Via> = vias.iter().filter(|v| v.net.as_deref() == Some(net.as_str())).collect();
         // The plane layers each via and through-hole pad lands on.
-        let on_plane = |ls: Vec<&String>| -> Vec<String> { ls.into_iter().filter(|l| my_planes.contains(l)).cloned().collect() };
-        let via_lands: Vec<Vec<String>> = net_vias.iter().map(|v| on_plane(via_lands_on(z, v, layers))).collect();
-        let pad_lands: Vec<Vec<String>> = net_pads
+        // With how each lands (the main filled piece, an island, or an
+        // unfilled zone): a way down that reaches only an island or an
+        // unfilled zone is not proven, see `doubt`.
+        let landing_on_plane = |ls: Vec<(&String, Landing)>| -> Vec<(String, Landing)> { ls.into_iter().filter(|(l, _)| my_planes.contains(l)).map(|(l, q)| (l.clone(), q)).collect() };
+        let via_landing: Vec<Vec<(String, Landing)>> = net_vias.iter().map(|v| landing_on_plane(via_lands_on(z, v, layers))).collect();
+        let pad_landing: Vec<Vec<(String, Landing)>> = net_pads
             .iter()
             .map(|p| {
                 if p.smd {
                     return Vec::new();
                 }
-                let c = pad_centre(p);
-                let r = p.corners.iter().map(|q| (q.0 - c.0).hypot(q.1 - c.1)).fold(0.0, f64::max);
-                on_plane(z.outlines.keys().filter(|l| z.touches_point(l, c, r)).collect())
+                landing_on_plane(z.outlines.keys().filter_map(|l| z.landing(l, |poly| polygon_distance(&p.outline, poly) <= 0.01).map(|q| (l, q))).collect())
             })
             .collect();
+        let names_of = |ls: &Vec<(String, Landing)>| -> Vec<String> { ls.iter().map(|(l, _)| l.clone()).collect() };
+        let via_lands: Vec<Vec<String>> = via_landing.iter().map(names_of).collect();
+        let pad_lands: Vec<Vec<String>> = pad_landing.iter().map(names_of).collect();
+        // Why a way down off `own` layer is not proven (`None`: it lands on
+        // the main filled piece of a plane layer).
+        let doubt = |t: PlaneTarget, own: &str| -> Option<String> {
+            let lands = match t {
+                PlaneTarget::Via(k) => &via_landing[k],
+                PlaneTarget::Pad(j) => &pad_landing[j],
+            };
+            let off: Vec<(String, Landing)> = lands.iter().filter(|(l, _)| l.as_str() != own).cloned().collect();
+            best_landing(&off).and_then(|(l, q)| q.doubt(l))
+        };
         let lands_off = |lands: &[String], own: &str| lands.iter().any(|l| l.as_str() != own);
         let on_pads = pads_on_nodes(&graph, net_pads.len());
         let pads_of = |r: &str| pads.iter().filter(|p| p.reference == r).count();
@@ -2954,7 +3107,8 @@ fn plane_connection_checks(
                     }
                 });
                 let mut found: Vec<(usize, PlaneTarget)> = targets.iter().filter(|(n, _)| dist[**n].is_finite()).map(|(n, t)| (*n, *t)).collect();
-                found.sort_by(|a, b| dist[a.0].total_cmp(&dist[b.0]));
+                // Ties broken by the target, so equal choices come out the same every run.
+                found.sort_by(|a, b| dist[a.0].total_cmp(&dist[b.0]).then(a.1.cmp(&b.1)));
                 let mut seen: Vec<PlaneTarget> = Vec::new();
                 let mut out = Vec::new();
                 // stub ≤ path weight, so targets far past the limit need no
@@ -3008,41 +3162,83 @@ fn plane_connection_checks(
             paths.insert(i, PadPaths { cands, best, chained });
         }
 
-        // Phase 2: give each pad a via of its own where it can have one
-        // (pads of one part may share). Pads with the fewest choices go first.
+        // Phase 2: give each pad a way down of its own where it can have
+        // one (pads of one part may share): a bipartite matching of pads to
+        // ways down by augmenting paths, so an early choice cannot take the
+        // only via a later pad has (A [V1, V2], B [V2, V3], C [V1, V2] gets
+        // all three their own). Only pads left without one share.
         let mut order: Vec<usize> = paths.keys().copied().filter(|i| !paths[i].cands.is_empty()).collect();
         order.sort_by_key(|i| paths[i].cands.len());
-        // Ownership per way down: a via, or a through-hole pad (owned by its
-        // own part from the start, so that part's pads may always use it).
+        // A part's own through-hole pad is always free for its own pads and
+        // is never owned; any other way down belongs to the first part
+        // matched to it.
+        let own_tht = |t: PlaneTarget, i: usize| matches!(t, PlaneTarget::Pad(j) if net_pads[j].reference == net_pads[i].reference);
+        let mut assign: BTreeMap<usize, usize> = BTreeMap::new(); // pad → index into its cands
         let mut owner: HashMap<PlaneTarget, String> = HashMap::new();
-        let mut users: HashMap<PlaneTarget, Vec<usize>> = HashMap::new();
-        // Per pad: the chosen path and, when no way down of its own was free,
-        // the pads it shares with.
-        let mut chosen: BTreeMap<usize, (PlanePath, Vec<usize>)> = BTreeMap::new();
-        let free_for = |t: PlaneTarget, me: &str, owner: &HashMap<PlaneTarget, String>| match t {
-            PlaneTarget::Pad(j) if net_pads[j].reference == me => true,
-            PlaneTarget::Pad(j) => owner.get(&t).is_none_or(|o| o == me) && net_pads[j].reference != me,
-            PlaneTarget::Via(_) => owner.get(&t).is_none_or(|o| o == me),
-        };
-        for i in order {
-            let me = net_pads[i].reference.clone();
-            let pick = paths[&i].cands.iter().find(|p| free_for(p.target, &me, &owner)).cloned();
-            match pick {
-                Some(p) => {
-                    let own_tht = matches!(p.target, PlaneTarget::Pad(j) if net_pads[j].reference == me);
-                    if !own_tht {
+        #[allow(clippy::too_many_arguments)]
+        fn augment(
+            i: usize,
+            paths: &BTreeMap<usize, PadPaths>,
+            net_pads: &[&CopperPad],
+            own_tht: &dyn Fn(PlaneTarget, usize) -> bool,
+            visited: &mut BTreeSet<PlaneTarget>,
+            assign: &mut BTreeMap<usize, usize>,
+            owner: &mut HashMap<PlaneTarget, String>,
+        ) -> bool {
+            let me = &net_pads[i].reference;
+            let cands = &paths[&i].cands;
+            // A free way down (or one of this part's) first, nearest first.
+            for (c, p) in cands.iter().enumerate() {
+                if own_tht(p.target, i) || owner.get(&p.target).is_none_or(|o| o == me) {
+                    if !own_tht(p.target, i) {
                         owner.insert(p.target, me.clone());
                     }
-                    users.entry(p.target).or_default().push(i);
-                    chosen.insert(i, (p, Vec::new()));
-                }
-                None => {
-                    let p = paths[&i].cands[0].clone();
-                    let others: Vec<usize> = users.get(&p.target).cloned().unwrap_or_default().into_iter().filter(|j| net_pads[*j].reference != me).collect();
-                    users.entry(p.target).or_default().push(i);
-                    chosen.insert(i, (p, others));
+                    assign.insert(i, c);
+                    return true;
                 }
             }
+            // Else move the part holding one elsewhere.
+            for (c, p) in cands.iter().enumerate() {
+                if !visited.insert(p.target) {
+                    continue;
+                }
+                let (saved_assign, saved_owner) = (assign.clone(), owner.clone());
+                let holders: Vec<usize> = assign.iter().filter(|(u, k)| paths[u].cands[**k].target == p.target).map(|(u, _)| *u).collect();
+                for u in &holders {
+                    assign.remove(u);
+                }
+                owner.insert(p.target, me.clone());
+                assign.insert(i, c);
+                if holders.iter().all(|&u| augment(u, paths, net_pads, own_tht, visited, assign, owner)) {
+                    return true;
+                }
+                *assign = saved_assign;
+                *owner = saved_owner;
+            }
+            false
+        }
+        let mut unmatched: Vec<usize> = Vec::new();
+        for &i in &order {
+            let mut visited = BTreeSet::new();
+            if !augment(i, &paths, &net_pads, &own_tht, &mut visited, &mut assign, &mut owner) {
+                unmatched.push(i);
+            }
+        }
+        // Per pad: the chosen path and, when no way down of its own was free,
+        // the pads it shares with.
+        let mut users: HashMap<PlaneTarget, Vec<usize>> = HashMap::new();
+        let mut chosen: BTreeMap<usize, (PlanePath, Vec<usize>)> = BTreeMap::new();
+        for &i in order.iter().filter(|i| assign.contains_key(i)) {
+            let p = paths[&i].cands[assign[&i]].clone();
+            users.entry(p.target).or_default().push(i);
+            chosen.insert(i, (p, Vec::new()));
+        }
+        for i in unmatched {
+            let me = net_pads[i].reference.clone();
+            let p = paths[&i].cands[0].clone();
+            let others: Vec<usize> = users.get(&p.target).cloned().unwrap_or_default().into_iter().filter(|j| net_pads[*j].reference != me).collect();
+            users.entry(p.target).or_default().push(i);
+            chosen.insert(i, (p, others));
         }
 
         // Phase 3: one check per pad.
@@ -3057,11 +3253,13 @@ fn plane_connection_checks(
                 let in_pour = |p: Pt, r: f64| touching.iter().any(|&t| polygon_distance(&[p, p, p], &polys[t]) <= r + 1e-6);
                 let edge = |p: Pt, r: f64| (polygon_distance(&[p, p, p], &pad.outline) - r).max(0.0);
                 let mut nearest: Option<(f64, String, Pt)> = None;
+                let mut nearest_target: Option<PlaneTarget> = None;
                 for (k, v) in net_vias.iter().enumerate() {
                     if lands_off(&via_lands[k], pad.layer) && in_pour((v.x, v.y), v.size / 2.0) {
                         let d = edge((v.x, v.y), v.size / 2.0);
                         if nearest.as_ref().is_none_or(|n| d < n.0) {
                             nearest = Some((d, "via".to_string(), (v.x, v.y)));
+                            nearest_target = Some(PlaneTarget::Via(k));
                         }
                     }
                 }
@@ -3071,10 +3269,29 @@ fn plane_connection_checks(
                         let d = polygon_distance(&p.outline, &pad.outline);
                         if nearest.as_ref().is_none_or(|n| d < n.0) {
                             nearest = Some((d, format!("{}.{}", p.reference, p.number), c));
+                            nearest_target = Some(PlaneTarget::Pad(j));
                         }
                     }
                 }
-                (nearest, z.has_fill(pad.layer))
+                // The pour as the plane (its only plane layer): the pad must
+                // touch the main piece, or a piece a via or through-hole pad
+                // of the net reaches (a way to the rest of the net). Another
+                // part's pad on the same island joins nothing more.
+                let main = z.main_piece(pad.layer);
+                let pad_layer = layers.index(pad.layer);
+                let spans = |v: &konnect_sexp::board::Via| {
+                    let idx: Vec<usize> = v.layers.iter().filter_map(|l| layers.index(l)).collect();
+                    match (idx.iter().min(), idx.iter().max(), pad_layer) {
+                        (Some(lo), Some(hi), Some(i)) => *lo <= i && i <= *hi,
+                        _ => false,
+                    }
+                };
+                let reaches_drop = |t: usize| {
+                    net_vias.iter().any(|v| spans(v) && polygon_distance(&[(v.x, v.y); 3], &polys[t]) <= v.size / 2.0 + 1e-6)
+                        || net_pads.iter().any(|p| !p.smd && polygon_distance(&p.outline, &polys[t]) <= 0.01)
+                };
+                let on_plane_piece = touching.iter().any(|&t| Some(t) == main || reaches_drop(t));
+                (nearest, z.has_fill(pad.layer), nearest_target, on_plane_piece)
             });
             let only_layer = !my_planes.iter().any(|l| l.as_str() != pad.layer);
             let connected = !graph.adj[start].is_empty() || pour.is_some();
@@ -3097,9 +3314,14 @@ fn plane_connection_checks(
                 json!({"stub_mm": p.stub_mm, "vias": p.vias, "target": what, "est_inductance_nh": p.est_inductance_nh, "est_via_nh": via_nh, "unmodelled_mm": p.unmodelled_mm, "through_pads": p.through_pads})
             };
             let limit_ok = limit.is_finite() && limit > 0.0;
-            let pour_ok = pour.as_ref().is_some_and(|(n, _)| only_layer || n.as_ref().is_some_and(|n| n.0 <= limit));
-            let pour_json = pour.as_ref().map(|(n, filled)| {
-                json!({"nearest_plane_via_mm": n.as_ref().map(|n| r3(n.0)), "nearest": n.as_ref().map(|n| json!({"what": n.1, "at": [r3(n.2 .0), r3(n.2 .1)]})), "zone_filled": filled, "pour_is_the_plane": only_layer})
+            let pour_ok = pour.as_ref().is_some_and(|(n, _, _, main)| (only_layer && *main) || n.as_ref().is_some_and(|n| n.0 <= limit));
+            let island = only_layer && pour.as_ref().is_some_and(|(_, _, _, main)| !main);
+            let pour_json = pour.as_ref().map(|(n, filled, _, main)| {
+                let mut v = json!({"nearest_plane_via_mm": n.as_ref().map(|n| r3(n.0)), "nearest": n.as_ref().map(|n| json!({"what": n.1, "at": [r3(n.2 .0), r3(n.2 .1)]})), "zone_filled": filled, "pour_is_the_plane": only_layer});
+                if only_layer {
+                    v["on_main_piece_or_joined"] = json!(main);
+                }
+                v
             });
             let mut warnings: Vec<String> = Vec::new();
             let side = |j: usize| net_pads[j].layer;
@@ -3156,7 +3378,7 @@ fn plane_connection_checks(
                     }
                 }
             } else if pour_ok {
-                let (n, filled) = pour.as_ref().map(|(n, f)| (n.clone(), *f)).unwrap_or((None, false));
+                let (n, filled) = pour.as_ref().map(|(n, f, _, _)| (n.clone(), *f)).unwrap_or((None, false));
                 let why = if only_layer {
                     format!("joined to the {net} pour on {}, which is the net's only plane layer: the pour is the plane", pad.layer)
                 } else {
@@ -3177,14 +3399,29 @@ fn plane_connection_checks(
             } else if let Some(c) = &pp.chained {
                 let why = chain_policy.as_ref().map(|(_, w)| format!(" ({w})")).unwrap_or_default();
                 ("fail", "daisy_chain", format!("reaches the plane only through {} ({} mm of trace){why}: give this pad its own via (UG483 p.30: one-to-one lands to vias)", c.through_pads.join(", "), c.stub_mm))
+            } else if island {
+                ("fail", "pour_island", format!("touches only an isolated piece of the {net} pour on {} (not its main piece, and no via or through-hole pad of the net reaches that piece): it does not join the plane; join the piece to the pour or add a via", pad.layer))
             } else if let Some(p) = &pp.best {
                 ("fail", "long_stub", format!("{} mm connecting trace to the nearest plane via > {limit} mm: add a via at the pad", p.stub_mm))
-            } else if let Some((Some((d, _, _)), _)) = &pour {
+            } else if let Some((Some((d, _, _)), _, _, _)) = &pour {
                 ("fail", "pour", format!("joined to the {net} pour on {} but the nearest via to a plane layer is {} mm away (> {limit} mm): add a via at the pad", pad.layer, r3(*d)))
             } else {
                 ("fail", "no_via", format!("the track graph finds no path from the pad to a via landing on a {net} plane layer {my_planes:?} (tracks, arcs and vias as modelled; zones other than the pad's own-layer pour are not): add a via at the pad, or check the routing if it is meant to be there"))
             };
             let connection = connection_override.unwrap_or(connection);
+            // A way down landing only on an island or an unfilled zone of the
+            // plane layer is not proven (Pass 19: an unfilled zone joins
+            // nothing yet).
+            let used: Option<PlaneTarget> = match connection {
+                _ if assigned.is_some() => assigned.map(|a| a.0.target),
+                "shared_pad_ok" | "shared_pad" => pp.chained.as_ref().map(|c| c.target),
+                "pour" if !only_layer => pour.as_ref().and_then(|p| p.2),
+                _ => None,
+            };
+            let (status, detail) = match (status, used.and_then(|t| doubt(t, pad.layer))) {
+                ("pass", Some(why)) => ("unverified", format!("{detail}; but {why}")),
+                (s, _) => (s, detail),
+            };
             let mut measured = json!({"pad": name, "net": net, "layer": pad.layer, "connection": connection});
             let shown = assigned.map(|a| &a.0).or(pp.chained.as_ref()).or(pp.best.as_ref());
             if let Some(p) = shown {
@@ -3287,11 +3524,18 @@ struct PadExcept {
 }
 
 /// The zone layers a via lands on (its span reaches the layer and the zone's
-/// copper reaches the via).
-fn via_lands_on<'z>(z: &'z ZoneLayers, v: &konnect_sexp::board::Via, layers: &LayerStack) -> Vec<&'z String> {
+/// copper reaches the via), each with how it lands: a zone without a fill
+/// in the file is read by its outline and lands `Unfilled`, never as the
+/// plane (Pass 19: an unfilled zone joins nothing yet).
+fn via_lands_on<'z>(z: &'z ZoneLayers, v: &konnect_sexp::board::Via, layers: &LayerStack) -> Vec<(&'z String, Landing)> {
     let span: Vec<usize> = v.layers.iter().filter_map(|l| layers.index(l)).collect();
     let (lo, hi) = (span.iter().min().copied().unwrap_or(1), span.iter().max().copied().unwrap_or(0));
-    z.outlines.keys().filter(|l| layers.index(l).is_some_and(|i| i >= lo && i <= hi) && z.touches_point(l, (v.x, v.y), v.size / 2.0)).collect()
+    let p = (v.x, v.y);
+    z.outlines
+        .keys()
+        .filter(|l| layers.index(l).is_some_and(|i| i >= lo && i <= hi))
+        .filter_map(|l| z.landing(l, |poly| polygon_distance(&[p, p, p], poly) <= v.size / 2.0 + 1e-6).map(|q| (l, q)))
+        .collect()
 }
 
 /// Per graph node: the indices (into the net's pads, in [`net_graph`] order)
@@ -3374,6 +3618,15 @@ impl ExceptCtx<'_> {
     /// pad's layer touching both (straight pad-edge distance). `Some(true)`
     /// pass, `Some(false)` fail, `None` unverified.
     fn local_join(&self, net: &str, graph: &NetGraph, from: &CopperPad, to: &[&CopperPad], limit: f64, max_vias: Option<u32>) -> (Option<bool>, Value, String) {
+        // A same-layer rule cannot be met by a surface pad on the other side
+        // from every target: no copper joins them without a via.
+        if max_vias == Some(0) && from.smd && !to.is_empty() && to.iter().all(|t| t.smd && t.layer != from.layer) {
+            return (
+                Some(false),
+                json!({"max_path_mm": limit, "max_vias": 0, "pad_layer": from.layer, "target_layers": to.iter().map(|t| t.layer).collect::<BTreeSet<_>>()}),
+                format!("the pad is on {} and every target pad on the other side: no same-layer join without a via", from.layer),
+            );
+        }
         // A 0-via rule searches without barrels; fall back to any path to report it.
         let path = if max_vias == Some(0) {
             tie_path_with(graph, net, &[from], to, self.layers, self.planes, true).or_else(|| tie_path(graph, net, &[from], to, self.layers, self.planes))
@@ -3383,8 +3636,11 @@ impl ExceptCtx<'_> {
         let pour = self.zones.get(net).and_then(|z| {
             let touching = z.touching_pad(from.layer, &from.outline);
             let polys = z.copper(from.layer);
+            // Only targets with copper on the pour's layer: a surface pad on
+            // the other side is not joined by this pour, whatever its outline.
             let d = to
                 .iter()
+                .filter(|t| t.layer == from.layer || !t.smd)
                 .filter(|t| touching.iter().any(|&i| polygon_distance(&t.outline, &polys[i]) <= 0.01))
                 .map(|t| polygon_distance(&from.outline, &t.outline))
                 .fold(f64::INFINITY, f64::min);
@@ -3509,19 +3765,26 @@ fn evaluate_plane_exceptions(intent: &DesignIntent, cx: &ExceptCtx) -> (BTreeMap
                 // (thermal pad), pad edge to via edge within the plane-stub limit.
                 let anchors: Vec<&CopperPad> = cx.pads.iter().filter(|p| (p.reference == *regulator && p.net.as_deref() == Some(net.as_str())) || pg.iter().any(|q| std::ptr::eq(*q, *p))).collect();
                 let z = cx.zones.get(&net);
-                let near: Vec<(f64, f64, f64)> = cx
+                // (x, y, pad edge mm, lands on the main filled piece of a
+                // layer off the PGND pin's).
+                let near: Vec<(f64, f64, f64, bool)> = cx
                     .vias
                     .iter()
                     .filter(|v| v.net.as_deref() == Some(net.as_str()))
-                    .filter(|v| z.is_some_and(|z| via_lands_on(z, v, cx.layers).iter().any(|l| l.as_str() != pg[0].layer)))
                     .filter_map(|v| {
+                        let lands: Vec<Landing> = z.map(|z| via_lands_on(z, v, cx.layers).into_iter().filter(|l| l.0.as_str() != pg[0].layer).map(|l| l.1).collect()).unwrap_or_default();
+                        let best = lands.into_iter().min()?;
                         let d = anchors.iter().map(|a| (polygon_distance(&[(v.x, v.y); 3], &a.outline) - v.size / 2.0).max(0.0)).fold(f64::INFINITY, f64::min);
-                        (d <= cx.near_mm).then_some((r3(v.x), r3(v.y), r3(d)))
+                        (d <= cx.near_mm).then_some((r3(v.x), r3(v.y), r3(d), best == Landing::Main))
                     })
                     .collect();
-                let vias_ok = near.len() as u32 >= need;
+                let proven = near.iter().filter(|v| v.3).count();
+                let vias_ok = proven as u32 >= need;
+                // Enough vias only when those landing on an island or an
+                // unfilled zone count: not proven either way.
+                let vias_open = !vias_ok && near.len() as u32 >= need;
                 let graph = cx.graph(&net);
-                let mut status = if vias_ok { "pass" } else { "fail" };
+                let mut status = if vias_ok { "pass" } else if vias_open { "unverified" } else { "fail" };
                 let mut notes = Vec::new();
                 for cap in input_caps {
                     let cap_pads: Vec<&CopperPad> = cx.pads.iter().filter(|p| p.reference == *cap && p.smd && p.net.as_deref() == Some(net.as_str())).collect();
@@ -3532,24 +3795,25 @@ fn evaluate_plane_exceptions(intent: &DesignIntent, cx: &ExceptCtx) -> (BTreeMap
                     for p in cap_pads {
                         let (ok, mut m, d) = cx.local_join(&net, &graph, p, &pg, limit, Some(0));
                         if let Value::Object(mm) = &mut m {
-                            mm.insert("plane_vias_at_pgnd".into(), json!(near.len()));
+                            mm.insert("plane_vias_at_pgnd".into(), json!(proven));
                             mm.insert("min_vias".into(), json!(need));
                         }
-                        let s = match (ok, vias_ok) {
-                            (Some(false), _) | (_, false) => "excepted_fail",
-                            (None, true) => "excepted_unverified",
-                            (Some(true), true) => "excepted_pass",
+                        let s = match (ok, vias_ok, vias_open) {
+                            (Some(false), _, _) | (_, false, false) => "excepted_fail",
+                            (None, _, _) | (_, false, true) => "excepted_unverified",
+                            (Some(true), true, _) => "excepted_pass",
                         };
                         status = worst(status, if s == "excepted_fail" { "fail" } else if s == "excepted_unverified" { "unverified" } else { "pass" });
                         cover(p, &net, s, format!(
-                            "hot loop to PGND on its own layer: {d}; {} plane vias at the PGND pins/thermal pad (need {need}){}",
-                            near.len(),
+                            "hot loop to PGND on its own layer: {d}; {} plane vias at the PGND pins/thermal pad (need {need}){}{}",
+                            proven,
+                            if near.len() > proven { format!(", {} more landing only on an island or an unfilled zone (refill zones and check again)", near.len() - proven) } else { String::new() },
                             if p.layer == pg[0].layer { "" } else { "; the cap is on the other side from the PGND pin" }
                         ), m);
                     }
                 }
                 check.status = status;
-                check.measured = json!({"kind": kind, "net": net, "plane_vias_at_pgnd": near.len(), "vias": near.iter().map(|v| json!({"at": [v.0, v.1], "pad_edge_mm": v.2})).collect::<Vec<_>>(), "within_mm": cx.near_mm});
+                check.measured = json!({"kind": kind, "net": net, "plane_vias_at_pgnd": proven, "vias": near.iter().map(|v| json!({"at": [v.0, v.1], "pad_edge_mm": v.2, "on_main_fill": v.3})).collect::<Vec<_>>(), "within_mm": cx.near_mm});
                 check.required = json!({"min_vias": need, "max_path_mm": limit, "path_source": limit_src});
                 check.detail = format!("input caps close the hot loop to {} on the outer layer, and the PGND node reaches the plane through ≥ {need} vias{}", pgnd_pins.join(", "), if notes.is_empty() { String::new() } else { format!("; {}", notes.join("; ")) });
             }
@@ -3737,23 +4001,25 @@ fn evaluate_plane_exceptions(intent: &DesignIntent, cx: &ExceptCtx) -> (BTreeMap
 
 /// Per plane net: pad counts by status and the worst connecting traces.
 fn plane_connection_summary(checks: &[Check]) -> Value {
-    /// Per net: counts by status, and failing pads as (stub, pad, connection).
-    type NetTally<'a> = (BTreeMap<&'a str, usize>, Vec<(f64, String, &'a str)>);
+    /// Per net: counts by status, and failing pads as (stub, pad,
+    /// connection, status). A pad failing its exception's own rule
+    /// (`excepted_fail`) is a failure too, labelled by its status.
+    type NetTally<'a> = (BTreeMap<&'a str, usize>, Vec<(f64, String, &'a str, &'a str)>);
     let mut nets: BTreeMap<String, NetTally> = BTreeMap::new();
     for c in checks.iter().filter(|c| c.kind == "plane_connection") {
         let net = c.measured["net"].as_str().unwrap_or_default().to_string();
         let e = nets.entry(net).or_default();
         *e.0.entry(c.status).or_default() += 1;
-        if c.status == "fail" {
+        if c.status == "fail" || c.status == "excepted_fail" {
             let stub = c.measured["stub_mm"].as_f64().unwrap_or(f64::INFINITY);
-            e.1.push((stub, c.measured["pad"].as_str().unwrap_or_default().to_string(), c.measured["connection"].as_str().unwrap_or_default()));
+            e.1.push((stub, c.measured["pad"].as_str().unwrap_or_default().to_string(), c.measured["connection"].as_str().unwrap_or_default(), c.status));
         }
     }
     let out: serde_json::Map<String, Value> = nets
         .into_iter()
         .map(|(net, (counts, mut worst))| {
             worst.sort_by(|a, b| b.0.total_cmp(&a.0));
-            let worst: Vec<Value> = worst.iter().take(5).map(|(s, p, c)| json!({"pad": p, "stub_mm": s.is_finite().then_some(*s), "connection": c})).collect();
+            let worst: Vec<Value> = worst.iter().take(5).map(|(s, p, c, st)| json!({"pad": p, "stub_mm": s.is_finite().then_some(*s), "connection": c, "status": st})).collect();
             (net, json!({"by_status": counts, "worst_failing": worst}))
         })
         .collect();
@@ -3973,7 +4239,7 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
         };
         let d = from
             .iter()
-            .flat_map(|a| target.iter().map(move |b| polygon_distance(&a.corners, &b.corners)))
+            .flat_map(|a| target.iter().map(move |b| polygon_distance(&a.outline, &b.outline)))
             .fold(f64::INFINITY, f64::min);
         let same_side = from.iter().any(|a| target.iter().any(|b| a.layer == b.layer));
         checks.push(Check {
@@ -4024,7 +4290,13 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
         if n.role == "plane" {
             // The pour as the board file holds it filled: pieces per layer.
             let pieces = pour_pieces(tree, &r.net);
-            let cut: Vec<String> = pieces.iter().filter(|(l, n)| **n > 1 && layers.index(l).is_some() && !layers.is_outer(l)).map(|(l, n)| format!("{l}: {n} pieces")).collect();
+            // The inner layers are the plane; a net with no inner pour (a
+            // two-layer board) has its outer pour judged instead.
+            let inner = |l: &str| layers.index(l).is_some() && !layers.is_outer(l);
+            let has_inner = pieces.keys().any(|l| inner(l));
+            let judged: Vec<&String> = pieces.keys().filter(|l| layers.index(l).is_some() && (inner(l) || !has_inner)).collect();
+            let which = if has_inner { "an inner layer" } else { "its outer layer (the net has no inner pour)" };
+            let cut: Vec<String> = pieces.iter().filter(|(l, n)| **n > 1 && judged.contains(l)).map(|(l, n)| format!("{l}: {n} pieces")).collect();
             let narrowest = net_copper.segments.iter().map(|s| s.2).fold(f64::INFINITY, f64::min);
             let track_mm = length(&net_copper.segments);
             let (status, detail) = if !net_copper.has_zone {
@@ -4035,13 +4307,13 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
                 (
                     "unverified",
                     format!(
-                        "the pour is cut into pieces on an inner layer ({}); the pieces are joined only through vias to another layer or by the net's tracks{}; whether they are joined at all is DRC's unconnected-items check, and the current those links carry is not computed",
+                        "the pour is cut into pieces on {which} ({}); the pieces are joined only through vias to another layer or by the net's tracks{}; whether they are joined at all is DRC's unconnected-items check, and the current those links carry is not computed",
                         cut.join(", "),
                         if routed { format!(" ({} mm of track, narrowest {} mm)", r3(track_mm), r3(narrowest)) } else { String::new() }
                     ),
                 )
             } else {
-                ("pass", "a zone of the net, filled in one piece on every inner layer it is on".to_string())
+                ("pass", if has_inner { "a zone of the net, filled in one piece on every inner layer it is on".to_string() } else { "a zone of the net, filled in one piece on every layer it is on (no inner pour, so the outer pour is the plane)".to_string() })
             };
             checks.push(Check {
                 kind: "plane",
@@ -4050,6 +4322,7 @@ fn check_board(tree: &SexpNode, intent: &DesignIntent) -> Vec<Check> {
                 measured: json!({
                     "has_zone": net_copper.has_zone,
                     "filled_pieces": pieces,
+                    "judged_layers": judged,
                     "track_length_mm": r3(track_mm),
                     "narrowest_track_mm": routed.then(|| r3(narrowest)),
                 }),
@@ -4323,7 +4596,9 @@ pub(crate) fn plan_ties(tree: &SexpNode, intent: &DesignIntent, clearance: f64) 
         let nets: BTreeSet<&str> = target.iter().filter_map(|p| p.net.as_deref()).collect();
         let net_pads: Vec<&&CopperPad> = part.iter().filter(|p| p.net.as_deref().is_some_and(|n| nets.contains(n))).collect();
         let job: Vec<&&CopperPad> = if net_pads.is_empty() { part.iter().collect() } else { net_pads };
-        let distance_now = job.iter().flat_map(|a| target.iter().map(move |b| polygon_distance(&a.corners, &b.corners))).fold(f64::INFINITY, f64::min);
+        // Pad edge to pad edge by the true pad shapes (a round pad's bounding
+        // square sits closer than its copper).
+        let distance_now = job.iter().flat_map(|a| target.iter().map(move |b| polygon_distance(&a.outline, &b.outline))).fold(f64::INFINITY, f64::min);
         if distance_now <= max_mm {
             notes.push(json!({"tie": label, "status": "already_met", "distance_mm": r3(distance_now)}));
             continue;
@@ -4338,6 +4613,8 @@ pub(crate) fn plan_ties(tree: &SexpNode, intent: &DesignIntent, clearance: f64) 
         let work_net = job[0].net.clone();
         let work_local: Vec<(f64, f64)> = local_pads.iter().find(|(n, _)| *n == work_net).map(|(_, c)| c.clone()).unwrap_or_default();
         let work_center = (work_local.iter().map(|p| p.0).sum::<f64>() / 4.0, work_local.iter().map(|p| p.1).sum::<f64>() / 4.0);
+        // The working pad's true outline, for the distance.
+        let work_shape: Vec<(f64, f64)> = part.iter().find(|p| p.net == work_net).map(|p| p.outline.iter().map(|c| to_local(*c, at, rot)).collect()).unwrap_or_default();
         let pin = target[0];
         let pin_center = (pin.corners.iter().map(|p| p.0).sum::<f64>() / 4.0, pin.corners.iter().map(|p| p.1).sum::<f64>() / 4.0);
         let (dx, dy) = (pin_center.0 - ic.3 .0, pin_center.1 - ic.3 .1);
@@ -4369,8 +4646,8 @@ pub(crate) fn plan_ties(tree: &SexpNode, intent: &DesignIntent, clearance: f64) 
                     if clash {
                         continue;
                     }
-                    let work: Vec<(f64, f64)> = work_local.iter().map(|p| to_board(*p, origin, rotation)).collect();
-                    let d = target.iter().map(|b| polygon_distance(&work, &b.corners)).fold(f64::INFINITY, f64::min);
+                    let work: Vec<(f64, f64)> = work_shape.iter().map(|p| to_board(*p, origin, rotation)).collect();
+                    let d = target.iter().map(|b| polygon_distance(&work, &b.outline)).fold(f64::INFINITY, f64::min);
                     let score = d + 0.02 * (t - 0.25).abs();
                     if best.is_none_or(|(b, _, _)| score < b) {
                         best = Some((score, origin, rotation));
@@ -4380,8 +4657,8 @@ pub(crate) fn plan_ties(tree: &SexpNode, intent: &DesignIntent, clearance: f64) 
         }
         match best {
             Some((_, origin, rotation)) => {
-                let work: Vec<(f64, f64)> = work_local.iter().map(|p| to_board(*p, origin, rotation)).collect();
-                let d = target.iter().map(|b| polygon_distance(&work, &b.corners)).fold(f64::INFINITY, f64::min);
+                let work: Vec<(f64, f64)> = work_shape.iter().map(|p| to_board(*p, origin, rotation)).collect();
+                let d = target.iter().map(|b| polygon_distance(&work, &b.outline)).fold(f64::INFINITY, f64::min);
                 // The part's new courtyard is an obstacle for the next tie.
                 let court: Vec<(f64, f64)> = local_courtyard.iter().map(|p| to_board(*p, origin, rotation)).collect();
                 courtyards[me].1 = hull(&court);
@@ -5862,8 +6139,14 @@ mod tie_path_tests {
         assert_eq!(c.status, "fail", "{c:?}");
         assert_eq!(c.measured["path_mm"], json!(24.0));
         assert!(c.detail.contains("exceeds"), "{}", c.detail);
-        // A tee straight across makes the short path win.
+        // A tee straight across makes the short path win, but the detour
+        // left beside it still loads the node: 28 mm of track is far over
+        // the 0.5 pF (review 3 #2).
         let c = path("crystal", &format!("{Y1_TOP} {detour} {}", seg("F.Cu", 0.2, (10.0, 10.0), (14.0, 10.0))));
+        assert_eq!((c.status, c.measured["path_mm"].clone()), ("fail", json!(4.0)), "{c:?}");
+        assert!(c.detail.contains("on the whole node (28 mm of track"), "{}", c.detail);
+        // The tee alone passes.
+        let c = path("crystal", &format!("{Y1_TOP} {}", seg("F.Cu", 0.2, (10.0, 10.0), (14.0, 10.0))));
         assert_eq!((c.status, c.measured["path_mm"].clone()), ("pass", json!(4.0)), "{c:?}");
     }
 
@@ -6218,7 +6501,10 @@ mod second_review_tests {
         // does not end in it.
         let wide = "(footprint \"X\" (layer \"F.Cu\") (at 14 10) (property \"Reference\" \"Y1\") (pad \"1\" smd rect (at 0 0) (size 0.9 0.95) (layers \"F.Cu\") (net \"XI\")))";
         let c = run(format!("{u1} {wide} {} {}", seg("XI", "F.Cu", 0.2, (10.0, 10.0), (10.0, 10.3)), seg("XI", "F.Cu", 0.2, (10.0, 10.3), (18.0, 10.3))));
-        assert_eq!((c.status, c.measured["path_mm"].clone()), ("pass", json!(4.3)), "{c:?}");
+        // The corner at (10, 10.3) is 0.05 mm off U1.5's edge, inside the
+        // 0.1 mm half width: its copper overlaps the pad, which joins it
+        // there (review 3 #3), so the 0.3 mm jog is pad copper.
+        assert_eq!((c.status, c.measured["path_mm"].clone()), ("pass", json!(4.0)), "{c:?}");
         // (b) Two track ends 0.05 mm apart, each inside the other's width.
         let c = run(format!("{u1} {y1} {} {}", seg("XI", "F.Cu", 0.25, (10.0, 10.0), (12.0, 10.0)), seg("XI", "F.Cu", 0.25, (12.0, 10.05), (14.0, 10.05))));
         // The 0.05 mm between the ends is copper too, and counted.
@@ -6441,9 +6727,11 @@ mod second_review_tests {
     fn a_leg_through_the_plane_is_measured_stub_via_plane_via_stub() {
         let c1 = part("C1", "F.Cu", (20.0, 10.0), &[("1", "+3V3", 0.0, 0.0), ("2", "GND", 0.0, 1.0)]);
         let mut body = format!("{} {c1}", u1_supply());
-        // Pin side: vias 0.5 mm above / below the pads; capacitor side: 0.5 mm to the right.
-        for (net, pin_via, pad_y) in [("+3V3", (10.0, 9.5), 10.0), ("GND", (10.0, 11.5), 11.0)] {
-            body.push_str(&format!(" {} {} {} {}", seg(net, "F.Cu", 0.3, (10.0, pad_y), pin_via), via(net, pin_via), seg(net, "F.Cu", 0.3, (20.0, pad_y), (20.5, pad_y)), via(net, (20.5, pad_y))));
+        // Pin side: vias 0.8 mm above / below the pads; capacitor side: 0.8
+        // mm to the right (clear of the pads: an annulus overlapping a pad
+        // joins it with no track, review 3 #3).
+        for (net, pin_via, pad_y) in [("+3V3", (10.0, 9.2), 10.0), ("GND", (10.0, 11.8), 11.0)] {
+            body.push_str(&format!(" {} {} {} {}", seg(net, "F.Cu", 0.3, (10.0, pad_y), pin_via), via(net, pin_via), seg(net, "F.Cu", 0.3, (20.0, pad_y), (20.8, pad_y)), via(net, (20.8, pad_y))));
         }
         let c = path_check(&board(LAYERS4, &format!("{PLANES} {body}")), tie("C1", "U1", Some("1"), Some("decoupling")));
         let (layers, planes) = stack4();
@@ -6452,16 +6740,16 @@ mod second_review_tests {
         assert_eq!(legs.len(), 2, "{c:?}");
         for leg in legs {
             let net = leg["net"].as_str().unwrap();
-            assert_eq!((leg["carried_by"].as_str(), leg["path_mm"].clone(), leg["vias"].clone()), (Some("plane"), json!(1.0), json!(2)), "{leg}");
-            // Either net: 10.5 mm along x, 0.5 mm along y between its two vias.
-            let span = (10.5_f64).hypot(0.5);
+            assert_eq!((leg["carried_by"].as_str(), leg["path_mm"].clone(), leg["vias"].clone()), (Some("plane"), json!(1.6), json!(2)), "{leg}");
+            // Either net: 10.8 mm along x, 0.8 mm along y between its two vias.
+            let span = (10.8_f64).hypot(0.8);
             assert!(close(leg["plane_span_mm"].as_f64().unwrap(), span), "{leg}");
             // The loop height of the plane part is the In1–In2 core.
             assert!(close(leg["plane_inductance_nh"].as_f64().unwrap(), MU_OVER_2PI_NH_PER_MM * core * (span / 0.15).ln()), "{leg}");
             // Barrels run from F.Cu to the net's own plane only.
             let depth = if net == "GND" { layers.gaps[0].thickness_mm } else { layers.gaps[0].thickness_mm + core };
             assert!(close(leg["via_barrel_mm"].as_f64().unwrap(), 2.0 * depth), "{leg}");
-            let tracks = layers.model("F.Cu", &planes).unwrap().per_mm(0.3).l_nh_per_mm;
+            let tracks = 1.6 * layers.model("F.Cu", &planes).unwrap().per_mm(0.3).l_nh_per_mm;
             let sum = leg["track_inductance_nh"].as_f64().unwrap() + leg["via_inductance_nh"].as_f64().unwrap() + leg["plane_inductance_nh"].as_f64().unwrap();
             assert!(close(leg["track_inductance_nh"].as_f64().unwrap(), tracks) && close(leg["est_inductance_nh"].as_f64().unwrap(), sum), "{leg}");
         }
@@ -6469,7 +6757,7 @@ mod second_review_tests {
         assert!(close(c.measured["loop_inductance_nh"].as_f64().unwrap(), total));
         assert_eq!(c.status, if total <= DECOUPLING_LOOP_NH { "pass" } else { "fail" }, "{c:?}");
         // The pin's via missing: that end has no way into the plane.
-        let cut = body.replace(&via("+3V3", (10.0, 9.5)), "");
+        let cut = body.replace(&via("+3V3", (10.0, 9.2)), "");
         let c = path_check(&board(LAYERS4, &format!("{PLANES} {cut}")), tie("C1", "U1", Some("1"), Some("decoupling")));
         assert_eq!(c.status, "unverified", "{c:?}");
         assert!(c.detail.contains("+3V3: no routed track path, and no via"), "{}", c.detail);
@@ -6583,7 +6871,9 @@ mod plane_connection_tests {
     fn checks_with(extra: &str, intent: &DesignIntent) -> Vec<Check> {
         let board = konnect_sexp::parse_sexp(&format!(
             "(kicad_pcb (general (thickness 1.6)) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" signal) (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal))
-              (zone (net \"GND\") (layers \"In1.Cu\" \"In2.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50))))
+              (zone (net \"GND\") (layers \"In1.Cu\" \"In2.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50)))
+                (filled_polygon (layer \"In1.Cu\") (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50)))
+                (filled_polygon (layer \"In2.Cu\") (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50))))
               (zone (net \"+3V3\") (layers \"F.Cu\") (polygon (pts (xy 40 40) (xy 45 40) (xy 45 45))))
               (footprint \"C\" (layer \"F.Cu\") (at 9 10) (property \"Reference\" \"C1\")
                 (pad \"1\" smd rect (at -1 0) (size 0.6 0.6) (layers \"F.Cu\") (net \"+3V3\"))
@@ -6777,7 +7067,9 @@ mod plane_connection_tests {
     fn all_checks(extra: &str, i: &DesignIntent) -> Vec<Check> {
         let board = konnect_sexp::parse_sexp(&format!(
             "(kicad_pcb (general (thickness 1.6)) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" signal) (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal))
-              (zone (net \"GND\") (layers \"In1.Cu\" \"In2.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50))))
+              (zone (net \"GND\") (layers \"In1.Cu\" \"In2.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50)))
+                (filled_polygon (layer \"In1.Cu\") (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50)))
+                (filled_polygon (layer \"In2.Cu\") (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50))))
               (footprint \"C\" (layer \"F.Cu\") (at 9 10) (property \"Reference\" \"C1\")
                 (pad \"1\" smd rect (at -1 0) (size 0.6 0.6) (layers \"F.Cu\") (net \"+3V3\"))
                 (pad \"2\" smd rect (at 1 0) (size 0.6 0.6) (layers \"F.Cu\") (net \"GND\")))
@@ -6792,8 +7084,10 @@ mod plane_connection_tests {
     fn regime_checks(extra: &str, stackup: Option<Stackup>) -> Vec<Check> {
         let board = konnect_sexp::parse_sexp(&format!(
             "(kicad_pcb (general (thickness 1.6)) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" signal) (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal))
-              (zone (net \"GND\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50))))
-              (zone (net \"+3V3\") (layers \"In2.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50))))
+              (zone (net \"GND\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50)))
+                (filled_polygon (layer \"In1.Cu\") (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50))))
+              (zone (net \"+3V3\") (layers \"In2.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50)))
+                (filled_polygon (layer \"In2.Cu\") (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50))))
               {extra})"
         ))
         .unwrap();
@@ -6943,7 +7237,9 @@ mod plane_connection_tests {
     fn round_pads_join_by_their_real_shape() {
         // A 1 mm round pad: a track end in its bounding square's corner is not on it.
         let p = "(footprint \"TP\" (layer \"F.Cu\") (at 30 10) (property \"Reference\" \"TP1\") (pad \"1\" smd circle (at 0 0) (size 1 1) (layers \"F.Cu\") (net \"GND\")))";
-        let corner = format!("{p} {} {}", seg("GND", "F.Cu", (30.45, 10.45), (31.0, 10.45)), via(31.0, 10.45));
+        // (0.18 mm off the circle: past the 0.15 mm half width of the track,
+        // whose copper would otherwise overlap the pad and join it.)
+        let corner = format!("{p} {} {}", seg("GND", "F.Cu", (30.48, 10.48), (31.0, 10.48)), via(31.0, 10.48));
         let c = pad_check(&all_checks(&corner, &intent()), "TP1.1").clone();
         assert_eq!(c.measured["connection"], "none", "{c:?}");
         // A track grazing past the circle without touching it.
@@ -7237,5 +7533,350 @@ mod plane_connection_tests {
         assert!(err);
         let (err, _) = call(json!({"project": pro, "plane_exceptions": [{"kind": "datasheet", "pad": "C1.2", "rule": "r"}]}));
         assert!(err, "missing source refused");
+    }
+}
+
+#[cfg(test)]
+mod third_review_tests {
+    //! Pass 21: the third review of the Tier 1 work (one test per finding).
+    use super::*;
+
+    const LAYERS4: &str = "(general (thickness 1.6)) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" signal) (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal))";
+    const LAYERS2: &str = "(general (thickness 1.6)) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal))";
+
+    fn square(x0: f64, y0: f64, x1: f64, y1: f64) -> String {
+        format!("(pts (xy {x0} {y0}) (xy {x1} {y0}) (xy {x1} {y1}) (xy {x0} {y1}))")
+    }
+
+    /// A `net` zone on `layers`, filled with `pieces` (layer, x0, y0, x1, y1).
+    fn zone(net: &str, layers: &[&str], outline: (f64, f64, f64, f64), pieces: &[(&str, f64, f64, f64, f64)]) -> String {
+        let ls: String = layers.iter().map(|l| format!(" \"{l}\"")).collect();
+        let fills: String = pieces.iter().map(|(l, a, b, c, d)| format!(" (filled_polygon (layer \"{l}\") {})", square(*a, *b, *c, *d))).collect();
+        format!("(zone (net \"{net}\") (layers{ls}) (polygon {}){fills})", square(outline.0, outline.1, outline.2, outline.3))
+    }
+
+    /// GND filled over the whole 50 mm square on In1 and In2.
+    fn gnd_planes() -> String {
+        zone("GND", &["In1.Cu", "In2.Cu"], (0.0, 0.0, 50.0, 50.0), &[("In1.Cu", 0.0, 0.0, 50.0, 50.0), ("In2.Cu", 0.0, 0.0, 50.0, 50.0)])
+    }
+
+    fn seg(net: &str, layer: &str, w: f64, (x1, y1): (f64, f64), (x2, y2): (f64, f64)) -> String {
+        format!("(segment (start {x1} {y1}) (end {x2} {y2}) (width {w}) (layer \"{layer}\") (net \"{net}\"))")
+    }
+
+    fn via_on(net: &str, (x, y): (f64, f64), from: &str, to: &str) -> String {
+        format!("(via (at {x} {y}) (size 0.6) (drill 0.3) (layers \"{from}\" \"{to}\") (net \"{net}\"))")
+    }
+
+    fn via(net: &str, at: (f64, f64)) -> String {
+        via_on(net, at, "F.Cu", "B.Cu")
+    }
+
+    /// A footprint on `side` with 0.6 mm square surface pads (number, net, dx, dy).
+    fn part(reference: &str, side: &str, (x, y): (f64, f64), pads: &[(&str, &str, f64, f64)]) -> String {
+        let pads: String = pads.iter().map(|(n, net, dx, dy)| format!("(pad \"{n}\" smd rect (at {dx} {dy}) (size 0.6 0.6) (layers \"{side}\") (net \"{net}\"))")).collect();
+        format!("(footprint \"X\" (layer \"{side}\") (at {x} {y}) (property \"Reference\" \"{reference}\") {pads})")
+    }
+
+    fn board(layers: &str, body: &str) -> SexpNode {
+        konnect_sexp::parse_sexp(&format!("(kicad_pcb {layers} {body})")).unwrap()
+    }
+
+    fn intent() -> DesignIntent {
+        DesignIntent { schema: 1, ..Default::default() }
+    }
+
+    fn plane_pad(tree: &SexpNode, i: &DesignIntent, pad: &str) -> Check {
+        check_board(tree, i).into_iter().find(|c| c.kind == "plane_connection" && c.measured["pad"] == pad).unwrap_or_else(|| panic!("no plane_connection check for {pad}"))
+    }
+
+    fn with(e: PlaneException) -> DesignIntent {
+        DesignIntent { plane_exceptions: vec![e], ..intent() }
+    }
+
+    // ── #1 ─────────────────────────────────────────────────────────────
+
+    /// A pour on the cap's side is no same-layer join to a PGND pin on the
+    /// other side, however their outlines overlap in 2-D.
+    #[test]
+    fn a_pour_on_the_other_side_does_not_join_a_hot_loop_or_a_local_ground() {
+        let u3 = part("U3", "F.Cu", (20.0, 10.0), &[("7", "GND", 0.0, 0.0)]);
+        let c20 = part("C20", "B.Cu", (20.0, 10.0), &[("2", "GND", 0.0, 0.0)]);
+        let bottom = zone("GND", &["B.Cu"], (15.0, 5.0, 25.0, 15.0), &[("B.Cu", 15.0, 5.0, 25.0, 15.0)]);
+        let body = format!("{} {bottom} {u3} {c20} {} {}", gnd_planes(), via("GND", (20.0, 11.0)), via("GND", (20.0, 9.0)));
+        let hot = PlaneException::SwitchingHotLoop { regulator: "U3".into(), input_caps: vec!["C20".into()], pgnd_pins: vec!["U3.7".into()], max_path_mm: None, min_vias: None, source: "s".into(), reason: None };
+        let c = plane_pad(&board(LAYERS4, &body), &with(hot), "C20.2");
+        assert_eq!(c.status, "excepted_fail", "{c:?}");
+        assert!(c.detail.contains("no same-layer join without a via"), "{}", c.detail);
+        // The same with the cap on the PGND pin's side passes through the F.Cu pour.
+        let top = bottom.replace("B.Cu", "F.Cu");
+        let c20_top = part("C20", "F.Cu", (21.0, 10.0), &[("2", "GND", 0.0, 0.0)]);
+        let body_top = format!("{} {top} {u3} {c20_top} {} {}", gnd_planes(), via("GND", (20.0, 11.0)), via("GND", (20.0, 9.0)));
+        let hot = PlaneException::SwitchingHotLoop { regulator: "U3".into(), input_caps: vec!["C20".into()], pgnd_pins: vec!["U3.7".into()], max_path_mm: None, min_vias: None, source: "s".into(), reason: None };
+        assert_eq!(plane_pad(&board(LAYERS4, &body_top), &with(hot), "C20.2").status, "excepted_pass");
+        // crystal_local_ground (vias allowed): the bottom pour is no join to
+        // the VSS pin on top, and no track joins them either.
+        let u1 = part("U1", "F.Cu", (20.0, 10.0), &[("47", "GND", 0.0, 0.0)]);
+        let c3 = part("C3", "B.Cu", (20.0, 10.0), &[("2", "GND", 0.0, 0.0)]);
+        let y1 = part("Y1", "F.Cu", (30.0, 30.0), &[("1", "XI", 0.0, 0.0)]);
+        let xtal = PlaneException::CrystalLocalGround { crystal: "Y1".into(), load_caps: vec!["C3".into()], vss_pin: "U1.47".into(), max_path_mm: None, source: "s".into(), reason: None };
+        let c = plane_pad(&board(LAYERS4, &format!("{} {bottom} {u1} {c3} {y1}", gnd_planes())), &with(xtal), "C3.2");
+        assert_eq!(c.status, "excepted_fail", "{c:?}");
+    }
+
+    // ── #2 ─────────────────────────────────────────────────────────────
+
+    /// AVR186's 1 pF is the node's: a stub left beside a short path counts.
+    #[test]
+    fn a_crystal_budget_counts_every_track_of_the_node() {
+        let u1 = part("U1", "F.Cu", (10.0, 10.0), &[("5", "XI", 0.0, 0.0)]);
+        let y1 = part("Y1", "F.Cu", (13.0, 10.0), &[("1", "XI", 0.0, 0.0)]);
+        let path = seg("XI", "F.Cu", 0.2, (10.0, 10.0), (13.0, 10.0));
+        let stub = seg("XI", "F.Cu", 0.2, (13.0, 10.0), (13.0, 25.0));
+        let mut i = intent();
+        i.ties.push(Tie { part: "Y1".into(), to: "U1".into(), pin: Some("5".into()), kind: Some("crystal".into()), ..Default::default() });
+        let run = |body: String| check_board(&board(LAYERS4, &format!("{} {u1} {y1} {body}", gnd_planes())), &i).into_iter().find(|c| c.kind == "tie_path").unwrap();
+        let short = run(path.clone());
+        assert_eq!(short.status, "pass", "{short:?}");
+        let c = run(format!("{path} {stub}"));
+        assert_eq!(c.status, "fail", "{c:?}");
+        // The path alone is still 3 mm, under the 6 mm guide and 0.5 pF.
+        assert_eq!(c.measured["path_mm"], json!(3.0));
+        assert!(c.measured["est_capacitance_pf"].as_f64().unwrap() < 0.5, "{c:?}");
+        assert_eq!(c.measured["net_track_mm"], json!(18.0));
+        assert!(c.measured["net_capacitance_pf"].as_f64().unwrap() > 0.5);
+        assert!(c.detail.contains("on the whole node (18 mm of track, 0 vias)"), "{}", c.detail);
+        // A via on the node adds its 0.4 pF.
+        let with_via = run(format!("{path} {}", via("XI", (11.5, 10.0))));
+        assert_eq!(with_via.measured["net_vias"], json!(1));
+        assert_eq!(with_via.status, "fail", "{with_via:?}");
+    }
+
+    // ── #3 ─────────────────────────────────────────────────────────────
+
+    /// UG483 p.30's via butted against the land, with no trace, joins the
+    /// pad; so does a track end whose copper overlaps the pad edge.
+    #[test]
+    fn a_via_or_track_end_overlapping_a_pad_joins_it() {
+        let c1 = part("C1", "F.Cu", (9.0, 10.0), &[("1", "+3V3", -1.0, 0.0), ("2", "GND", 1.0, 0.0)]);
+        // Pad edge at 10.3; via centre at 10.5 (outside), its annulus to 10.2.
+        let c = plane_pad(&board(LAYERS4, &format!("{} {c1} {}", gnd_planes(), via("GND", (10.5, 10.0)))), &intent(), "C1.2");
+        assert_eq!((c.status, c.measured["stub_mm"].clone()), ("pass", json!(0.0)), "{c:?}");
+        // A 0.3 mm track ending 0.1 mm outside the pad edge, its far end on a via.
+        let c = plane_pad(&board(LAYERS4, &format!("{} {c1} {} {}", gnd_planes(), seg("GND", "F.Cu", 0.3, (10.4, 10.0), (11.4, 10.0)), via("GND", (11.4, 10.0)))), &intent(), "C1.2");
+        assert_eq!(c.status, "pass", "{c:?}");
+        // 0.4 mm of track outside the via's copper (the pad side is not in the pad).
+        assert_eq!(c.measured["stub_mm"], json!(0.7));
+        // Copper that stops short of the pad still does not join it.
+        let c = plane_pad(&board(LAYERS4, &format!("{} {c1} {}", gnd_planes(), via("GND", (10.65, 10.0)))), &intent(), "C1.2");
+        assert_eq!(c.measured["connection"], "none", "{c:?}");
+    }
+
+    // ── #4 ─────────────────────────────────────────────────────────────
+
+    /// A via into a plane zone with no fill in the file, or only onto an
+    /// island of it, is not a proven way down.
+    #[test]
+    fn a_via_to_an_unfilled_plane_or_an_island_is_unverified() {
+        let c1 = part("C1", "F.Cu", (9.0, 10.0), &[("1", "+3V3", -1.0, 0.0), ("2", "GND", 1.0, 0.0)]);
+        let filled = plane_pad(&board(LAYERS4, &format!("{} {c1} {}", gnd_planes(), via("GND", (10.0, 10.0)))), &intent(), "C1.2");
+        assert_eq!(filled.status, "pass", "{filled:?}");
+        let outline = "(zone (net \"GND\") (layers \"In1.Cu\" \"In2.Cu\") (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50))))";
+        let c = plane_pad(&board(LAYERS4, &format!("{outline} {c1} {}", via("GND", (10.0, 10.0)))), &intent(), "C1.2");
+        assert_eq!(c.status, "unverified", "{c:?}");
+        assert!(c.detail.contains("no fill in the file"), "{}", c.detail);
+        // Main piece below y = 8, an island around the pad.
+        let island = zone("GND", &["In1.Cu", "In2.Cu"], (0.0, 0.0, 50.0, 50.0), &[("In1.Cu", 0.0, 0.0, 50.0, 8.0), ("In1.Cu", 9.0, 9.0, 11.0, 11.0), ("In2.Cu", 0.0, 0.0, 50.0, 8.0), ("In2.Cu", 9.0, 9.0, 11.0, 11.0)]);
+        let c = plane_pad(&board(LAYERS4, &format!("{island} {c1} {}", via("GND", (10.0, 10.0)))), &intent(), "C1.2");
+        assert_eq!(c.status, "unverified", "{c:?}");
+        assert!(c.detail.contains("smaller piece"), "{}", c.detail);
+        // The hot loop's PGND vias: into an unfilled plane they do not count as proven.
+        let u3 = part("U3", "F.Cu", (20.0, 10.0), &[("7", "GND", 0.0, 0.0)]);
+        let c20 = part("C20", "F.Cu", (22.0, 10.0), &[("2", "GND", 0.0, 0.0)]);
+        let routed = format!("{u3} {c20} {} {} {}", seg("GND", "F.Cu", 0.3, (22.0, 10.0), (20.0, 10.0)), via("GND", (20.0, 11.0)), via("GND", (20.0, 9.0)));
+        let hot = || PlaneException::SwitchingHotLoop { regulator: "U3".into(), input_caps: vec!["C20".into()], pgnd_pins: vec!["U3.7".into()], max_path_mm: None, min_vias: None, source: "s".into(), reason: None };
+        assert_eq!(plane_pad(&board(LAYERS4, &format!("{} {routed}", gnd_planes())), &with(hot()), "C20.2").status, "excepted_pass");
+        let c = plane_pad(&board(LAYERS4, &format!("{outline} {routed}")), &with(hot()), "C20.2");
+        assert_eq!(c.status, "excepted_unverified", "{c:?}");
+    }
+
+    // ── #5 ─────────────────────────────────────────────────────────────
+
+    /// A [V1, V2], B [V2, V3], C [V1, V2]: greedy first choice leaves C
+    /// sharing; a matching gives all three their own via.
+    #[test]
+    fn ways_down_are_matched_not_handed_out_greedily() {
+        let (v1, v2, v3) = ((10.0, 10.0), (12.0, 10.0), (14.0, 10.0));
+        let (a, b, c) = ((10.6, 11.0), (12.6, 11.0), (11.0, 9.0));
+        let mut body = gnd_planes();
+        for (r, at) in [("C11", a), ("C12", b), ("C13", c)] {
+            body.push_str(&part(r, "F.Cu", at, &[("2", "GND", 0.0, 0.0)]));
+        }
+        for v in [v1, v2, v3] {
+            body.push_str(&via("GND", v));
+        }
+        for (from, to) in [(a, v1), (a, v2), (b, v2), (b, v3), (c, v1), (c, v2)] {
+            body.push_str(&seg("GND", "F.Cu", 0.3, from, to));
+        }
+        let tree = board(LAYERS4, &body);
+        let checks: Vec<Check> = check_board(&tree, &intent()).into_iter().filter(|c| c.kind == "plane_connection").collect();
+        assert_eq!(checks.len(), 3);
+        for c in &checks {
+            assert_eq!(c.status, "pass", "{c:?}");
+            assert!(c.measured.get("via_shared_with").is_none(), "{c:?}");
+        }
+        // Each its own via, from its own choices (C13 has two equal ones,
+        // so more than one perfect matching exists).
+        let via_of = |pad: &str| checks.iter().find(|c| c.measured["pad"] == pad).unwrap().measured["target"]["via"].clone();
+        let got = [via_of("C11.2"), via_of("C12.2"), via_of("C13.2")];
+        let set: BTreeSet<String> = got.iter().map(Value::to_string).collect();
+        assert_eq!(set.len(), 3, "{got:?}");
+        assert!([json!([10.0, 10.0]), json!([12.0, 10.0])].contains(&got[0]) && [json!([12.0, 10.0]), json!([14.0, 10.0])].contains(&got[1]), "{got:?}");
+        // The same answer every time (ties are broken by the target, not hash order).
+        for _ in 0..5 {
+            let again: Vec<Value> = check_board(&tree, &intent()).into_iter().filter(|c| c.kind == "plane_connection").map(|c| c.measured["target"]["via"].clone()).collect();
+            assert_eq!(again, checks.iter().map(|c| c.measured["target"]["via"].clone()).collect::<Vec<_>>());
+        }
+    }
+
+    // ── #6 ─────────────────────────────────────────────────────────────
+
+    /// A two-layer board: the outer pour is the plane, so its pieces are
+    /// judged, and a pad on an isolated island of it is not on the plane.
+    #[test]
+    fn an_outer_plane_is_judged_by_its_pieces_and_an_island_is_not_the_plane() {
+        let mut i = intent();
+        i.nets.insert("GND".into(), NetIntent { role: "plane".into(), ..Default::default() });
+        let five: Vec<(&str, f64, f64, f64, f64)> = (0..5).map(|k| ("B.Cu", k as f64 * 10.0, 0.0, k as f64 * 10.0 + 8.0, 50.0)).collect();
+        let cut = board(LAYERS2, &zone("GND", &["B.Cu"], (0.0, 0.0, 50.0, 50.0), &five));
+        let plane = check_board(&cut, &i).into_iter().find(|c| c.kind == "plane").unwrap();
+        assert_eq!(plane.status, "unverified", "{plane:?}");
+        assert!(plane.detail.contains("B.Cu: 5 pieces") && plane.detail.contains("outer layer"), "{}", plane.detail);
+        let whole = board(LAYERS2, &zone("GND", &["B.Cu"], (0.0, 0.0, 50.0, 50.0), &[("B.Cu", 0.0, 0.0, 50.0, 50.0)]));
+        assert_eq!(check_board(&whole, &i).into_iter().find(|c| c.kind == "plane").unwrap().status, "pass");
+        // C1.2 on B.Cu: on the main piece it passes; on a 2 mm island it fails.
+        let c1 = part("C1", "B.Cu", (9.0, 30.0), &[("1", "SIG", -1.0, 0.0), ("2", "GND", 1.0, 0.0)]);
+        let pieces = zone("GND", &["B.Cu"], (0.0, 0.0, 50.0, 50.0), &[("B.Cu", 0.0, 0.0, 50.0, 20.0), ("B.Cu", 9.0, 29.0, 11.0, 31.0)]);
+        let c = plane_pad(&board(LAYERS2, &format!("{pieces} {c1}")), &i, "C1.2");
+        assert_eq!((c.status, c.measured["connection"].as_str()), ("fail", Some("pour_island")), "{c:?}");
+        let on_main = board(LAYERS2, &format!("{} {c1}", zone("GND", &["B.Cu"], (0.0, 0.0, 50.0, 50.0), &[("B.Cu", 0.0, 0.0, 50.0, 50.0), ("B.Cu", 60.0, 60.0, 61.0, 61.0)])));
+        assert_eq!(plane_pad(&on_main, &i, "C1.2").status, "pass");
+        // A via of the net on the island joins it to the rest of the net.
+        let joined = board(LAYERS2, &format!("{pieces} {c1} {}", via("GND", (10.5, 30.5))));
+        assert_eq!(plane_pad(&joined, &i, "C1.2").status, "pass");
+    }
+
+    // ── #7 ─────────────────────────────────────────────────────────────
+
+    /// The near pad's nearest drop is on In1, the far pad reaches only In2:
+    /// the leg through In2 is found.
+    #[test]
+    fn a_plane_leg_tries_every_plane_layer_the_drops_reach() {
+        let c1 = part("C1", "F.Cu", (10.0, 10.0), &[("2", "GND", 0.0, 0.0)]);
+        let u1 = part("U1", "B.Cu", (20.0, 10.0), &[("2", "GND", 0.0, 0.0)]);
+        let body = format!(
+            "{} {c1} {u1} {} {} {} {} {} {}",
+            gnd_planes(),
+            seg("GND", "F.Cu", 0.3, (10.0, 10.0), (10.0, 10.8)),
+            via_on("GND", (10.0, 10.8), "F.Cu", "In1.Cu"),
+            seg("GND", "F.Cu", 0.3, (10.0, 10.0), (10.0, 8.0)),
+            via("GND", (10.0, 8.0)),
+            seg("GND", "B.Cu", 0.3, (20.0, 10.0), (20.0, 11.0)),
+            via_on("GND", (20.0, 11.0), "In2.Cu", "B.Cu")
+        );
+        let tree = board(LAYERS4, &body);
+        let (layers, planes, _) = stack_and_planes(&intent(), Some(&tree));
+        let pads = copper_pads(&tree);
+        let copper = board_copper(&tree);
+        let vias = konnect_sexp::board::vias(&tree).items;
+        let names: Vec<String> = layers.copper.iter().map(|c| c.0.clone()).collect();
+        let fills = zone_copper(&tree, &names);
+        let graph = net_graph("GND", &copper["GND"], &pads, &vias, &layers);
+        let from: Vec<&CopperPad> = pads.iter().filter(|p| p.reference == "C1").collect();
+        let to: Vec<&CopperPad> = pads.iter().filter(|p| p.reference == "U1").collect();
+        let leg = plane_leg(&graph, "GND", &from, &to, fills.get("GND"), &layers, &planes).expect("a leg through In2");
+        assert_eq!(leg.plane_layer.as_deref(), Some("In2.Cu"));
+        assert_eq!(leg.vias, 2);
+    }
+
+    /// A loop over its budget on a track leg whose net has an inner pour a
+    /// via drops into, but which `plane_leg` cannot use from both ends (the
+    /// via is not joined to the leg in the track graph; copper the graph
+    /// misses may join it), is not a proven failure.
+    #[test]
+    fn a_track_leg_beside_an_unmeasured_inner_pour_is_unverified_not_failed() {
+        let u1 = part("U1", "F.Cu", (10.0, 10.0), &[("1", "+3V3", 0.0, 0.0), ("2", "GND", 0.0, 1.0)]);
+        let c1 = part("C1", "F.Cu", (30.0, 10.0), &[("1", "+3V3", 0.0, 0.0), ("2", "GND", 0.0, 1.0)]);
+        let supply = zone("+3V3", &["In2.Cu"], (0.0, 0.0, 50.0, 50.0), &[("In2.Cu", 0.0, 0.0, 50.0, 50.0)]);
+        let gnd = zone("GND", &["In1.Cu"], (0.0, 0.0, 50.0, 50.0), &[("In1.Cu", 0.0, 0.0, 50.0, 50.0)]);
+        let base = format!("{supply} {gnd} {u1} {c1} {}", seg("+3V3", "F.Cu", 0.3, (10.0, 10.0), (30.0, 10.0)));
+        let mut i = intent();
+        i.ties.push(Tie { part: "C1".into(), to: "U1".into(), pin: Some("1".into()), kind: Some("decoupling".into()), ..Default::default() });
+        let run = |body: &str| check_board(&board(LAYERS4, body), &i).into_iter().find(|c| c.kind == "tie_path").unwrap();
+        // No via of +3V3 at all: the pour carries nothing, the failure stands.
+        assert_eq!(run(&base).status, "fail");
+        // A via joined to the leg gives a plane leg, measured: still a fail.
+        assert_eq!(run(&format!("{base} {} {}", seg("+3V3", "F.Cu", 0.3, (10.0, 10.0), (9.0, 10.0)), via("+3V3", (9.0, 10.0)))).status, "fail");
+        // A via of +3V3 in the pour that the graph does not join to the leg: unverified.
+        let c = run(&format!("{base} {}", via("+3V3", (25.0, 15.0))));
+        assert_eq!(c.status, "unverified", "{c:?}");
+        assert!(c.detail.contains("net +3V3 also has a zone"), "{}", c.detail);
+    }
+
+    // ── #9 ─────────────────────────────────────────────────────────────
+
+    /// KiCad ≤ 9 files: `(net 1) (net_name "GND")` zones and `(net 2)` arcs.
+    #[test]
+    fn kicad_9_zones_and_arcs_are_read() {
+        let tree = konnect_sexp::parse_sexp(&format!(
+            "(kicad_pcb {LAYERS4} (net 0 \"\") (net 1 \"GND\") (net 2 \"SIG\")
+              (zone (net 1) (net_name \"GND\") (layers \"In1.Cu\" \"In2.Cu\") (polygon {sq})
+                (filled_polygon (layer \"In1.Cu\") {sq}) (filled_polygon (layer \"In2.Cu\") {sq}))
+              (footprint \"C\" (layer \"F.Cu\") (at 9 10) (property \"Reference\" \"C1\")
+                (pad \"1\" smd rect (at -1 0) (size 0.6 0.6) (layers \"F.Cu\") (net 2 \"SIG\"))
+                (pad \"2\" smd rect (at 1 0) (size 0.6 0.6) (layers \"F.Cu\") (net 1 \"GND\")))
+              (via (at 10 10) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 1))
+              (arc (start 0 0) (mid 1 1) (end 2 0) (width 0.2) (layer \"F.Cu\") (net 2)))",
+            sq = square(0.0, 0.0, 50.0, 50.0)
+        ))
+        .unwrap();
+        let c = plane_pad(&tree, &intent(), "C1.2");
+        assert_eq!((c.status, c.measured["connection"].as_str()), ("pass", Some("via_in_pad")), "{c:?}");
+        let copper = board_copper(&tree);
+        assert!(length(&copper["SIG"].segments) > 3.0, "the arc is routed copper of SIG");
+    }
+
+    // ── #11 ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_summary_lists_pads_failing_their_exception() {
+        let check = |pad: &str, status: &'static str| Check {
+            kind: "plane_connection",
+            subject: pad.into(),
+            status,
+            measured: json!({"pad": pad, "net": "GND", "connection": "excepted"}),
+            required: Value::Null,
+            detail: String::new(),
+        };
+        let s = plane_connection_summary(&[check("C20.2", "excepted_fail"), check("C1.2", "pass")]);
+        let worst = s["GND"]["worst_failing"].as_array().unwrap();
+        assert_eq!(worst.len(), 1, "{s}");
+        assert_eq!((worst[0]["pad"].as_str(), worst[0]["status"].as_str()), (Some("C20.2"), Some("excepted_fail")));
+    }
+
+    // ── #12 ────────────────────────────────────────────────────────────
+
+    /// Round pads on a diagonal: their bounding squares are 0.28 mm apart,
+    /// the copper 0.70 mm.
+    #[test]
+    fn tie_distance_is_measured_between_the_true_pad_shapes() {
+        let round = |r: &str, x: f64, y: f64| format!("(footprint \"X\" (layer \"F.Cu\") (at {x} {y}) (property \"Reference\" \"{r}\") (pad \"1\" smd circle (at 0 0) (size 1 1) (layers \"F.Cu\") (net \"V\")))");
+        let tree = board(LAYERS4, &format!("{} {}", round("U1", 10.0, 10.0), round("C1", 11.2, 11.2)));
+        let mut i = intent();
+        i.ties.push(Tie { part: "C1".into(), to: "U1".into(), max_mm: Some(0.5), ..Default::default() });
+        let t = check_board(&tree, &i).into_iter().find(|c| c.kind == "tie").unwrap();
+        assert_eq!(t.status, "fail", "{t:?}");
+        let d = t.measured["distance_mm"].as_f64().unwrap();
+        assert!((d - (1.2_f64.hypot(1.2) - 1.0)).abs() < 0.01, "{d}");
     }
 }

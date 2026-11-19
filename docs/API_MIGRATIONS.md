@@ -2522,3 +2522,20 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
 - **`export_specctra_dsn`.** Adds `kept_for_partial_planes` (fully fanned plane nets kept in the job because their solid-plane pour does not lie under every via and through-hole pad) and a warning. `left_to_planes` no longer lists those nets. The refusal for a renamed copper layer has a longer message.
 - **Graph (internal).** `net_graph` joins overlapping track nodes with `Track` edges as long as their distance; path lengths over such joins grow by that distance.
 
+
+## Unreleased (fork): Tier 1 third-review fixes
+
+- **`tie_path`, `crystal`.** `budget_pf` (0.5 pF) is compared with the whole node: Σ C′·len over every track of the net plus 0.4 pF per via of the net. A short path with a stub left beside it now fails. Legs add `net_capacitance_pf`, `net_track_mm`, `net_vias`, `net_unmodelled_mm`; `est_capacitance_pf` is still the path's share. `required.sources.budget_pf` says so.
+- **`tie_path`, verdict.** A failure is `unverified` only when the exceeded limit is on a net whose zone was not measured; the loop total still fails when the other legs alone exceed the budget. An inner pour that a via of the net drops into but no measured leg uses now counts as unmeasured. `plane_leg` tries every plane layer, so some legs that were track-only or unmeasured are now measured through the plane.
+- **`tie` and `plan_tie_placement`.** Distances are pad edge to pad edge by the true pad outline (circle, oval, roundrect), not the bounding rectangle: round and oval pads measure farther apart than before.
+- **`plane_connection`.**
+  - A via or track end whose copper overlaps a pad joins it (no track needed): pads that were `unverified` "not connected", or failed `long_stub` / `daisy_chain`, can now pass.
+  - A way down landing on a plane zone with no fill in the file, or only on a smaller piece of the fill than its main piece, gives `unverified` instead of `pass`. Refill zones and save before checking.
+  - New `connection: "pour_island"` (`fail`): a pad whose pour is the net's only plane layer touches only an isolated piece of it. `measured.pour.on_main_piece_or_joined` is new for such pads.
+  - Ways down are assigned by a matching, so fewer pads report `shared_via` / `via_shared_with`.
+  - `switching_hot_loop`: `plane_vias_at_pgnd` counts vias landing on a main fill only; `vias[]` adds `on_main_fill`; enough vias only counting the others is `excepted_unverified`.
+- **`plane` check.** A plane net with no inner pour (two-layer board) is judged on its outer pour's pieces: more than one piece is `unverified`. `measured.judged_layers` is new.
+- **`plane_connection_summary`.** `worst_failing[]` includes `excepted_fail` pads and each entry has `status`.
+- **`export_specctra_dsn`.** A fully fanned plane net leaves the job only when its solid-plane fill joins every via (within its layer span) and through-hole pad into one connected piece; a split plane keeps the net in the job (`kept_for_partial_planes`).
+- **KiCad ≤ 9 boards.** Zones written `(net 3) (net_name "GND")` and arcs written `(net 3)` are now read by the design-intent checks and the Specctra plane test (they were skipped).
+- **`route_specctra_dsn`.** `routing.final_score_estimated` is new: `true` when Freerouting's log had no stage-completed line and the counts are the last pass's; the warning says so.

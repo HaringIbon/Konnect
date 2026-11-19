@@ -568,7 +568,8 @@ fn split_by_plane_layer(
 }
 
 /// Whether the filled copper of `net` on a solid plane layer (inner, not
-/// `mixed`) reaches every via and every through-hole pad of the net.
+/// `mixed`) joins every via and every through-hole pad of the net into one
+/// connected piece.
 ///
 /// A net leaves the routing job only because its plane joins all its
 /// fan-out vias. A partial pour (a +5V island on a layer that is mostly
@@ -576,16 +577,35 @@ fn split_by_plane_layer(
 /// vias inside it, so such a net must stay in the job. The pour is read by
 /// its `filled_polygon`s, so clearances, voids and islands count; a pour
 /// with no fill in the file keeps the net in the job (refill, then export).
+///
+/// A plane split into pieces is one conductor only where something joins
+/// the pieces, and a net dropped from the job gets nothing routed between
+/// them. Pieces are joined when they touch on one layer, or when one drop
+/// (a via within its layer span, a through-hole pad on every layer) reaches
+/// both; every drop must then reach the same joined piece.
 fn solid_plane_reaches_every_drop(board: &SexpNode, net: &str, mixed: &BTreeSet<String>) -> bool {
+    use crate::tools::fanout::polygon_distance;
     let solid_layer = |layer: &str| layer.starts_with("In") && layer.ends_with(".Cu") && !mixed.contains(layer);
+    // Stack order by name: F.Cu, In1.Cu … InN.Cu, B.Cu (KiCad's copper order
+    // in every format, whatever the numeric layer ids).
+    let order = |layer: &str| -> Option<u32> {
+        match layer {
+            "F.Cu" => Some(0),
+            "B.Cu" => Some(u32::MAX),
+            _ => layer.strip_prefix("In")?.strip_suffix(".Cu")?.parse().ok(),
+        }
+    };
+    let table = konnect_sexp::board::net_table(board);
     let mut zone_nodes: Vec<&SexpNode> = board.find_all("zone");
     for footprint in konnect_sexp::board::footprints(board) {
         zone_nodes.extend(footprint.find_all("zone"));
     }
-    let mut fills: Vec<Vec<(f64, f64)>> = Vec::new();
+    // (layer, fill outline) per filled piece.
+    let mut fills: Vec<(String, Vec<(f64, f64)>)> = Vec::new();
     let mut unfilled = false;
     for zone in zone_nodes {
-        if zone.find("net").and_then(konnect_sexp::net::net_name) != Some(net) {
+        // `(net "GND")` (KiCad 10) or `(net 3) (net_name "GND")` (KiCad ≤ 9).
+        if table.item_net(zone).as_deref() != Some(net) {
             continue;
         }
         let layers: Vec<&str> = ["layers", "layer"]
@@ -598,13 +618,13 @@ fn solid_plane_reaches_every_drop(board: &SexpNode, net: &str, mixed: &BTreeSet<
         }
         let mut found = false;
         for fill in zone.find_all("filled_polygon") {
-            if fill.find_str("layer").is_some_and(solid_layer) {
+            if let Some(layer) = fill.find_str("layer").filter(|l| solid_layer(l)) {
                 let points: Vec<(f64, f64)> = fill
                     .find("pts")
                     .map(|pts| pts.find_all("xy").iter().filter_map(|xy| Some((xy.get_f64(1)?, xy.get_f64(2)?))).collect())
                     .unwrap_or_default();
                 if points.len() >= 3 {
-                    fills.push(points);
+                    fills.push((layer.to_string(), points));
                     found = true;
                 }
             }
@@ -614,13 +634,58 @@ fn solid_plane_reaches_every_drop(board: &SexpNode, net: &str, mixed: &BTreeSet<
     if unfilled || fills.is_empty() {
         return false;
     }
-    // The fill reaches a drop of radius `r` at `p` (KiCad joins a via whose
-    // copper the fill touches; vias are solid-connected).
-    let reaches = |p: (f64, f64), r: f64| fills.iter().any(|f| crate::tools::fanout::polygon_distance(&[p, p, p], f) <= r + 1e-6);
-    let vias = konnect_sexp::board::vias(board).items;
-    let pads = crate::tools::fanout::copper_pads(board);
-    vias.iter().filter(|via| via.net.as_deref() == Some(net)).all(|via| reaches((via.x, via.y), via.size / 2.0))
-        && pads.iter().filter(|pad| !pad.smd && pad.net.as_deref() == Some(net)).all(|pad| fills.iter().any(|f| crate::tools::fanout::polygon_distance(&pad.outline, f) <= 0.01))
+    // Union-find over the pieces.
+    let mut parent: Vec<usize> = (0..fills.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let join = |parent: &mut Vec<usize>, a: usize, b: usize| {
+        let (ra, rb) = (root(parent, a), root(parent, b));
+        parent[ra] = rb;
+    };
+    for a in 0..fills.len() {
+        for b in a + 1..fills.len() {
+            if fills[a].0 == fills[b].0 && polygon_distance(&fills[a].1, &fills[b].1) <= 1e-6 {
+                join(&mut parent, a, b);
+            }
+        }
+    }
+    // Per drop, the pieces it reaches (KiCad joins a via whose copper the
+    // fill touches on a layer the via spans; vias are solid-connected).
+    let mut drops: Vec<Vec<usize>> = Vec::new();
+    for via in konnect_sexp::board::vias(board).items.iter().filter(|v| v.net.as_deref() == Some(net)) {
+        let span: Vec<u32> = via.layers.iter().filter_map(|l| order(l)).collect();
+        let (lo, hi) = (span.iter().min().copied().unwrap_or(1), span.iter().max().copied().unwrap_or(0));
+        let p = (via.x, via.y);
+        drops.push(
+            fills
+                .iter()
+                .enumerate()
+                .filter(|(_, (layer, f))| order(layer).is_some_and(|i| i >= lo && i <= hi) && polygon_distance(&[p, p, p], f) <= via.size / 2.0 + 1e-6)
+                .map(|(k, _)| k)
+                .collect(),
+        );
+    }
+    for pad in crate::tools::fanout::copper_pads(board).iter().filter(|pad| !pad.smd && pad.net.as_deref() == Some(net)) {
+        drops.push(fills.iter().enumerate().filter(|(_, (_, f))| polygon_distance(&pad.outline, f) <= 0.01).map(|(k, _)| k).collect());
+    }
+    if drops.iter().any(Vec::is_empty) {
+        return false;
+    }
+    for touched in &drops {
+        for pair in touched.windows(2) {
+            join(&mut parent, pair[0], pair[1]);
+        }
+    }
+    let mut roots = drops.iter().map(|touched| root(&mut parent, touched[0]));
+    match roots.next() {
+        Some(first) => roots.all(|r| r == first),
+        None => true,
+    }
 }
 
 /// Remove nets from a DSN: their `(net …)` in the network, their names in
@@ -1267,6 +1332,40 @@ mod round_trip_tests {
         assert_eq!(partial.kept_for_partial_planes, vec!["+3V3"]);
         let root = super::super::parse_dsn_sexp(&partial.bundle.dsn).unwrap();
         assert!(root.find("network").unwrap().find_all("net").iter().any(|net| net.get(1).and_then(SexpNode::as_str) == Some("+3V3")));
+    }
+
+    /// Review 3 #8/#9: every drop must reach one joined piece of the solid
+    /// plane, within the via's layer span; KiCad ≤ 9 zones count too.
+    #[test]
+    fn a_split_plane_or_a_via_that_stops_short_keeps_the_net_in_the_job() {
+        let synthetic = |body: &str| {
+            konnect_sexp::parse_sexp(&format!(
+                "(kicad_pcb (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" power) (6 \"In2.Cu\" power) (2 \"B.Cu\" signal))
+                  (via (at 5 5) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"+5V\"))
+                  (via (at 30 5) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"+5V\"))
+                  {body})"
+            ))
+            .unwrap()
+        };
+        let none = BTreeSet::new();
+        let piece = |layer: &str, x0: f64, x1: f64| format!("(filled_polygon (layer \"{layer}\") (pts (xy {x0} 0) (xy {x1} 0) (xy {x1} 10) (xy {x0} 10)))");
+        // In1 split in two halves, one via in each: nothing joins them.
+        let split = format!("(zone (net \"+5V\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 40 0) (xy 40 10) (xy 0 10))) {} {})", piece("In1.Cu", 0.0, 10.0), piece("In1.Cu", 20.0, 40.0));
+        assert!(!super::solid_plane_reaches_every_drop(&synthetic(&split), "+5V", &none));
+        // A third via reaching both halves through In2's whole plane joins them.
+        let joined = format!("{split} (zone (net \"+5V\") (layers \"In2.Cu\") (polygon (pts (xy 0 0) (xy 40 0) (xy 40 10) (xy 0 10))) {})", piece("In2.Cu", 0.0, 40.0));
+        assert!(super::solid_plane_reaches_every_drop(&synthetic(&joined), "+5V", &none));
+        // Touching halves on one layer are one piece.
+        let touching = format!("(zone (net \"+5V\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 40 0) (xy 40 10) (xy 0 10))) {} {})", piece("In1.Cu", 0.0, 20.0), piece("In1.Cu", 20.0, 40.0));
+        assert!(super::solid_plane_reaches_every_drop(&synthetic(&touching), "+5V", &none));
+        // A blind via F.Cu–In1 does not reach a plane on In2.
+        let whole2 = format!("(zone (net \"+5V\") (layers \"In2.Cu\") (polygon (pts (xy 0 0) (xy 40 0) (xy 40 10) (xy 0 10))) {})", piece("In2.Cu", 0.0, 40.0));
+        assert!(super::solid_plane_reaches_every_drop(&synthetic(&whole2), "+5V", &none));
+        let blind = format!("{whole2} (via (at 15 5) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"In1.Cu\") (net \"+5V\"))");
+        assert!(!super::solid_plane_reaches_every_drop(&synthetic(&blind), "+5V", &none));
+        // KiCad ≤ 9: `(net 3) (net_name "+5V")` on the zone.
+        let old = whole2.replace("(net \"+5V\")", "(net 3) (net_name \"+5V\")");
+        assert!(super::solid_plane_reaches_every_drop(&synthetic(&old), "+5V", &none));
     }
 
     /// The fixture with the outline and fill of every `+3V3` zone replaced
