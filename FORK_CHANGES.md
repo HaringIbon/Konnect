@@ -1146,3 +1146,57 @@ Code: `design_intent.rs`, `specctra/native.rs` (`solid_plane_reaches_every_drop`
 - The undo history holds one entry per round. The last one ("Import Freerouting SES (k of n nets)") removes the import.
 - No orchestrating tool: export → route → apply is still three calls (`route_specctra_dsn` sits in another toolset).
 - There is no `undo` tool, so a rip-up that made things worse (VBUS on the demo) needs the earlier copper re-imported or a checkpoint.
+
+### Review fixes (independent Opus review of e118255)
+
+Rebased by merging `safe-writes` 78bb158 (Pass 21); this pass was renumbered from 20 to 22. Some behaviour described above changed, as follows.
+
+| # | Finding | Fix | Test (fails on e118255) |
+|---|---|---|---|
+| 1 | `rip_up_nets(footprints)` took every net on the part's pads board-wide, GND and +3V3 included, against the plane-pad-via rule | A walk from the part's pads over its own copper (`walk_from_footprint`). It stops at other parts' pads. On a plane net (a zone, or intent role `plane`) it also stops at a via and where the copper enters the net's fill. Named `nets` still go whole. `footprint_walk` reports each net's walk and its stops | `a_footprint_takes_only_the_copper_connected_to_its_pads` |
+| 2 | Candidate and `.drc.json` were written with bare `?` after the import was accepted | `write_import_outputs`: both are created atomically and last. A failure removes the candidate and rolls the import back | `a_failed_report_write_leaves_no_candidate` |
+| 3 | Half of a pair could be kept | Units kept or dropped whole, from the intent `pair`s, the `.kicad_dru` rules with `skew` / `diff_pair_gap` / `diff_pair_uncoupled` constraints, and `_P`/`_N`, `+`/`-`, `_DP`/`_DN` names. A new `groups` argument adds more. `nets[].decided_by` is `group` for a dropped partner | `a_pair_is_kept_or_dropped_as_a_unit`, `groups_come_from_names_rules_and_intent` |
+| 4 | One unblamable error or one other-net regression rolled every net back | Delta-debugging bisection (below). Budget: 2·units + 8 trials, capped at 64 | `bisection_isolates_…`, `a_fault_that_needs_two_nets_…`, `running_out_of_bisection_trials_or_rounds_fails_the_import` |
+| 5 | Undo history: per-net rounds left import/rollback pairs, and `undo_description` was wrong | Trials now run offline, so there are at most 3 entries (trial import, rollback, re-import). `undo` reports `entries_added`, `last_entry` and a warning, repeated in `next_step`. `undo_description` is the real last label | `the_undo_history_is_described_as_it_is` |
+| 6 | A trial DRC without `unconnected_items` read as all complete | Trial and final DRCs now fail the import instead | (IPC path; the trial bails in `LiveTrial::run`) |
+| 7 | Created KIIDs were paired with nets by position | `created_route_items` decodes each returned item's own net | `created_items_are_read_with_their_own_nets` |
+| 8 | The board-unchanged check came before a multi-second DRC | `import` re-checks `save == before` right before each commit | (IPC path) |
+| 9 | Region selection used only track end points | `Region::touches`: a track or arc by any chord (Liang–Barsky), a via by its centre | `a_track_crossing_the_region_with_both_ends_outside_is_taken` |
+| 10 | A test assertion passed via "revision"; the round loop was not testable | Assertion fixed (same board text, one track unlocked → "not locked"). The loop is now pure (`route_verdict::decide` over a `Trial` trait) and tested with a fake DRC: rounds, the round-limit exit, groups, bisection and its budget. Trials replace live rollbacks between rounds | `a_clean_import_…`, `a_failing_net_is_dropped_…`, `require_complete_drops_partial_nets` |
+| 11 | `net_classes` whose nets were all left to planes was refused as unknown | Classes are read from the DSN before the plane nets leave it. They are reported in `not_in_job`. When nothing at all is routable, the refusal names every net with its reason, as it now does for `nets` (it gave a bare count) | `a_class_left_entirely_to_planes_names_its_nets_and_why` |
+
+**How `per_net` works now:**
+1. The whole session is imported in one commit (the board-unchanged check runs right before it).
+2. Every trial is an offline DRC of that board's text, with the other nets' created items cut out by KIID (`without_items`, which refuses unless it finds every KIID). Trials never touch the live board or its undo history.
+3. `decide` runs rounds of: one trial of all remaining units. On a fault no net can be blamed for, it bisects and drops the units that bring the fault. Otherwise it judges each net and drops failing units whole.
+4. Bisection trials each half with a context. When neither half shows the fault, the fault needs both (two routes that together cut a pour into an island). The second half is then searched again with the first half added to the context, so only its part of the pair is dropped.
+5. If anything was rejected: one compensating deletion (proved byte-identical to before), one re-import of the kept nets, and a DRC check that the re-import has no more errors than its trial.
+
+**Live** (KiCad 10.0.8, Freerouting 2.3.0, a fresh copy of `stm32_nrf_module`):
+- **Fix 1, dry runs comparing a footprint walk against ripping its nets whole.** The walks stopped at plane vias and other pads, as listed below.
+
+  | Footprint | Walk | Nets whole | GND | +3V3 |
+  |---|---|---|---|---|
+  | U1 | 175 items | 334 | 8 against 74 (4 plane vias) | 35 against 125 (7 plane vias, 1 other pad) |
+  | U4 | 81 | 266 | 10 against 74 | 7 against 125 |
+  | C8 (decoupling cap) | 9 | 199 | | |
+
+- **Fix 4, the reviewer's case.**
+  - Setup: every unlocked track ripped up (327 items), then full-board GND pours added on F.Cu and B.Cu, which Freerouting does not see.
+  - Whole-board autoroute: route 136 s, 23 nets with routes.
+  - On e118255's logic every net would have been rolled back. The first run here, with the old 12-trial cap, ran out and rolled back. That is why the budget is now 2·n + 8.
+  - With the budget alone, the first bisection version dropped a whole half (14 nets rejected) for an island that only two routes make together. That is why the delta-debugging context was added.
+  - Final run, apply 45 s:
+    - 25 trial DRCs, 3 rounds; 19 nets kept (18 complete).
+    - 4 rejected by bisection, each with its starved-thermal error: /LDO_EN, /NRF_IRQ, /NRF_RESET, and VBUS ("together with other kept nets").
+    - Undo: 3 entries, last "Import Freerouting SES (19 of 23 nets)", with the warning.
+  - Between the runs, `rip_up_nets` on the 9 nets imported in the second run restored the board exactly: the manifest's revision hash matched again.
+
+**Tests:**
+- `konnect-core --lib`: 1954 passed, 0 failed (1935 after the merge).
+- Workspace: 2657 passed, 1 failed (the environmental `conformance_test` pin-label test).
+- `doc_tool_counts`: 6/6.
+
+**Not done:**
+- No unit test for fixes 6 and 8: they are in the IPC closure, and no IPC fake exists.
+- The offline trials assume KiCad's DRC on the text equals the live board. The re-import's own DRC is the check on that.

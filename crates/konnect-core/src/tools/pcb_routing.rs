@@ -302,7 +302,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC (project rules, zones refilled) against the board before the import. accept 'all' (default) keeps every route or none: any new DRC error by identity rolls everything back. accept 'per_net' judges each net on KiCad's DRC of the board, not the router's log: a net is kept when its routes add no DRC error and join something (fewer unconnected items, or none left); the rest are dropped and the kept ones re-imported in one commit. Every response lists nets[] (status imported/rejected/no_routes, reason, tracks, vias, session and board length, unconnected before/after, complete, new_drc_errors) and unconnected_by_net for the whole board.",
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC (project rules, zones refilled) against the board before the import. accept 'all' (default) keeps every route or none: any new DRC error by identity rolls everything back. accept 'per_net' judges each net on KiCad's DRC of the board, not the router's log: a net is kept when its routes add no DRC error and join something (fewer unconnected items, or none left). Pairs and skew groups are kept or dropped whole. Trials run offline on the imported board's text; an error no net is named in, or another net cut open, is traced to its nets by bisection. The rejected nets' copper is then removed and the kept nets re-imported in one commit; the response's undo block says what Ctrl-Z would do. Every response lists nets[] (status imported/rejected/no_routes, reason, tracks, vias, session and board length, unconnected before/after, complete, new_drc_errors) and unconnected_by_net for the whole board.",
             json!({
                 "type": "object",
                 "properties": {
@@ -312,7 +312,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced." },
                     "accept": { "type": "string", "enum": ["all", "per_net"], "default": "all", "description": "'all': all routes or none. 'per_net': keep each net that adds no DRC error and joins something" },
                     "require_complete": { "type": "boolean", "default": false, "description": "With accept 'per_net', also drop nets left with unconnected items (no partial routes)" },
-                    "nets": { "type": "array", "items": { "type": "string" }, "description": "Import only these nets' routes (each must be in the routing job)" }
+                    "nets": { "type": "array", "items": { "type": "string" }, "description": "Import only these nets' routes (each must be in the routing job)" },
+                    "groups": { "type": "array", "items": { "type": "array", "items": { "type": "string" } }, "description": "With accept 'per_net': nets kept or dropped together, beyond the pairs and skew groups found in the design intent, the .kicad_dru and _P/_N or +/- names" }
                 },
                 "required": ["board", "ses_path", "manifest_path", "candidate_output_path"]
             }),
@@ -1259,6 +1260,9 @@ pub(crate) struct CopperRecord {
     #[serde(skip)]
     pub points: Vec<(f64, f64)>,
     pub length_mm: f64,
+    /// Track width, or a via's diameter (mm), from the board file.
+    #[serde(skip)]
+    pub width_mm: f64,
 }
 
 /// A rectangle in board mm, corners in any order.
@@ -1276,10 +1280,47 @@ impl Region {
         let (ya, yb) = (self.y0.min(self.y1), self.y0.max(self.y1));
         (xa..=xb).contains(&x) && (ya..=yb).contains(&y)
     }
+
+    /// Whether the segment `a`–`b` has any point in the rectangle
+    /// (Liang–Barsky clipping), so a track crossing it with both ends
+    /// outside counts.
+    fn meets_segment(&self, a: (f64, f64), b: (f64, f64)) -> bool {
+        let (xa, xb) = (self.x0.min(self.x1), self.x0.max(self.x1));
+        let (ya, yb) = (self.y0.min(self.y1), self.y0.max(self.y1));
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let (mut t0, mut t1) = (0.0f64, 1.0f64);
+        for (p, q) in [(-dx, a.0 - xa), (dx, xb - a.0), (-dy, a.1 - ya), (dy, yb - a.1)] {
+            if p == 0.0 {
+                if q < 0.0 {
+                    return false;
+                }
+            } else {
+                let t = q / p;
+                if p < 0.0 {
+                    t0 = t0.max(t);
+                } else {
+                    t1 = t1.min(t);
+                }
+                if t0 > t1 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// A via by its centre; a track or arc (by its chords) when any part of
+    /// it lies in the rectangle.
+    fn touches(&self, item: &CopperRecord) -> bool {
+        match item.points.as_slice() {
+            [p] => self.contains(*p),
+            points => points.windows(2).any(|w| self.meets_segment(w[0], w[1])),
+        }
+    }
 }
 
-/// The items of `nets` to rip up: inside `region` when given (any placing
-/// point inside, so a track crossing into the region goes whole), locked ones
+/// The items of `nets` to rip up: touching `region` when given (a via by its
+/// centre, a track or arc by any part of it; the item goes whole), locked ones
 /// only with `include_locked`. Returns the selection and the locked items it
 /// left. Pure, so it is tested without KiCad.
 pub(crate) fn select_rip_up(
@@ -1289,7 +1330,7 @@ pub(crate) fn select_rip_up(
     include_locked: bool,
 ) -> (Vec<CopperRecord>, Vec<CopperRecord>) {
     let in_scope = |item: &&CopperRecord| {
-        nets.contains(&item.net) && region.is_none_or(|r| item.points.iter().any(|p| r.contains(*p)))
+        nets.contains(&item.net) && region.is_none_or(|r| r.touches(item))
     };
     let (locked, unlocked): (Vec<CopperRecord>, Vec<CopperRecord>) =
         items.iter().filter(in_scope).cloned().partition(|item| item.locked);
@@ -1326,6 +1367,7 @@ fn copper_records(items: &[prost_types::Any]) -> anyhow::Result<Vec<CopperRecord
                 locked: locked(t.locked),
                 points: vec![a, b],
                 length_mm: (b.0 - a.0).hypot(b.1 - a.1),
+                width_mm: t.width.map_or(0.0, |w| konnect_ipc::builders::nm_to_mm(w.value_nm)),
             });
         } else if konnect_ipc::builders::any_is(item, "kiapi.board.types.Arc") {
             let t = Arc::decode(item.value.as_slice())?;
@@ -1338,6 +1380,7 @@ fn copper_records(items: &[prost_types::Any]) -> anyhow::Result<Vec<CopperRecord
                 locked: locked(t.locked),
                 points: vec![a, m, b],
                 length_mm: (m.0 - a.0).hypot(m.1 - a.1) + (b.0 - m.0).hypot(b.1 - m.1),
+                width_mm: t.width.map_or(0.0, |w| konnect_ipc::builders::nm_to_mm(w.value_nm)),
             });
         } else if konnect_ipc::builders::any_is(item, "kiapi.board.types.Via") {
             let v = Via::decode(item.value.as_slice())?;
@@ -1350,6 +1393,8 @@ fn copper_records(items: &[prost_types::Any]) -> anyhow::Result<Vec<CopperRecord
                 locked: locked(v.locked),
                 points: vec![p],
                 length_mm: 0.0,
+                // The pad stack's diameter is filled in from the board file.
+                width_mm: 0.0,
             });
         }
     }
@@ -1376,6 +1421,229 @@ fn rip_up_summary(items: &[CopperRecord]) -> serde_json::Value {
             })
             .collect(),
     )
+}
+
+/// A pad as the footprint walk sees it.
+#[derive(Debug, Clone)]
+pub(crate) struct WalkPad {
+    pub reference: String,
+    pub net: Option<String>,
+    pub outline: Vec<(f64, f64)>,
+    /// The copper layer of a surface-mount pad; `None` for a plated hole,
+    /// which is on every layer.
+    pub layer: Option<String>,
+}
+
+/// One net's filled zone copper on one layer.
+#[derive(Debug, Clone)]
+pub(crate) struct ZoneFill {
+    pub net: String,
+    pub layer: String,
+    pub polygon: Vec<(f64, f64)>,
+}
+
+/// What the walk from one footprint found on one net.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) struct WalkReport {
+    pub footprint: String,
+    pub net: String,
+    /// A net with a zone or the intent role `plane`: only the footprint's own
+    /// fan-out goes (the walk stops at its vias and at the pour).
+    pub plane_net: bool,
+    pub items: usize,
+    /// Where the walk stopped, and how often: `other_pad`, `plane_via`, `zone`.
+    pub stopped_at: BTreeMap<&'static str, usize>,
+}
+
+fn point_segment_mm(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 == 0.0 { 0.0 } else { (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0) };
+    (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
+}
+
+/// Whether copper of half-width `reach` at `p` on `layer` (`None`: every
+/// layer, a via) touches `item`.
+fn reaches_item(p: (f64, f64), reach: f64, layer: Option<&str>, item: &CopperRecord) -> bool {
+    let tolerance = 1e-3;
+    if item.kind == "via" {
+        return (p.0 - item.points[0].0).hypot(p.1 - item.points[0].1) <= reach + item.width_mm / 2.0 + tolerance;
+    }
+    if layer.is_some_and(|l| item.layer.as_deref() != Some(l)) {
+        return false;
+    }
+    item.points.windows(2).any(|w| point_segment_mm(p, w[0], w[1]) <= reach + item.width_mm / 2.0 + tolerance)
+}
+
+fn reaches_pad(p: (f64, f64), reach: f64, layer: Option<&str>, pad: &WalkPad) -> bool {
+    let shared = match (layer, pad.layer.as_deref()) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    };
+    shared && crate::tools::fanout::polygon_distance(&[p, p, p], &pad.outline) <= reach + 1e-3
+}
+
+/// The points where an item meets other copper: a track's or arc's ends, a
+/// via's centre.
+fn node_points(item: &CopperRecord) -> Vec<(f64, f64)> {
+    match item.points.as_slice() {
+        [p] => vec![*p],
+        points => vec![points[0], points[points.len() - 1]],
+    }
+}
+
+/// The copper connected to `reference`'s pads, net by net: a walk outward
+/// from its pads that stops at another footprint's pad, and on a plane net
+/// (`plane_nets`: a zone or the intent role `plane`) also at a via and where
+/// the copper enters the net's filled zone. So a moved part takes its own
+/// stubs, fan-out and the tracks up to the next pad with it, never a plane
+/// net's other copper. Pure, for tests.
+pub(crate) fn walk_from_footprint(
+    reference: &str,
+    items: &[CopperRecord],
+    pads: &[WalkPad],
+    fills: &[ZoneFill],
+    plane_nets: &BTreeSet<String>,
+) -> (BTreeSet<String>, Vec<WalkReport>) {
+    let own: Vec<&WalkPad> = pads.iter().filter(|pad| pad.reference == reference).collect();
+    let nets: BTreeSet<&str> = own.iter().filter_map(|pad| pad.net.as_deref()).collect();
+    let mut selected = BTreeSet::new();
+    let mut reports = Vec::new();
+    for net in nets {
+        let plane = plane_nets.contains(net);
+        let on_net: Vec<&CopperRecord> = items.iter().filter(|item| item.net == net).collect();
+        let others: Vec<&WalkPad> = pads.iter().filter(|pad| pad.reference != reference && pad.net.as_deref() == Some(net)).collect();
+        let own_pads: Vec<&&WalkPad> = own.iter().filter(|pad| pad.net.as_deref() == Some(net)).collect();
+        let layer_of = |item: &CopperRecord| if item.kind == "via" { None } else { item.layer.clone() };
+        let mut visited = vec![false; on_net.len()];
+        let mut queue = std::collections::VecDeque::new();
+        for (i, item) in on_net.iter().enumerate() {
+            let layer = layer_of(item);
+            if node_points(item).iter().any(|p| own_pads.iter().any(|pad| reaches_pad(*p, item.width_mm / 2.0, layer.as_deref(), pad))) {
+                visited[i] = true;
+                queue.push_back(i);
+            }
+        }
+        let mut stops: BTreeMap<&'static str, usize> = BTreeMap::new();
+        while let Some(i) = queue.pop_front() {
+            let item = on_net[i];
+            let layer = layer_of(item);
+            if plane && item.kind == "via" {
+                *stops.entry("plane_via").or_default() += 1;
+                continue;
+            }
+            // Where the walk may not go on from: another part's pad, and on
+            // a plane net the pour.
+            let stop_at = |p: (f64, f64), reach: f64, layer: Option<&str>| -> Option<&'static str> {
+                if others.iter().any(|pad| reaches_pad(p, reach, layer, pad)) {
+                    Some("other_pad")
+                } else if plane
+                    && fills.iter().any(|fill| {
+                        fill.net == net
+                            && layer.is_none_or(|l| l == fill.layer)
+                            && crate::tools::fanout::point_in_polygon(p, &fill.polygon)
+                    })
+                {
+                    Some("zone")
+                } else {
+                    None
+                }
+            };
+            let reach = item.width_mm / 2.0;
+            for p in node_points(item) {
+                if let Some(stop) = stop_at(p, reach, layer.as_deref()) {
+                    *stops.entry(stop).or_default() += 1;
+                    continue;
+                }
+                for (j, next) in on_net.iter().enumerate() {
+                    if !visited[j] && reaches_item(p, reach, layer.as_deref(), next) {
+                        visited[j] = true;
+                        queue.push_back(j);
+                    }
+                }
+            }
+            // A track that ends on this one's body (a tee), away from a stop.
+            for (j, next) in on_net.iter().enumerate() {
+                if visited[j] {
+                    continue;
+                }
+                let next_layer = layer_of(next);
+                let tee = node_points(next).into_iter().any(|q| {
+                    reaches_item(q, next.width_mm / 2.0, next_layer.as_deref(), item)
+                        && stop_at(q, next.width_mm / 2.0, next_layer.as_deref()).is_none()
+                        && !node_points(item).iter().any(|p| (p.0 - q.0).hypot(p.1 - q.1) <= reach + next.width_mm / 2.0)
+                });
+                if tee {
+                    visited[j] = true;
+                    queue.push_back(j);
+                }
+            }
+        }
+        let found: Vec<&CopperRecord> = on_net.iter().zip(&visited).filter(|(_, v)| **v).map(|(item, _)| *item).collect();
+        selected.extend(found.iter().map(|item| item.uuid.clone()));
+        reports.push(WalkReport {
+            footprint: reference.to_string(),
+            net: net.to_string(),
+            plane_net: plane,
+            items: found.len(),
+            stopped_at: stops,
+        });
+    }
+    (selected, reports)
+}
+
+/// Pads, zone fills and plane nets for the footprint walk, from the board
+/// text (and the design intent's `plane` roles beside it).
+fn walk_context(tree: &konnect_sexp::SexpNode, board: &Path) -> (Vec<WalkPad>, Vec<ZoneFill>, BTreeSet<String>) {
+    let pads = crate::tools::fanout::copper_pads(tree)
+        .into_iter()
+        .map(|pad| WalkPad {
+            reference: pad.reference,
+            net: pad.net,
+            outline: pad.outline,
+            layer: pad.smd.then(|| pad.layer.to_string()),
+        })
+        .collect();
+    let mut fills = Vec::new();
+    let mut plane_nets = BTreeSet::new();
+    for zone in tree.find_all("zone") {
+        let Some(net) = zone.find("net").and_then(konnect_sexp::net::net_name).filter(|n| !n.is_empty()) else { continue };
+        plane_nets.insert(net.to_string());
+        for fill in zone.find_all("filled_polygon") {
+            let points: Vec<(f64, f64)> = fill
+                .find("pts")
+                .map(|pts| pts.find_all("xy").iter().filter_map(|xy| Some((xy.get_f64(1)?, xy.get_f64(2)?))).collect())
+                .unwrap_or_default();
+            if let (Some(layer), true) = (fill.find_str("layer"), points.len() >= 3) {
+                fills.push(ZoneFill { net: net.to_string(), layer: layer.to_string(), polygon: points });
+            }
+        }
+    }
+    let intent = std::fs::read_to_string(format!("{}.intent.json", board.with_extension("").display()))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    if let Some(nets) = intent.as_ref().and_then(|i| i["nets"].as_object()) {
+        plane_nets.extend(nets.iter().filter(|(_, spec)| spec["role"] == "plane").map(|(net, _)| net.clone()));
+    }
+    (pads, fills, plane_nets)
+}
+
+/// Item widths (tracks, arcs) and via diameters by KIID, from the board text.
+fn copper_widths(tree: &konnect_sexp::SexpNode) -> std::collections::HashMap<String, f64> {
+    let mut out = std::collections::HashMap::new();
+    for kind in ["segment", "arc"] {
+        for node in tree.find_all(kind) {
+            if let (Some(uuid), Some(width)) = (node.find_str("uuid"), node.find("width").and_then(|w| w.get_f64(1))) {
+                out.insert(uuid.to_string(), width);
+            }
+        }
+    }
+    for via in konnect_sexp::board::vias(tree).items {
+        if let Some(uuid) = via.uuid {
+            out.insert(uuid, via.size);
+        }
+    }
+    out
 }
 
 pub(crate) async fn handle_rip_up_nets(args: &serde_json::Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
@@ -1418,13 +1686,20 @@ pub(crate) async fn handle_rip_up_nets(args: &serde_json::Value, ctx: &ToolConte
     let include_locked = args["include_locked"].as_bool().unwrap_or(false);
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
     let types = [ObjectType::KotPcbTrace, ObjectType::KotPcbArc, ObjectType::KotPcbVia];
+    let board_for_walk = board.clone();
     let result = with_board_ipc_classified(ctx, &board, move |client, document| {
         let source = client.save_document_to_string_in(document.clone())?;
         let tree = konnect_sexp::parse_sexp(&source).context("parse the live board")?;
-        let pads = crate::tools::fanout::copper_pads(&tree);
-        let mut selected_nets: BTreeSet<String> = nets.iter().cloned().collect();
+        let (pads, fills, plane_nets) = walk_context(&tree, &board_for_walk);
+        let widths = copper_widths(&tree);
+        let named_nets: BTreeSet<String> = nets.iter().cloned().collect();
         let board_nets: BTreeSet<&str> = pads.iter().filter_map(|pad| pad.net.as_deref()).collect();
-        let records = copper_records(&client.get_items_of_types_in(document.clone(), &types)?)?;
+        let mut records = copper_records(&client.get_items_of_types_in(document.clone(), &types)?)?;
+        for record in &mut records {
+            if let Some(width) = widths.get(&record.uuid) {
+                record.width_mm = *width;
+            }
+        }
         let unknown: Vec<&String> = nets
             .iter()
             .filter(|net| !board_nets.contains(net.as_str()) && !records.iter().any(|r| &&r.net == net))
@@ -1432,16 +1707,36 @@ pub(crate) async fn handle_rip_up_nets(args: &serde_json::Value, ctx: &ToolConte
         if !unknown.is_empty() {
             anyhow::bail!("net(s) {} are not on the board", unknown.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", "));
         }
+        // Named nets go whole (inside the region); a footprint takes only the
+        // copper connected to its pads.
+        let (mut selected, mut kept_locked) = select_rip_up(&records, &named_nets, region, include_locked);
+        let mut walks = Vec::new();
         for reference in &footprints {
-            let of_part: Vec<&str> = pads.iter().filter(|pad| &pad.reference == reference).filter_map(|pad| pad.net.as_deref()).collect();
             if !pads.iter().any(|pad| &pad.reference == reference) {
                 anyhow::bail!("footprint '{reference}' has no copper pad on the board");
             }
-            selected_nets.extend(of_part.into_iter().map(str::to_string));
+            let (found, reports) = walk_from_footprint(reference, &records, &pads, &fills, &plane_nets);
+            walks.extend(reports);
+            let walked: Vec<CopperRecord> = records
+                .iter()
+                .filter(|r| found.contains(&r.uuid) && !named_nets.contains(&r.net))
+                .filter(|r| region.is_none_or(|region| region.touches(r)))
+                .cloned()
+                .collect();
+            for record in walked {
+                let pool = if record.locked && !include_locked { &mut kept_locked } else { &mut selected };
+                if !pool.iter().any(|r| r.uuid == record.uuid) {
+                    pool.push(record);
+                }
+            }
         }
-        let (selected, kept_locked) = select_rip_up(&records, &selected_nets, region, include_locked);
+        let selected_nets: BTreeSet<String> = named_nets
+            .iter()
+            .cloned()
+            .chain(walks.iter().map(|w| w.net.clone()))
+            .collect();
         if dry_run || selected.is_empty() {
-            return Ok((selected_nets, selected, kept_locked, false));
+            return Ok((selected_nets, selected, kept_locked, walks, false));
         }
         let ids: Vec<String> = selected.iter().map(|item| item.uuid.clone()).collect();
         if ids.iter().any(String::is_empty) {
@@ -1456,14 +1751,15 @@ pub(crate) async fn handle_rip_up_nets(args: &serde_json::Value, ctx: &ToolConte
         if !left.is_empty() {
             anyhow::bail!("{} item(s) still present after the rip-up: {}", left.len(), left.join(", "));
         }
-        Ok((selected_nets, selected, kept_locked, true))
+        Ok((selected_nets, selected, kept_locked, walks, true))
     })
     .await?;
     match result {
-        Ok((nets, selected, kept_locked, deleted)) => Ok(CallToolResult::json(&json!({
+        Ok((nets, selected, kept_locked, walks, deleted)) => Ok(CallToolResult::json(&json!({
             "dry_run": dry_run,
             "deleted": deleted,
             "nets": nets,
+            "footprint_walk": walks,
             "region": region.map(|r| json!({ "x0": r.x0, "y0": r.y0, "x1": r.x1, "y1": r.y1 })),
             "count": selected.len(),
             "by_net": rip_up_summary(&selected),
@@ -1629,6 +1925,7 @@ mod rip_up_tests {
             locked,
             points: points.to_vec(),
             length_mm: 1.0,
+            width_mm: 0.2,
         }
     }
 
@@ -1676,6 +1973,77 @@ mod rip_up_tests {
     }
 
     #[test]
+    fn a_track_crossing_the_region_with_both_ends_outside_is_taken() {
+        let items = [
+            record("cross", "track", "SDA", false, &[(-5.0, 0.5), (5.0, 0.5)]),
+            record("beside", "track", "SDA", false, &[(-5.0, 3.0), (5.0, 3.0)]),
+            record("via_in", "via", "SDA", false, &[(0.0, 0.0)]),
+            record("arc", "arc", "SDA", false, &[(-3.0, -3.0), (0.0, -0.5), (3.0, -3.0)]),
+        ];
+        let region = Region { x0: -1.0, y0: -1.0, x1: 1.0, y1: 1.0 };
+        let (taken, _) = select_rip_up(&items, &["SDA".to_string()].into(), Some(region), false);
+        assert_eq!(names(&taken), ["cross", "via_in", "arc"]);
+    }
+
+    fn pad(reference: &str, net: &str, (x, y): (f64, f64)) -> WalkPad {
+        WalkPad {
+            reference: reference.into(),
+            net: Some(net.into()),
+            outline: vec![(x - 0.3, y - 0.3), (x + 0.3, y - 0.3), (x + 0.3, y + 0.3), (x - 0.3, y + 0.3)],
+            layer: Some("F.Cu".into()),
+        }
+    }
+
+    fn on(layer: &str, mut item: CopperRecord) -> CopperRecord {
+        item.layer = (item.kind != "via").then(|| layer.to_string());
+        if item.kind == "via" {
+            item.width_mm = 0.6;
+        }
+        item
+    }
+
+    /// The user's rule (plane pads get their own via): moving a part must
+    /// never take GND copper beyond the part's own fan-out.
+    #[test]
+    fn a_footprint_takes_only_the_copper_connected_to_its_pads() {
+        let pads = [
+            pad("U1", "SDA", (0.0, 0.0)),
+            pad("U1", "GND", (0.0, 2.0)),
+            pad("U1", "GND", (0.0, 4.0)),
+            pad("R1", "SDA", (10.0, 0.0)),
+            pad("C1", "GND", (20.0, 2.0)),
+        ];
+        let items = [
+            on("F.Cu", record("s1", "track", "SDA", false, &[(0.0, 0.0), (5.0, 0.0)])),
+            on("F.Cu", record("s2", "track", "SDA", false, &[(5.0, 0.0), (10.0, 0.0)])),
+            on("F.Cu", record("s3", "track", "SDA", false, &[(10.0, 0.0), (15.0, 0.0)])),
+            on("F.Cu", record("g1", "track", "GND", true, &[(0.0, 2.0), (1.0, 3.0)])),
+            on("F.Cu", record("v1", "via", "GND", true, &[(1.0, 3.0)])),
+            on("B.Cu", record("g2", "track", "GND", false, &[(1.0, 3.0), (8.0, 3.0)])),
+            on("F.Cu", record("g3", "track", "GND", false, &[(20.0, 2.0), (25.0, 2.0)])),
+            on("F.Cu", record("g4", "track", "GND", false, &[(0.0, 4.0), (3.0, 4.0)])),
+            on("F.Cu", record("g5", "track", "GND", false, &[(3.0, 4.0), (6.0, 4.0)])),
+            on("F.Cu", record("tee", "track", "SDA", false, &[(2.5, 0.0), (2.5, -3.0)])),
+        ];
+        let fills = [ZoneFill {
+            net: "GND".into(),
+            layer: "F.Cu".into(),
+            polygon: vec![(2.0, 3.5), (7.0, 3.5), (7.0, 4.5), (2.0, 4.5)],
+        }];
+        let planes: BTreeSet<String> = ["GND".to_string()].into();
+        let (found, reports) = walk_from_footprint("U1", &items, &pads, &fills, &planes);
+        assert_eq!(found, ["g1", "g4", "s1", "s2", "tee", "v1"].iter().map(|s| s.to_string()).collect::<BTreeSet<_>>());
+        let gnd = reports.iter().find(|r| r.net == "GND").unwrap();
+        assert!(gnd.plane_net);
+        assert_eq!((gnd.stopped_at.get("plane_via"), gnd.stopped_at.get("zone")), (Some(&1), Some(&1)), "{gnd:?}");
+        let sda = reports.iter().find(|r| r.net == "SDA").unwrap();
+        assert_eq!((sda.items, sda.stopped_at.get("other_pad")), (3, Some(&1)), "{sda:?}");
+        // Without a plane role, GND is walked like a signal: through the via.
+        let (found, _) = walk_from_footprint("U1", &items, &pads, &fills, &BTreeSet::new());
+        assert!(found.contains("g2") && found.contains("g5") && !found.contains("g3"), "{found:?}");
+    }
+
+    #[test]
     fn live_items_become_records_with_lock_state_and_length() {
         let net = Some(Net { name: "SDA".into(), ..Default::default() });
         let track = Track {
@@ -1708,6 +2076,42 @@ mod rip_up_tests {
         assert_eq!(summary[0]["length_mm"], 5.0);
     }
 
+    /// Review finding 2: the outputs are written last and a failure leaves
+    /// no partial file (the caller then rolls the import back).
+    #[test]
+    fn a_failed_report_write_leaves_no_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("c.kicad_pcb");
+        // The report's directory is a file, so it cannot be created.
+        std::fs::write(dir.path().join("blocked"), "x").unwrap();
+        let report = dir.path().join("blocked").join("c.drc.json");
+        assert!(write_import_outputs(&candidate, "(kicad_pcb)", &report, "{}").is_err());
+        assert!(!candidate.exists(), "the candidate is removed again");
+        let report = dir.path().join("c.drc.json");
+        write_import_outputs(&candidate, "(kicad_pcb)", &report, "{}").unwrap();
+        assert!(candidate.exists() && report.exists());
+        assert!(write_import_outputs(&candidate, "(kicad_pcb)", &report, "{}").is_err(), "never replaced");
+    }
+
+    /// Review finding 7: created items carry their own nets; nothing is
+    /// paired with the request by position.
+    #[test]
+    fn created_items_are_read_with_their_own_nets() {
+        let track = |id: &str, net: &str| {
+            konnect_ipc::builders::pack_any(
+                &Track { id: Some(Kiid { value: id.into() }), net: Some(Net { name: net.into(), ..Default::default() }), ..Default::default() },
+                "kiapi.board.types.Track",
+            )
+        };
+        let via = konnect_ipc::builders::pack_any(
+            &Via { id: Some(Kiid { value: "v".into() }), net: Some(Net { name: "GND".into(), ..Default::default() }), ..Default::default() },
+            "kiapi.board.types.Via",
+        );
+        let items = created_route_items(&[track("b", "SCL"), via, track("a", "SDA")]).unwrap();
+        assert_eq!(items, vec![("b".into(), "SCL".into()), ("v".into(), "GND".into()), ("a".into(), "SDA".into())]);
+        assert!(created_route_items(&[track("x", "")]).is_err(), "a created item without a net is refused");
+    }
+
     #[test]
     fn the_ses_net_filter_refuses_empty_and_blank_names() {
         assert_eq!(ses_net_filter(&json!({})).unwrap(), None);
@@ -1731,6 +2135,12 @@ mod rip_up_tests {
         assert!(result.is_error);
         let text = serde_json::to_string(&result).unwrap();
         assert!(text.contains("per_net"), "{text}");
+        let mut grouped = base.clone();
+        grouped["groups"] = json!([["A", "B"]]);
+        assert!(handle_apply_specctra_ses(&grouped, &ctx).await.unwrap().is_error, "groups need per_net");
+        assert_eq!(groups_argument(&json!({ "groups": [["A", "B"], ["C", "D", "E"]] })).unwrap().len(), 2);
+        assert!(groups_argument(&json!({ "groups": [["A"]] })).is_err(), "a group of one");
+        assert!(groups_argument(&json!({ "groups": ["A", "B"] })).is_err());
     }
 
     #[tokio::test]
@@ -2238,6 +2648,16 @@ enum Accept {
 /// in another are rare.
 const MAX_IMPORT_ROUNDS: usize = 4;
 
+/// Trial DRCs bisection may spend isolating a fault no net can be blamed
+/// for. Two per halving find one culprit among n units in about 2·log₂ n;
+/// when many units bring the fault (routes on an outer pour each starving a
+/// thermal) it needs up to 2·n, so the budget is 2·n + 8, capped here.
+const MAX_BISECTION_TRIALS: usize = 64;
+
+fn bisection_budget(units: usize) -> usize {
+    (2 * units + 8).min(MAX_BISECTION_TRIALS)
+}
+
 /// One net's result in an SES import.
 #[derive(Debug, Clone, serde::Serialize)]
 struct NetOutcome {
@@ -2259,6 +2679,10 @@ struct NetOutcome {
     /// No unconnected item left on the net, judged by KiCad's DRC of the
     /// board, never by the router's log.
     complete: Option<bool>,
+    /// For a rejected net: `judged` (its own evidence), `group` (its pair or
+    /// skew group failed) or `bisection`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decided_by: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     new_drc_errors: Vec<crate::tools::route_verdict::ErrorBrief>,
     /// All copper of the net on the board after the import.
@@ -2293,6 +2717,9 @@ struct ApplyEvidence {
     /// Every net still open on the board after the import, from KiCad's DRC.
     unconnected_by_net: BTreeMap<String, usize>,
     rounds: usize,
+    trials: usize,
+    undo: crate::tools::route_verdict::UndoPlan,
+    groups: Vec<serde_json::Value>,
 }
 
 /// DRC of `source` with the project's own rules: KiCad reads the
@@ -2529,14 +2956,114 @@ fn ses_net_filter(args: &serde_json::Value) -> Result<Option<BTreeSet<String>>, 
     Ok(Some(nets))
 }
 
-/// What one import round found.
-struct RoundCheck {
-    candidate_source: String,
-    report: cli::DrcReport,
-    report_json: String,
-    added: usize,
-    blame: crate::tools::route_verdict::Attribution,
-    unconnected: BTreeMap<String, usize>,
+/// The IDs and nets of the route items KiCad created, decoded from each
+/// returned item (not paired with the request by position).
+fn created_route_items(items: &[prost_types::Any]) -> anyhow::Result<Vec<(String, String)>> {
+    use konnect_ipc::gen::kiapi::board::types::{Arc, Track, Via};
+    let ids = created_route_item_ids(items)?;
+    let mut out = Vec::with_capacity(items.len());
+    for (item, id) in items.iter().zip(ids) {
+        let net = if item.type_url.ends_with("kiapi.board.types.Track") {
+            Track::decode(item.value.as_slice())?.net
+        } else if item.type_url.ends_with("kiapi.board.types.Arc") {
+            Arc::decode(item.value.as_slice())?.net
+        } else {
+            Via::decode(item.value.as_slice())?.net
+        }
+        .map(|net| net.name)
+        .filter(|name| !name.is_empty())
+        .with_context(|| format!("KiCad returned created route item {id} without a net"))?;
+        out.push((id, net));
+    }
+    Ok(out)
+}
+
+/// Create the candidate board and its DRC report, each atomically; when the
+/// second fails the first is removed, so a failure leaves neither file.
+fn write_import_outputs(candidate: &Path, board_text: &str, drc_output: &Path, drc_json: &str) -> anyhow::Result<()> {
+    konnect_sexp::write_new_atomic(candidate, board_text)
+        .with_context(|| format!("create candidate {}", candidate.display()))?;
+    if let Err(error) = konnect_sexp::write_new_atomic(drc_output, drc_json) {
+        let _ = std::fs::remove_file(candidate);
+        return Err(anyhow::Error::from(error).context(format!("create {}", drc_output.display())));
+    }
+    Ok(())
+}
+
+/// Units of nets kept or dropped together: the caller's `groups`, the pairs
+/// of the design intent, the pair and skew rules of the `.kicad_dru`, and
+/// `_P`/`_N`, `+`/`-` name pairs.
+fn import_groups(board: &Path, explicit: &[BTreeSet<String>], nets: &BTreeSet<String>) -> Vec<(BTreeSet<String>, &'static str)> {
+    use crate::tools::route_verdict as verdict;
+    let mut groups: Vec<(BTreeSet<String>, &'static str)> = explicit.iter().map(|g| (g.clone(), "groups argument")).collect();
+    let stem = board.with_extension("");
+    if let Ok(text) = std::fs::read_to_string(format!("{}.intent.json", stem.display())) {
+        if let Ok(intent) = serde_json::from_str::<serde_json::Value>(&text) {
+            groups.extend(verdict::intent_pairs(&intent).into_iter().map(|g| (g, "design intent pair")));
+        }
+    }
+    if let Ok(dru) = std::fs::read_to_string(board.with_extension("kicad_dru")) {
+        groups.extend(verdict::dru_groups(&dru).into_iter().map(|g| (g, ".kicad_dru pair or skew rule")));
+    }
+    groups.extend(verdict::name_pairs(nets).into_iter().map(|g| (g, "net names (_P/_N, +/-)")));
+    groups
+}
+
+/// The optional `groups` argument: arrays of net names kept together.
+fn groups_argument(args: &serde_json::Value) -> Result<Vec<BTreeSet<String>>, CallToolResult> {
+    let value = &args["groups"];
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let refuse = || invalid_specctra_argument("groups", "must be an array of arrays of at least two net names");
+    let groups = value.as_array().ok_or_else(refuse)?;
+    groups
+        .iter()
+        .map(|group| {
+            let names: Option<BTreeSet<String>> = group.as_array().and_then(|names| {
+                names.iter().map(|n| n.as_str().filter(|s| !s.trim().is_empty()).map(str::to_string)).collect()
+            });
+            names.filter(|names| names.len() >= 2).ok_or_else(refuse)
+        })
+        .collect()
+}
+
+/// Trials of the import on the imported board's text: the other nets'
+/// created items are left out by KIID and the board is checked with
+/// kicad-cli, so no trial touches the live board or its undo history.
+struct LiveTrial<'a> {
+    full_text: &'a str,
+    created: &'a std::collections::HashMap<String, String>,
+    baseline: &'a cli::DrcReport,
+    before_nets: &'a std::collections::HashMap<String, String>,
+    board: &'a Path,
+    cli_path: &'a str,
+    refill: bool,
+    runtime: &'a tokio::runtime::Handle,
+    /// The last trial: its nets, report and the report's JSON.
+    last: Option<(BTreeSet<String>, cli::DrcReport, String)>,
+}
+
+impl crate::tools::route_verdict::Trial for LiveTrial<'_> {
+    fn run(&mut self, nets: &BTreeSet<String>) -> anyhow::Result<crate::tools::route_verdict::TrialResult> {
+        use crate::tools::route_verdict as verdict;
+        let drop: HashSet<String> =
+            self.created.iter().filter(|(_, net)| !nets.contains(*net)).map(|(id, _)| id.clone()).collect();
+        let text = verdict::without_items(self.full_text, &drop)?;
+        let (report, json) = self.runtime.block_on(drc_with_project_rules(self.cli_path, self.board, &text, self.refill))?;
+        let tree = konnect_sexp::parse_sexp(&text).context("parse the trial board")?;
+        let mut item_nets = self.before_nets.clone();
+        item_nets.extend(verdict::item_nets(&tree));
+        let added = new_drc_errors(self.baseline, &report);
+        let kept: std::collections::HashMap<String, String> =
+            self.created.iter().filter(|(_, net)| nets.contains(*net)).map(|(k, v)| (k.clone(), v.clone())).collect();
+        let blame = verdict::attribute_errors(&added, &kept, nets, &item_nets);
+        let unconnected = verdict::unconnected_by_net(&report, &item_nets).context(
+            "the trial DRC reports no unconnected items, so no net's routing can be verified",
+        )?;
+        self.last = Some((nets.clone(), report, json));
+        Ok(verdict::TrialResult { blame, unconnected })
+    }
 }
 
 async fn handle_apply_specctra_ses(
@@ -2574,6 +3101,13 @@ async fn handle_apply_specctra_ses(
         Ok(filter) => filter,
         Err(refusal) => return Ok(refusal),
     };
+    let explicit_groups = match groups_argument(args) {
+        Ok(groups) => groups,
+        Err(refusal) => return Ok(refusal),
+    };
+    if !explicit_groups.is_empty() && accept == Accept::All {
+        return Ok(invalid_specctra_argument("groups", "applies only with accept 'per_net'"));
+    }
     let drc_output = candidate.with_extension("drc.json");
     let conflicts = [&candidate, &drc_output]
         .into_iter()
@@ -2706,10 +3240,6 @@ async fn handle_apply_specctra_ses(
             );
             items.push((via.net_name.clone(), konnect_ipc::builders::pack_any(&item, "kiapi.board.types.Via")));
         }
-        let stable = client.save_document_to_string_in(document.clone())?;
-        if stable != before {
-            anyhow::bail!("KiCad board changed while route items were prepared; retry from a stable editor revision");
-        }
 
         // The baseline: the board as it is, with the project's rules and
         // zones refilled when it has any.
@@ -2728,10 +3258,50 @@ async fn handle_apply_specctra_ses(
         let unconnected_before = unconnected_before.unwrap_or_default();
         let routes = plan.per_net();
         let routes_of = |net: &str| routes.iter().find(|r| r.net == net);
+        let with_routes: BTreeSet<String> = items.iter().map(|(net, _)| net.clone()).collect();
+        let groups = import_groups(&board_for_ipc, &explicit_groups, &with_routes);
+        let units = verdict::units(&with_routes, &groups.iter().map(|(g, _)| g.clone()).collect::<Vec<_>>());
 
+        let count_of = |nets: &BTreeSet<String>, kind: &str| {
+            items.iter().filter(|(net, item)| nets.contains(net) && item.type_url.ends_with(kind)).count()
+        };
+        // Create the items of `nets` in one commit, after proving the board
+        // is still exactly `before`, and read the counts back.
+        let import = |nets: &BTreeSet<String>, label: &str| -> anyhow::Result<Vec<(String, String)>> {
+            let stable = client.save_document_to_string_in(document.clone())?;
+            if stable != before {
+                anyhow::bail!("KiCad board changed while the import was checked; retry from a stable editor revision");
+            }
+            let subset: Vec<prost_types::Any> =
+                items.iter().filter(|(net, _)| nets.contains(net)).map(|(_, item)| item.clone()).collect();
+            let expected = subset.len();
+            let created = client.run_commit(label, |client| {
+                let created = client.create_items_in_returning(document.clone(), subset)?;
+                if created.len() != expected {
+                    anyhow::bail!("KiCad returned {} created items for {} planned route primitives", created.len(), expected);
+                }
+                created_route_items(&created)
+            })?;
+            Ok(created)
+        };
+        let read_back = |nets: &BTreeSet<String>| -> anyhow::Result<()> {
+            let (tracks, arcs, vias) = (count_of(nets, ".Track"), count_of(nets, ".Arc"), count_of(nets, ".Via"));
+            let read_tracks = client.get_items_in(document.clone(), ObjectType::KotPcbTrace)?.len();
+            let read_arcs = client.get_items_in(document.clone(), ObjectType::KotPcbArc)?.len();
+            let read_vias = client.get_items_in(document.clone(), ObjectType::KotPcbVia)?.len();
+            if read_tracks != plan.locked_track_count + tracks || read_arcs != arcs || read_vias != plan.locked_via_count + vias {
+                anyhow::bail!(
+                    "post-commit IPC read-back mismatch: expected {} tracks/{} arcs/{} vias, read {read_tracks} tracks/{read_arcs} arcs/{read_vias} vias",
+                    plan.locked_track_count + tracks,
+                    arcs,
+                    plan.locked_via_count + vias
+                );
+            }
+            Ok(())
+        };
         // Delete exactly the created KIIDs and prove the board serialises as
         // it did before the import.
-        let rollback = |client: &konnect_ipc::client::KiCadIpcClient, ids: &[String], why: &str| -> anyhow::Result<()> {
+        let rollback = |ids: &[String], why: &str| -> anyhow::Result<()> {
             client
                 .run_commit("Rollback failed Freerouting SES import", |client| {
                     client.delete_items_in(document.clone(), ids.to_vec())
@@ -2744,183 +3314,148 @@ async fn handle_apply_specctra_ses(
             Ok(())
         };
 
-        let mut importing: BTreeSet<String> = items.iter().map(|(net, _)| net.clone()).collect();
-        let mut outcomes: BTreeMap<String, NetOutcome> = BTreeMap::new();
-        let mut rounds = 0;
-        let mut accepted: Option<(Vec<String>, RoundCheck)> = None;
-        while !importing.is_empty() {
-            rounds += 1;
-            if rounds > MAX_IMPORT_ROUNDS {
-                anyhow::bail!(
-                    "nets kept failing after {MAX_IMPORT_ROUNDS} rounds of dropping the failing ones; nothing was imported"
-                );
-            }
-            let subset: Vec<(String, prost_types::Any)> =
-                items.iter().filter(|(net, _)| importing.contains(net)).cloned().collect();
-            let expected_count = subset.len();
-            let nets_in_order: Vec<String> = subset.iter().map(|(net, _)| net.clone()).collect();
-            let label = if accept == Accept::PerNet && importing.len() < routes.len() {
-                format!("Import Freerouting SES ({} of {} nets)", importing.len(), routes.len())
-            } else {
-                "Import Freerouting SES".to_string()
-            };
-            let created_ids = client.run_commit(&label, |client| {
-                let created = client.create_items_in_returning(
-                    document.clone(),
-                    subset.into_iter().map(|(_, item)| item).collect(),
-                )?;
-                if created.len() != expected_count {
-                    anyhow::bail!(
-                        "KiCad returned {} created items for {} planned route primitives",
-                        created.len(),
-                        expected_count
-                    );
-                }
-                created_route_item_ids(&created)
-            })?;
-            let created_nets: std::collections::HashMap<String, String> =
-                created_ids.iter().cloned().zip(nets_in_order.iter().cloned()).collect();
-            let count = |kind: &str| items.iter().filter(|(net, item)| importing.contains(net) && item.type_url.ends_with(kind)).count();
-            let (new_tracks, new_arcs, new_vias) = (count(".Track"), count(".Arc"), count(".Via"));
-
-            // KiCad 10 publishes neither GetItems nor SaveDocumentToString
-            // changes while a commit is open, so the checks run after it.
-            let check = (|| -> anyhow::Result<RoundCheck> {
-                let read_tracks = client.get_items_in(document.clone(), ObjectType::KotPcbTrace)?;
-                let read_arcs = client.get_items_in(document.clone(), ObjectType::KotPcbArc)?;
-                let read_vias = client.get_items_in(document.clone(), ObjectType::KotPcbVia)?;
-                if read_tracks.len() != plan.locked_track_count + new_tracks
-                    || read_arcs.len() != new_arcs
-                    || read_vias.len() != plan.locked_via_count + new_vias
-                {
-                    anyhow::bail!(
-                        "post-commit IPC read-back mismatch: expected {} tracks/{} arcs/{} vias, read {} tracks/{} arcs/{} vias",
-                        plan.locked_track_count + new_tracks,
-                        new_arcs,
-                        plan.locked_via_count + new_vias,
-                        read_tracks.len(), read_arcs.len(), read_vias.len()
-                    );
-                }
-                let candidate_source = client.save_document_to_string_in(document.clone())?;
-                let (report, report_json) = runtime.block_on(drc_with_project_rules(
-                    &cli_path,
-                    &board_for_ipc,
-                    &candidate_source,
-                    plan.refill_zones,
-                ))?;
-                let tree = konnect_sexp::parse_sexp(&candidate_source).context("parse the candidate board")?;
-                let mut nets = before_nets.clone();
-                nets.extend(verdict::item_nets(&tree));
-                let added = new_drc_errors(&baseline, &report);
-                let blame = verdict::attribute_errors(&added, &created_nets, &importing, &nets);
-                let unconnected = verdict::unconnected_by_net(&report, &nets).unwrap_or_default();
-                Ok(RoundCheck { candidate_source, added: added.len(), blame, unconnected, report, report_json })
-            })();
-            let check = match check {
-                Ok(check) => check,
-                Err(error) => {
-                    rollback(client, &created_ids, &format!("SES import failed ({error:#})"))?;
-                    return Err(error);
-                }
-            };
-            if accept == Accept::All {
-                if check.added > 0 {
-                    let added = new_drc_errors(&baseline, &check.report);
-                    let by_net = check
-                        .blame
-                        .by_net
-                        .iter()
-                        .map(|(net, errors)| format!("{net}: {}", errors.len()))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let why = format!(
-                        "the routes add DRC errors ({}); the import was rolled back. Errors by net: {}. \
-                         accept 'per_net' keeps the nets that add none",
-                        describe_new_errors(&added),
-                        if by_net.is_empty() { "none attributable".to_string() } else { by_net }
-                    );
-                    rollback(client, &created_ids, &why)?;
-                    anyhow::bail!(why);
-                }
-                accepted = Some((created_ids, check));
-                break;
-            }
-            // Per net: errors no imported net can be blamed for, or another
-            // net cut open, leave nothing to decide net by net.
-            let worse = verdict::other_nets_worse(&unconnected_before, &check.unconnected, &importing);
-            if !check.blame.unattributed.is_empty() || !worse.is_empty() {
-                let why = format!(
-                    "the import cannot be kept net by net: {}{}; it was rolled back",
-                    if check.blame.unattributed.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "{} new DRC error(s) involve no imported net (e.g. {})",
-                            check.blame.unattributed.len(),
-                            check.blame.unattributed[0].description
-                        )
-                    },
-                    if worse.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "{}nets outside the import lost connections once zones refilled ({})",
-                            if check.blame.unattributed.is_empty() { "" } else { "; " },
-                            worse.iter().map(|(net, was, now)| format!("{net} {was}→{now}")).collect::<Vec<_>>().join(", ")
-                        )
+        // 1. The whole session in one commit; every trial runs on its text.
+        let mut kept_ids: Vec<String> = Vec::new();
+        let mut decision = verdict::Decision::default();
+        let mut final_text = before.clone();
+        let mut final_report = baseline.clone();
+        let mut final_json = baseline_json.clone();
+        if !with_routes.is_empty() {
+            let created = import(&with_routes, "Import Freerouting SES")?;
+            let ids: Vec<String> = created.iter().map(|(id, _)| id.clone()).collect();
+            let checked = (|| -> anyhow::Result<(String, verdict::Decision, Option<(BTreeSet<String>, cli::DrcReport, String)>)> {
+                read_back(&with_routes)?;
+                let full_text = client.save_document_to_string_in(document.clone())?;
+                let created_map: std::collections::HashMap<String, String> = created.iter().cloned().collect();
+                let mut trial = LiveTrial {
+                    full_text: &full_text,
+                    created: &created_map,
+                    baseline: &baseline,
+                    before_nets: &before_nets,
+                    board: &board_for_ipc,
+                    cli_path: &cli_path,
+                    refill: plan.refill_zones,
+                    runtime: &runtime,
+                    last: None,
+                };
+                let decision = match accept {
+                    Accept::All => {
+                        let (report, json) = runtime.block_on(drc_with_project_rules(&cli_path, &board_for_ipc, &full_text, plan.refill_zones))?;
+                        let added = new_drc_errors(&baseline, &report);
+                        if !added.is_empty() {
+                            let tree = konnect_sexp::parse_sexp(&full_text).context("parse the imported board")?;
+                            let mut item_nets = before_nets.clone();
+                            item_nets.extend(verdict::item_nets(&tree));
+                            let blame = verdict::attribute_errors(&added, &created_map, &with_routes, &item_nets);
+                            let by_net = blame.by_net.iter().map(|(net, errors)| format!("{net}: {}", errors.len())).collect::<Vec<_>>().join(", ");
+                            anyhow::bail!(
+                                "the routes add DRC errors ({}); the import was rolled back. Errors by net: {}. \
+                                 accept 'per_net' keeps the nets that add none",
+                                describe_new_errors(&added),
+                                if by_net.is_empty() { "none attributable".to_string() } else { by_net }
+                            );
+                        }
+                        let unconnected = verdict::unconnected_by_net(&report, &before_nets).unwrap_or_default();
+                        trial.last = Some((with_routes.clone(), report, json));
+                        verdict::Decision {
+                            accepted: with_routes.clone(),
+                            rounds: 1,
+                            trials: 1,
+                            accepted_trial: Some(verdict::TrialResult { blame: Default::default(), unconnected }),
+                            ..Default::default()
+                        }
                     }
-                );
-                rollback(client, &created_ids, &why)?;
-                anyhow::bail!(why);
-            }
-            let mut rejected = Vec::new();
-            for net in &importing {
-                let errors = check.blame.by_net.get(net).cloned().unwrap_or_default();
-                let was = unconnected_before.get(net).copied().unwrap_or(0);
-                let now = check.unconnected.get(net).copied().unwrap_or(0);
-                if let Some(rejection) = verdict::judge_net(errors.len(), was, now, require_complete) {
-                    let r = routes_of(net);
-                    outcomes.insert(net.clone(), NetOutcome {
-                        net: net.clone(),
-                        status: "rejected",
-                        reason: Some(rejection.reason(was, now)),
-                        tracks: r.map_or(0, |r| r.tracks),
-                        arcs: r.map_or(0, |r| r.arcs),
-                        vias: r.map_or(0, |r| r.vias),
-                        session_length_mm: round3(r.map_or(0.0, |r| r.length_mm)),
-                        unconnected_before: Some(was),
-                        unconnected_after: Some(now),
-                        complete: Some(now == 0),
-                        new_drc_errors: errors.into_iter().take(3).collect(),
-                        board_length_mm: None,
-                        board_vias: None,
-                    });
-                    rejected.push(net.clone());
+                    Accept::PerNet => verdict::decide(
+                        &units,
+                        &unconnected_before,
+                        verdict::DecideOptions { require_complete, max_rounds: MAX_IMPORT_ROUNDS, max_bisection_trials: bisection_budget(units.len()) },
+                        &mut trial,
+                    )?,
+                };
+                let last = trial.last.take();
+                Ok((full_text, decision, last))
+            })();
+            let (full_text, decided, last) = match checked {
+                Ok(checked) => checked,
+                Err(error) => {
+                    rollback(&ids, &format!("SES import failed ({error:#})"))?;
+                    return Err(error.context("rolled back: the board is exactly as before"));
                 }
-            }
-            if rejected.is_empty() {
-                accepted = Some((created_ids, check));
-                break;
-            }
-            rollback(client, &created_ids, "dropping the rejected nets")?;
-            for net in &rejected {
-                importing.remove(net);
+            };
+            decision = decided;
+            if decision.accepted == with_routes {
+                // Everything kept: the trial import stays as it is.
+                let (nets, report, json) = last.context("no trial of the accepted nets")?;
+                debug_assert_eq!(nets, decision.accepted);
+                final_text = full_text;
+                final_report = report;
+                final_json = json;
+                kept_ids = ids;
+            } else {
+                // 2. Drop the trial import, 3. re-import only the kept nets.
+                rollback(&ids, "dropping the rejected nets")?;
+                if !decision.accepted.is_empty() {
+                    let label = verdict::undo_plan(decision.accepted.len(), with_routes.len()).last_entry;
+                    let created = import(&decision.accepted, &label)?;
+                    let ids: Vec<String> = created.iter().map(|(id, _)| id.clone()).collect();
+                    let confirmed = (|| -> anyhow::Result<(String, cli::DrcReport, String)> {
+                        read_back(&decision.accepted)?;
+                        let text = client.save_document_to_string_in(document.clone())?;
+                        let (report, json) = runtime.block_on(drc_with_project_rules(&cli_path, &board_for_ipc, &text, plan.refill_zones))?;
+                        // The re-import must reproduce its trial: no new
+                        // error the kept nets' trial did not have.
+                        let tree = konnect_sexp::parse_sexp(&text).context("parse the re-imported board")?;
+                        let mut item_nets = before_nets.clone();
+                        item_nets.extend(verdict::item_nets(&tree));
+                        let added = new_drc_errors(&baseline, &report);
+                        let created_map: std::collections::HashMap<String, String> = created.iter().cloned().collect();
+                        let blame = verdict::attribute_errors(&added, &created_map, &decision.accepted, &item_nets);
+                        let trial_blame = decision.accepted_trial.as_ref().map(|t| t.blame.clone()).unwrap_or_default();
+                        if blame.unattributed.len() > trial_blame.unattributed.len()
+                            || blame.by_net.values().map(Vec::len).sum::<usize>() > trial_blame.by_net.values().map(Vec::len).sum::<usize>()
+                        {
+                            anyhow::bail!(
+                                "the re-import of the kept nets has DRC errors its trial did not have ({})",
+                                describe_new_errors(&added)
+                            );
+                        }
+                        Ok((text, report, json))
+                    })();
+                    match confirmed {
+                        Ok((text, report, json)) => {
+                            final_text = text;
+                            final_report = report;
+                            final_json = json;
+                            kept_ids = ids;
+                        }
+                        Err(error) => {
+                            rollback(&ids, &format!("SES import failed ({error:#})"))?;
+                            return Err(error.context("rolled back: the board is exactly as before"));
+                        }
+                    }
+                }
             }
         }
-
-        // The final board: with the accepted routes, or as it was.
-        let (created_count, final_source, final_report, final_json, final_unconnected) = match accepted {
-            Some((ids, check)) => (ids.len(), check.candidate_source, check.report, check.report_json, check.unconnected),
-            None => (0, before.clone(), baseline.clone(), baseline_json, unconnected_before.clone()),
+        let final_tree = konnect_sexp::parse_sexp(&final_text).context("parse the final board")?;
+        let mut final_nets = before_nets.clone();
+        final_nets.extend(verdict::item_nets(&final_tree));
+        let final_unconnected = match verdict::unconnected_by_net(&final_report, &final_nets) {
+            Some(counts) => counts,
+            None if accept == Accept::All => BTreeMap::new(),
+            None => {
+                if !kept_ids.is_empty() {
+                    rollback(&kept_ids, "the final DRC reports no unconnected items")?;
+                }
+                anyhow::bail!("the final DRC reports no unconnected items, so the kept nets cannot be verified; nothing was imported");
+            }
         };
-        let final_tree = konnect_sexp::parse_sexp(&final_source).context("parse the final board")?;
+
+        let mut outcomes: BTreeMap<String, NetOutcome> = BTreeMap::new();
         let copper = verdict::copper_by_net(&final_tree);
-        for net in &importing {
+        for net in &with_routes {
             let r = routes_of(net);
             let was = unconnected_before.get(net).copied().unwrap_or(0);
-            let now = final_unconnected.get(net).copied().unwrap_or(0);
-            let (length, vias) = copper.get(net).copied().unwrap_or((0.0, 0));
-            outcomes.insert(net.clone(), NetOutcome {
+            let base = NetOutcome {
                 net: net.clone(),
                 status: "imported",
                 reason: None,
@@ -2929,12 +3464,36 @@ async fn handle_apply_specctra_ses(
                 vias: r.map_or(0, |r| r.vias),
                 session_length_mm: round3(r.map_or(0.0, |r| r.length_mm)),
                 unconnected_before: Some(was),
-                unconnected_after: Some(now),
-                complete: Some(now == 0),
+                unconnected_after: None,
+                complete: None,
+                decided_by: None,
                 new_drc_errors: Vec::new(),
-                board_length_mm: Some(round3(length)),
-                board_vias: Some(vias),
-            });
+                board_length_mm: None,
+                board_vias: None,
+            };
+            let outcome = match decision.rejected.get(net) {
+                Some(rejection) => NetOutcome {
+                    status: "rejected",
+                    reason: Some(rejection.reason.clone()),
+                    unconnected_after: rejection.unconnected_after,
+                    complete: rejection.unconnected_after.map(|n| n == 0),
+                    decided_by: Some(rejection.by),
+                    new_drc_errors: rejection.errors.clone(),
+                    ..base
+                },
+                None => {
+                    let now = final_unconnected.get(net).copied().unwrap_or(0);
+                    let (length, vias) = copper.get(net).copied().unwrap_or((0.0, 0));
+                    NetOutcome {
+                        unconnected_after: Some(now),
+                        complete: Some(now == 0),
+                        board_length_mm: Some(round3(length)),
+                        board_vias: Some(vias),
+                        ..base
+                    }
+                }
+            };
+            outcomes.insert(net.clone(), outcome);
         }
         // Nets the group or the filter asked for that the session left empty.
         let asked: BTreeSet<String> = net_filter
@@ -2960,24 +3519,39 @@ async fn handle_apply_specctra_ses(
                 unconnected_before: Some(was),
                 unconnected_after: Some(now),
                 complete: Some(now == 0),
+                decided_by: None,
                 new_drc_errors: Vec::new(),
                 board_length_mm: None,
                 board_vias: None,
             });
         }
 
-        konnect_sexp::write_new_atomic(&candidate_for_ipc, &final_source)
-            .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
-        std::fs::write(&drc_output_for_ipc, final_json)
-            .with_context(|| format!("write {}", drc_output_for_ipc.display()))?;
+        // The files last, each created atomically; a failure removes what was
+        // written and takes the import back off the board.
+        let written = write_import_outputs(&candidate_for_ipc, &final_text, &drc_output_for_ipc, &final_json);
+        if let Err(error) = written {
+            if !kept_ids.is_empty() {
+                rollback(&kept_ids, &format!("writing the result failed ({error:#})"))?;
+            }
+            return Err(error.context("rolled back: the board is exactly as before"));
+        }
         let imported: Vec<&NetOutcome> = outcomes.values().filter(|o| o.status == "imported").collect();
+        let groups_used: Vec<serde_json::Value> = units
+            .iter()
+            .filter(|unit| unit.len() > 1)
+            .map(|unit| {
+                let sources: BTreeSet<&str> =
+                    groups.iter().filter(|(g, _)| g.iter().any(|n| unit.contains(n))).map(|(_, s)| *s).collect();
+                json!({ "nets": unit, "from": sources })
+            })
+            .collect();
         Ok(ApplyEvidence {
             source_sha256: plan.source_sha256.clone(),
             session_id: plan.session_id.clone(),
             track_count: imported.iter().map(|o| o.tracks).sum(),
             arc_count: imported.iter().map(|o| o.arcs).sum(),
             via_count: imported.iter().map(|o| o.vias).sum(),
-            created_count,
+            created_count: kept_ids.len(),
             preserved_locked_track_count: plan.locked_track_count,
             preserved_locked_via_count: plan.locked_via_count,
             existing_routing_fixed: plan.existing_routing_fixed,
@@ -2989,7 +3563,10 @@ async fn handle_apply_specctra_ses(
             refill_zones: plan.refill_zones,
             nets: outcomes.into_values().collect(),
             unconnected_by_net: final_unconnected,
-            rounds,
+            rounds: decision.rounds,
+            trials: decision.trials,
+            undo: verdict::undo_plan(decision.accepted.len(), with_routes.len()),
+            groups: groups_used,
         })
     })
     .await?;
@@ -2998,6 +3575,17 @@ async fn handle_apply_specctra_ses(
         Ok(evidence) => {
             let count = |status: &str| evidence.nets.iter().filter(|o| o.status == status).count();
             let complete = evidence.nets.iter().filter(|o| o.status == "imported" && o.complete == Some(true)).count();
+            let mut next_step = if evidence.created_count == 0 {
+                "Nothing was imported; see nets[].reason. Re-route those nets (rip_up_nets first if they carry partial copper) or change the placement.".to_string()
+            } else if evidence.refill_zones {
+                "The live board's zones were not refilled; call refill_zones, then save.".to_string()
+            } else {
+                "Save the board.".to_string()
+            };
+            if let Some(warning) = &evidence.undo.warning {
+                next_step.push(' ');
+                next_step.push_str(warning);
+            }
             Ok(CallToolResult::json(&json!({
             "success": true,
             "method": "strict_atomic_kicad_ipc_import",
@@ -3005,7 +3593,8 @@ async fn handle_apply_specctra_ses(
             "board": board,
             "candidate_output_path": candidate,
             "source_overwritten": false,
-            "undo_description": if evidence.created_count == 0 { "nothing imported" } else { "Import Freerouting SES" },
+            "undo_description": evidence.undo.last_entry,
+            "undo": evidence.undo,
             "source_sha256": evidence.source_sha256,
             "session_id": evidence.session_id,
             "track_count": evidence.track_count,
@@ -3025,8 +3614,10 @@ async fn handle_apply_specctra_ses(
                 "nets_rejected": count("rejected"),
                 "nets_without_routes": count("no_routes"),
                 "rounds": evidence.rounds,
+                "trial_drcs": evidence.trials,
                 "verified_by": "KiCad DRC of the board with the routes (unconnected items per net), not the router's log"
             },
+            "groups": evidence.groups,
             "nets": evidence.nets,
             "unconnected_by_net": evidence.unconnected_by_net,
             "drc": {
@@ -3041,13 +3632,7 @@ async fn handle_apply_specctra_ses(
                 "schematic_parity_violations": evidence.schematic_parity_violations,
                 "zones_refilled": evidence.refill_zones
             },
-            "next_step": if evidence.created_count == 0 {
-                "Nothing was imported; see nets[].reason. Re-route those nets (rip_up_nets first if they carry partial copper) or change the placement."
-            } else if evidence.refill_zones {
-                "The live board's zones were not refilled; call refill_zones, then save."
-            } else {
-                "Save the board."
-            }
+            "next_step": next_step
         })))
         }
         Err(failure) => {

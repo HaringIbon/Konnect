@@ -222,10 +222,11 @@ pub(crate) fn lower_grouped(
     let (left_to_planes, kept_for_partial_planes): (Vec<String>, Vec<String>) = left_to_planes
         .into_iter()
         .partition(|net| solid_plane_reaches_every_drop(&board, net, &mixed));
+    let before_planes = dsn.clone();
     let dsn = drop_nets(&dsn, &left_to_planes)?;
     let (dsn, group_report) = match group {
         Some(group) => {
-            let (dsn, report) = restrict_to_group(&board, &dsn, group, &left_to_planes)?;
+            let (dsn, report) = restrict_to_group(&board, &dsn, &before_planes, group, &left_to_planes)?;
             (dsn, Some(report))
         }
         None => (dsn, None),
@@ -1193,10 +1194,15 @@ fn class_selects(requested: &str, dsn_class: &str) -> bool {
 fn restrict_to_group(
     board: &SexpNode,
     dsn: &str,
+    before_planes: &str,
     group: &RoutingGroup,
     left_to_planes: &[String],
 ) -> Result<(String, GroupReport)> {
-    let (job_nets, classes) = dsn_network(dsn)?;
+    let (job_nets, _) = dsn_network(dsn)?;
+    // Class membership as KiCad wrote it, before nets left to their planes
+    // were taken out: a class whose every net went to a plane is still the
+    // user's class, and its nets are reported, not refused as unknown.
+    let (_, classes) = dsn_network(before_planes)?;
     let mut requested = group.nets.clone();
     for wanted in &group.classes {
         let matching: Vec<&String> = classes.keys().filter(|name| class_selects(wanted, name)).collect();
@@ -1243,7 +1249,10 @@ fn restrict_to_group(
         not_in_job.push(NetNotRouted { net: net.clone(), reason: reason.to_string() });
     }
     if routed.is_empty() {
-        bail!("no net of the group is in the routing job ({} requested)", requested.len());
+        bail!(
+            "no net of the group needs routing: {}",
+            not_in_job.iter().map(|n| format!("'{}' ({})", n.net, n.reason)).collect::<Vec<_>>().join("; ")
+        );
     }
     let others: Vec<String> = job_nets.keys().filter(|net| !routed.contains(*net)).cloned().collect();
     let dsn = drop_nets(dsn, &others)?;
@@ -1430,7 +1439,7 @@ mod round_trip_tests {
     /// The fixture board with every `+3V3` pad made through-hole: such pads
     /// reach the planes on their own, so the fan-out planner reports the net
     /// fully fanned without a via per pad.
-    fn board_with_fanned_3v3(board: &str) -> String {
+    pub(super) fn board_with_fanned_3v3(board: &str) -> String {
         let mut out = String::with_capacity(board.len());
         let mut rest = board;
         while let Some(start) = rest.find("(pad ") {
@@ -1848,7 +1857,35 @@ mod group_tests {
         assert_eq!(group.not_in_job.len(), 1);
         assert!(group.not_in_job[0].reason.contains("single pad"), "{:?}", group.not_in_job);
         let error = format!("{:#}", lower_grouped(&path, BOARD, DSN, Some(&nets(&["unconnected-(U1-PD2-Pad32)"]))).unwrap_err());
-        assert!(error.contains("no net of the group"), "{error}");
+        assert!(error.contains("no net of the group") && error.contains("single pad"), "{error}");
+    }
+
+    /// Review finding 11: a class whose every net is left to its planes was
+    /// refused as "no net in the routing job"; its nets are now named, each
+    /// with the reason.
+    #[test]
+    fn a_class_left_entirely_to_planes_names_its_nets_and_why() {
+        // +3V3 alone in a class `Supply`, every pad of it through-hole (so it
+        // is fully fanned and left to its In2 plane).
+        let fanned = super::round_trip_tests::board_with_fanned_3v3(BOARD);
+        let dsn = DSN.replacen(
+            "    (class Power,Default +3V3 +5V GND",
+            "    (class Supply +3V3\n      (circuit\n        (use_via \"Via[0-3]_700:350_um\")\n      )\n      (rule\n        (width 400)\n        (clearance 200)\n      )\n    )\n    (class Power,Default +5V GND",
+            1,
+        );
+        assert_ne!(dsn, DSN);
+        let (_dir, path) = board_file(&fanned);
+        let export = lower(&path, &fanned, &dsn).unwrap();
+        assert_eq!(export.left_to_planes, vec!["+3V3"], "fixture premise");
+        let error = format!("{:#}", lower_grouped(&path, &fanned, &dsn, Some(&classes(&["Supply"]))).unwrap_err());
+        assert!(error.contains("'+3V3' (every pad already reaches its plane"), "{error}");
+        // With a routable net beside it, the plane net is reported, not refused.
+        let mut mixed = classes(&["Supply"]);
+        mixed.nets.insert("/SDA".into());
+        let report = lower_grouped(&path, &fanned, &dsn, Some(&mixed)).unwrap().group.unwrap();
+        assert_eq!(report.nets, vec!["/SDA"]);
+        assert_eq!(report.not_in_job.len(), 1);
+        assert_eq!(report.not_in_job[0].net, "+3V3");
     }
 
     #[test]
@@ -1915,9 +1952,15 @@ mod group_tests {
         // The whole-board manifest of the same copper still refuses it
         // (another copy of the board, with the copper locked, is needed).
         let locked = board.replace("(uuid \"aaaaaaaa", "(locked yes)\n\t\t(uuid \"aaaaaaaa");
+        assert_ne!(locked, board);
         let whole = lower(&path, &locked, &dsn).unwrap();
-        let error = crate::specctra_ses::parse_import_plan(&path, &board, &whole.bundle.manifest, SES).unwrap_err();
-        assert!(format!("{error:#}").contains("not locked") || format!("{error:#}").contains("revision"), "{error:#}");
+        crate::specctra_ses::parse_import_plan(&path, &locked, &whole.bundle.manifest, SES).unwrap();
+        // The same whole-board manifest on the same board with one track
+        // unlocked is refused because of the lock, before the revision check.
+        let one_unlocked = locked.replacen("(locked yes)\n\t\t(uuid \"aaaaaaaa-0000-0000-0000-000000000002", "(uuid \"aaaaaaaa-0000-0000-0000-000000000002", 1);
+        assert_ne!(one_unlocked, locked);
+        let error = crate::specctra_ses::parse_import_plan(&path, &one_unlocked, &whole.bundle.manifest, SES).unwrap_err();
+        assert!(format!("{error:#}").contains("not locked"), "{error:#}");
     }
 
     #[test]

@@ -1540,20 +1540,23 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "rip_up_nets",
-            "Rip up (delete) the tracks, arcs and vias of named nets on the live board in one \
-             undo step, so a group can be routed again without a checkpoint restore. Nets are \
-             named directly and/or as every net on the pads of named footprints (move a part, \
-             rip up its nets, re-route them). Optionally only inside a region (an item goes \
-             whole when any of its end points or its centre is inside). Locked copper (hand \
-             routes, fan-out) is kept unless include_locked is true and is listed in \
-             locked_kept. Dry run by default; the response gives per-net counts and length, \
-             and the items are verified absent afterwards.",
+            "Rip up (delete) tracks, arcs and vias on the live board in one undo step, so a group \
+             can be routed again without a checkpoint restore. Named nets go whole. A named \
+             footprint takes only the copper connected to its pads: a walk outward from them \
+             that stops at other footprints' pads and, on a plane net (a zone, or intent role \
+             plane), at vias and at the pour, so it never takes GND or a supply beyond the \
+             part's own fan-out (name the net to take it all). footprint_walk reports each \
+             net's walk and where it stopped. Optionally only items touching a region (a via by \
+             its centre, a track or arc by any part of it; the item goes whole). Locked copper \
+             (hand routes, fan-out) is kept unless include_locked is true and is listed in \
+             locked_kept. Dry run by default; per-net counts and length; items are verified \
+             absent afterwards.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string" },
                     "nets": { "type": "array", "items": { "type": "string" } },
-                    "footprints": { "type": "array", "items": { "type": "string" }, "description": "References; every net on their copper pads is ripped up" },
+                    "footprints": { "type": "array", "items": { "type": "string" }, "description": "References; the copper connected to their pads is ripped up (see the walk above)" },
                     "region": {
                         "type": "object",
                         "description": "Board-mm rectangle; omit for the whole board",
