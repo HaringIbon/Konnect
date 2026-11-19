@@ -124,9 +124,6 @@ pub(crate) fn width_for_current(current_a: f64, temp_rise_c: f64, copper_oz: f64
     if width_mil > 400.0 {
         warnings.push("width exceeds 400 mil; use a plane or pour".to_string());
     }
-    if inner && copper_oz < 0.75 {
-        warnings.push("0.5 oz inner copper: the half-ounce internal fit applies".to_string());
-    }
     Calc {
         result: WidthForCurrent {
             width_mm: round(width_mm, 4),
@@ -136,11 +133,18 @@ pub(crate) fn width_for_current(current_a: f64, temp_rise_c: f64, copper_oz: f64
             temp_rise_c,
         },
         method: "IPC-2152 via the Brooks & Adam fit ΔT = K·I^a·W^b·Th^c (W, Th in mil); external K 215.3, a 2, b −1.15, c −1.0; internal per copper weight (0.5 oz: 120, 2, −1.10, −1.52; 1 oz: 200, 1.9, −1.10, −1.52; 2 oz: 300, 2, −1.15, −1.52; 3 oz: 262.5, 1.9, −1.15, −1.52) — the same equation and coefficients as KiCad's calculator (commit 7f558e2779)",
-        assumptions: vec![
-            "single trace, still air, no copper plane near it (the conservative IPC-2152 case); planes lower the rise".to_string(),
-            format!("copper thickness {copper_oz} oz = {:.1} µm", copper_oz * MM_PER_OZ * 1000.0),
-            "IPC-2152 found internal traces cool about as well as external ones: no internal derating factor".to_string(),
-        ],
+        assumptions: {
+            let mut assumptions = vec![
+                "single trace, still air, no copper plane near it (the conservative IPC-2152 case); planes lower the rise".to_string(),
+                format!("copper thickness {copper_oz} oz = {:.1} µm", copper_oz * MM_PER_OZ * 1000.0),
+                "IPC-2152 found internal traces cool about as well as external ones: no internal derating factor".to_string(),
+            ];
+            // Which fit was used is a fact about the method, not a warning.
+            if inner && copper_oz < 0.75 {
+                assumptions.push("0.5 oz inner copper: the half-ounce internal fit applies".to_string());
+            }
+            assumptions
+        },
         valid_range: "IPC-2152 chart range: ΔT 1–100 °C, up to ≈30 A",
         warnings,
     }
