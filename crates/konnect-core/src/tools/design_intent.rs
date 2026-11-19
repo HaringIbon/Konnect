@@ -209,6 +209,24 @@ pub enum PlaneException {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// A pad the vendor's reference layout grounds through a chip ground pin
+    /// rather than straight to the plane (Nordic nRF52840 OPS v0.5 §56.8: "It
+    /// is not directly connected to the ground plane, but grounded via VSS_PA
+    /// pin F23. This is done to create additional filtering of harmonic
+    /// components." [docdb nordic-nrf52840-ops-v0-5]). The pad must join
+    /// `via_pin` on its own layer with 0 vias within `max_path_mm`.
+    VendorReferenceGround {
+        /// `REF.PAD`.
+        pad: String,
+        /// `REF.PAD` of the chip ground pin.
+        via_pin: String,
+        /// Default: the hot-loop budget (1 nH / L′ of a 0.3 mm outer trace).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_path_mm: Option<f64>,
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Anything else a datasheet asks for: the rule is echoed back and the
     /// pads are reported `excepted_unverified`.
     Datasheet {
@@ -234,6 +252,7 @@ impl PlaneException {
             Self::CrystalLocalGround { .. } => "crystal_local_ground",
             Self::SplitGround { .. } => "split_ground",
             Self::NoPlane { .. } => "no_plane",
+            Self::VendorReferenceGround { .. } => "vendor_reference_ground",
             Self::Datasheet { .. } => "datasheet",
         }
     }
@@ -244,6 +263,7 @@ impl PlaneException {
             | Self::CrystalLocalGround { source, .. }
             | Self::SplitGround { source, .. }
             | Self::NoPlane { source, .. }
+            | Self::VendorReferenceGround { source, .. }
             | Self::Datasheet { source, .. } => source,
         }
     }
@@ -255,6 +275,7 @@ impl PlaneException {
             Self::CrystalLocalGround { crystal, .. } => format!("crystal_local_ground {crystal}"),
             Self::SplitGround { analog_net, digital_net, .. } => format!("split_ground {analog_net}/{digital_net}"),
             Self::NoPlane { net, .. } => format!("no_plane {net}"),
+            Self::VendorReferenceGround { pad, via_pin, .. } => format!("vendor_reference_ground {pad} → {via_pin}"),
             Self::Datasheet { pad, net, .. } => format!("datasheet {}{}", pad.as_deref().unwrap_or(""), net.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()),
         }
     }
@@ -314,6 +335,11 @@ impl PlaneException {
                 }
                 limit("max_path_mm", *max_path_mm)
             }
+            Self::VendorReferenceGround { pad, via_pin, max_path_mm, .. } => {
+                pin("pad", pad)?;
+                pin("via_pin", via_pin)?;
+                limit("max_path_mm", *max_path_mm)
+            }
             Self::Datasheet { pad, rule, .. } => {
                 // A net alone would waive a whole plane net: name the pads.
                 if pad.is_none() {
@@ -342,6 +368,7 @@ impl PlaneException {
             }
             Self::SplitGround { tie, converter, .. } => tie.split('|').map(|t| of(&t.to_string())).chain(converter.iter().cloned()).collect(),
             Self::NoPlane { star_point, .. } => star_point.iter().map(of).collect(),
+            Self::VendorReferenceGround { pad, via_pin, .. } => vec![of(pad), of(via_pin)],
             Self::Datasheet { pad, .. } => pad.iter().map(of).collect(),
         }
     }
@@ -353,6 +380,7 @@ impl PlaneException {
             Self::CrystalLocalGround { vss_pin, .. } => vec![vss_pin.clone()],
             Self::SplitGround { tie, .. } if tie.contains('|') => tie.split('|').map(str::to_string).collect(),
             Self::NoPlane { star_point, .. } => star_point.iter().cloned().collect(),
+            Self::VendorReferenceGround { pad, via_pin, .. } => vec![pad.clone(), via_pin.clone()],
             Self::Datasheet { pad, .. } => pad.iter().filter(|p| p.contains('.')).cloned().collect(),
             _ => Vec::new(),
         }
@@ -3270,6 +3298,19 @@ struct ExceptCtx<'a> {
 }
 
 impl ExceptCtx<'_> {
+    /// Default length of a short same-layer join (hot loop, vendor reference
+    /// ground): the 1 nH hot-loop budget over L′ of a 0.3 mm outer trace.
+    fn short_join_default(&self) -> (f64, String) {
+        let outer = self.layers.copper.first().map(|c| c.0.clone()).unwrap_or_default();
+        match self.layers.model(&outer, self.planes) {
+            Ok(m) => {
+                let l = m.per_mm(0.3).l_nh_per_mm;
+                (((HOT_LOOP_NH / l) * 10.0).floor() / 10.0, format!("default: {HOT_LOOP_NH} nH hot-loop budget / {l:.3} nH/mm (0.3 mm on {outer}); Konnect judgement, LMR33630: input caps \"as close as possible to the VIN and GND terminals\" [docdb ti-lmr33630-layout]"))
+            }
+            Err(_) => (3.0, "default: fallback 3 mm (no outer line model); Konnect judgement".to_string()),
+        }
+    }
+
     fn graph(&self, net: &str) -> NetGraph {
         let empty = NetCopper { segments: vec![], has_zone: false };
         net_graph(net, self.copper.get(net).unwrap_or(&empty), self.pads, self.vias, self.layers)
@@ -3413,16 +3454,7 @@ fn evaluate_plane_exceptions(intent: &DesignIntent, cx: &ExceptCtx) -> (BTreeMap
                 };
                 let (limit, limit_src) = match max_path_mm {
                     Some(v) => (*v, "user".to_string()),
-                    None => {
-                        let outer = cx.layers.copper.first().map(|c| c.0.clone()).unwrap_or_default();
-                        match cx.layers.model(&outer, cx.planes) {
-                            Ok(m) => {
-                                let l = m.per_mm(0.3).l_nh_per_mm;
-                                (((HOT_LOOP_NH / l) * 10.0).floor() / 10.0, format!("default: {HOT_LOOP_NH} nH hot-loop budget / {l:.3} nH/mm (0.3 mm on {outer}); Konnect judgement, LMR33630: input caps \"as close as possible to the VIN and GND terminals\" [docdb ti-lmr33630-layout]"))
-                            }
-                            Err(_) => (3.0, "default: fallback 3 mm (no outer line model); Konnect judgement".to_string()),
-                        }
-                    }
+                    None => cx.short_join_default(),
                 };
                 let need = min_vias.unwrap_or(HOT_LOOP_MIN_VIAS);
                 // Plane vias at the PGND pins or the regulator's pads on PGND
@@ -3598,6 +3630,39 @@ fn evaluate_plane_exceptions(intent: &DesignIntent, cx: &ExceptCtx) -> (BTreeMap
                     if count == 0 { "; matches no SMD pad" } else { "" },
                     if cx.plane_nets.contains(net) { "; note: the net does have an inner-layer zone" } else { "" }
                 );
+            }
+            PlaneException::VendorReferenceGround { pad, via_pin, max_path_mm, .. } => {
+                let (targets, from) = (cx.pin(via_pin), cx.pin(pad));
+                let Some(net) = from.iter().find_map(|p| p.net.clone()) else {
+                    check.status = "fail";
+                    check.detail = format!("{pad} has no net");
+                    checks.push(check);
+                    continue;
+                };
+                let same: Vec<&CopperPad> = targets.iter().copied().filter(|t| t.net.as_deref() == Some(net.as_str())).collect();
+                let (limit, limit_src) = match max_path_mm {
+                    Some(v) => (*v, "user".to_string()),
+                    None => cx.short_join_default(),
+                };
+                let graph = cx.graph(&net);
+                let mut status = "pass";
+                if same.is_empty() {
+                    status = "fail";
+                }
+                for p in &from {
+                    let (ok, m, d) = if same.is_empty() { (Some(false), json!({}), format!("{via_pin} is not on {net}")) } else { cx.local_join(&net, &graph, p, &same, limit, Some(0)) };
+                    let s = match ok {
+                        Some(true) => "excepted_pass",
+                        Some(false) => "excepted_fail",
+                        None => "excepted_unverified",
+                    };
+                    status = worst(status, match ok { Some(true) => "pass", Some(false) => "fail", None => "unverified" });
+                    cover(p, &net, s, format!("grounded through {via_pin} on its own layer, no via: {d}"), m);
+                }
+                check.status = status;
+                check.measured = json!({"kind": kind, "net": net});
+                check.required = json!({"max_path_mm": limit, "path_source": limit_src, "max_vias": 0});
+                check.detail = format!("{pad} is grounded through chip pin {via_pin} as the vendor reference layout does, exempt from its own plane via (e.g. nRF52840 OPS v0.5 §56.8: grounded via VSS_PA \"to create additional filtering of harmonic components\" [docdb nordic-nrf52840-ops-v0-5])");
             }
             PlaneException::Datasheet { pad, net, rule, .. } => {
                 let mut count = 0;
@@ -4288,6 +4353,39 @@ pub(crate) fn plan_ties(tree: &SexpNode, intent: &DesignIntent, clearance: f64) 
 
 // ─── Tools ──────────────────────────────────────────────────────────────────
 
+/// JSON schema of `plane_exceptions` (separate to keep `json!` within its
+/// recursion limit).
+fn plane_exceptions_schema() -> Value {
+    json!({ "type": "array", "description": "Replaces the list. Structured exceptions to the own-via rule; check_design_intent verifies each kind's alternative rule (excepted_pass / excepted_fail / excepted_unverified)", "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["switching_hot_loop", "crystal_local_ground", "split_ground", "no_plane", "vendor_reference_ground", "datasheet"] },
+                            "source": { "type": "string", "description": "Required: datasheet section, app note or review" },
+                            "reason": { "type": "string" },
+                            "regulator": { "type": "string", "description": "switching_hot_loop" },
+                            "input_caps": { "type": "array", "items": { "type": "string" }, "description": "switching_hot_loop" },
+                            "pgnd_pins": { "type": "array", "items": { "type": "string" }, "description": "switching_hot_loop: REF.PAD" },
+                            "min_vias": { "type": "integer", "minimum": 0, "description": "switching_hot_loop: plane vias at PGND/thermal pad (default 2)" },
+                            "crystal": { "type": "string", "description": "crystal_local_ground" },
+                            "load_caps": { "type": "array", "items": { "type": "string" }, "description": "crystal_local_ground" },
+                            "vss_pin": { "type": "string", "description": "crystal_local_ground: REF.PAD" },
+                            "max_path_mm": { "type": "number", "description": "switching_hot_loop, crystal_local_ground, no_plane" },
+                            "analog_net": { "type": "string", "description": "split_ground" },
+                            "digital_net": { "type": "string", "description": "split_ground" },
+                            "tie": { "type": "string", "description": "split_ground: 'REF.PAD|REF.PAD' (converter pins) or a net-tie / 0 Ω part reference" },
+                            "converter": { "type": "string", "description": "split_ground: the part the tie must sit at" },
+                            "max_tie_mm": { "type": "number", "description": "split_ground (default 5)" },
+                            "allowed_bridges": { "type": "array", "items": { "type": "string" }, "description": "split_ground: parts on both nets that are not ties (every other non-capacitor part counts as a tie)" },
+                            "net": { "type": "string", "description": "no_plane, datasheet" },
+                            "star_point": { "type": "string", "description": "no_plane: REF.PAD" },
+                            "pad": { "type": "string", "description": "datasheet (required): REF.PAD or REF, a net-wide waiver is refused; vendor_reference_ground: REF.PAD" },
+                            "via_pin": { "type": "string", "description": "vendor_reference_ground: the chip ground pin (REF.PAD) the pad is grounded through" },
+                            "rule": { "type": "string", "description": "datasheet: what it asks for instead" }
+                        },
+                        "required": ["kind", "source"]
+                    } })
+}
+
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
@@ -4358,6 +4456,7 @@ pub fn tools() -> Vec<ToolDef> {
              load_caps: ['C3','C4'], vss_pin: 'U1.47', max_path_mm?, source}; {kind: split_ground, \
              analog_net: 'AGND', digital_net: 'GND', tie: 'U5.4|U5.9' or 'NT1', converter?, max_tie_mm?, \
              allowed_bridges?, source}; {kind: no_plane, net: 'GND', star_point?: 'J1.2', \
+             max_path_mm?, source}; {kind: vendor_reference_ground, pad: 'C3.2', via_pin: 'U1.F23', \
              max_path_mm?, source}; {kind: datasheet, pad: 'U2.5'|'U2', net?, rule, source}. Parts, pins and nets must \
              exist on the saved board. Validated before writing; revision-checked write.",
             json!({
@@ -4425,33 +4524,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "plane_layers": { "type": "array", "items": { "type": "string" }, "description": "Copper layers planned as reference planes, e.g. [\"In1.Cu\", \"In2.Cu\"], before their pours exist" },
                     "max_plane_stub_mm": { "type": ["number", "null"], "description": "Longest connecting trace (track outside the pad and the via) from an SMD pad on a plane net to its via to the plane, for nets without their own value; null restores the default (0.5 nH / L′ of a 0.3 mm outer trace, ≈ 1.5 mm on JLC04161H-7628)" },
-                    "plane_exceptions": { "type": "array", "description": "Replaces the list. Structured exceptions to the own-via rule; check_design_intent verifies each kind's alternative rule (excepted_pass / excepted_fail / excepted_unverified)", "items": {
-                        "type": "object",
-                        "properties": {
-                            "kind": { "type": "string", "enum": ["switching_hot_loop", "crystal_local_ground", "split_ground", "no_plane", "datasheet"] },
-                            "source": { "type": "string", "description": "Required: datasheet section, app note or review" },
-                            "reason": { "type": "string" },
-                            "regulator": { "type": "string", "description": "switching_hot_loop" },
-                            "input_caps": { "type": "array", "items": { "type": "string" }, "description": "switching_hot_loop" },
-                            "pgnd_pins": { "type": "array", "items": { "type": "string" }, "description": "switching_hot_loop: REF.PAD" },
-                            "min_vias": { "type": "integer", "minimum": 0, "description": "switching_hot_loop: plane vias at PGND/thermal pad (default 2)" },
-                            "crystal": { "type": "string", "description": "crystal_local_ground" },
-                            "load_caps": { "type": "array", "items": { "type": "string" }, "description": "crystal_local_ground" },
-                            "vss_pin": { "type": "string", "description": "crystal_local_ground: REF.PAD" },
-                            "max_path_mm": { "type": "number", "description": "switching_hot_loop, crystal_local_ground, no_plane" },
-                            "analog_net": { "type": "string", "description": "split_ground" },
-                            "digital_net": { "type": "string", "description": "split_ground" },
-                            "tie": { "type": "string", "description": "split_ground: 'REF.PAD|REF.PAD' (converter pins) or a net-tie / 0 Ω part reference" },
-                            "converter": { "type": "string", "description": "split_ground: the part the tie must sit at" },
-                            "max_tie_mm": { "type": "number", "description": "split_ground (default 5)" },
-                            "allowed_bridges": { "type": "array", "items": { "type": "string" }, "description": "split_ground: parts on both nets that are not ties (every other non-capacitor part counts as a tie)" },
-                            "net": { "type": "string", "description": "no_plane, datasheet" },
-                            "star_point": { "type": "string", "description": "no_plane: REF.PAD" },
-                            "pad": { "type": "string", "description": "datasheet (required): REF.PAD or REF; a net-wide waiver is refused" },
-                            "rule": { "type": "string", "description": "datasheet: what it asks for instead" }
-                        },
-                        "required": ["kind", "source"]
-                    } },
+                    "plane_exceptions": plane_exceptions_schema(),
                     "notes": { "type": "array", "items": { "type": "string" } }
                 },
                 "required": ["project"]
@@ -6978,18 +7051,39 @@ mod plane_connection_tests {
     }
 
     #[test]
+    fn vendor_reference_ground_joins_the_named_chip_pin_on_its_own_layer() {
+        let parts = format!("{} {}", fp("U1", 20.0, 10.0, &[("F23", 0.0, 0.0, "GND")]), fp("C3", 22.0, 10.0, &[("2", 0.0, 0.0, "GND")]));
+        let e = PlaneException::VendorReferenceGround { pad: "C3.2".into(), via_pin: "U1.F23".into(), max_path_mm: None, source: "nRF52840 OPS v0.5 §56.8".into(), reason: None };
+        let all = all_checks(&format!("{parts} {}", seg("GND", "F.Cu", (22.0, 10.0), (20.0, 10.0))), &with(vec![e.clone()]));
+        let c = pad_check(&all, "C3.2");
+        assert_eq!(c.status, "excepted_pass", "{c:?}");
+        assert_eq!((c.measured["exception"]["path_mm"].clone(), c.measured["exception"]["vias"].clone()), (json!(2.0), json!(0)));
+        assert!(exception_check(&all).detail.contains("nordic-nrf52840-ops-v0-5"));
+        // Through a via, or not joined at all: fails.
+        let via_path = format!(
+            "{parts} {} {} {} (via (at 22 11) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"GND\")) (via (at 20 11) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"GND\"))",
+            seg("GND", "F.Cu", (22.0, 10.0), (22.0, 11.0)),
+            seg("GND", "B.Cu", (22.0, 11.0), (20.0, 11.0)),
+            seg("GND", "F.Cu", (20.0, 11.0), (20.0, 10.0))
+        );
+        assert_eq!(pad_check(&all_checks(&via_path, &with(vec![e.clone()])), "C3.2").status, "excepted_fail");
+        assert_eq!(pad_check(&all_checks(&parts, &with(vec![e])), "C3.2").status, "excepted_fail");
+    }
+
+    #[test]
     fn worked_examples_parse_and_unknown_fields_or_missing_sources_are_refused() {
         let examples = r#"[
           {"kind": "switching_hot_loop", "regulator": "U3", "input_caps": ["C20", "C21"], "pgnd_pins": ["U3.7"], "source": "TI LMR33630 datasheet §10.1"},
           {"kind": "crystal_local_ground", "crystal": "Y1", "load_caps": ["C3", "C4"], "vss_pin": "U1.47", "source": "ST AN2867 §5"},
           {"kind": "split_ground", "analog_net": "AGND", "digital_net": "GND", "tie": "U5.4|U5.9", "source": "ADS1115 datasheet §10"},
           {"kind": "no_plane", "net": "GND", "star_point": "J1.2", "source": "2-layer board"},
+          {"kind": "vendor_reference_ground", "pad": "C3.2", "via_pin": "U1.F23", "source": "nRF52840 OPS v0.5 §56.8"},
           {"kind": "datasheet", "pad": "U2.5", "rule": "EP to the shield pour only", "source": "XYZ datasheet §9.2"}
         ]"#;
         let list: Vec<PlaneException> = serde_json::from_str(examples).unwrap();
         let i = with(list);
         assert!(i.validate().is_ok(), "{:?}", i.validate());
-        assert_eq!(i.plane_exceptions.iter().map(|e| e.kind()).collect::<Vec<_>>(), ["switching_hot_loop", "crystal_local_ground", "split_ground", "no_plane", "datasheet"]);
+        assert_eq!(i.plane_exceptions.iter().map(|e| e.kind()).collect::<Vec<_>>(), ["switching_hot_loop", "crystal_local_ground", "split_ground", "no_plane", "vendor_reference_ground", "datasheet"]);
         assert!(serde_json::from_str::<PlaneException>(r#"{"kind": "no_plane", "net": "GND", "star": "J1.2", "source": "s"}"#).is_err());
         assert!(serde_json::from_str::<PlaneException>(r#"{"kind": "no_plane", "net": "GND"}"#).is_err());
         assert!(serde_json::from_str::<PlaneException>(r#"{"kind": "waiver", "source": "s"}"#).is_err());

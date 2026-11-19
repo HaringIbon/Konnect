@@ -2470,6 +2470,11 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
   Each SMD pad on the net must reach `star_point` by its own trace, not through another part's pad, within the optional `max_path_mm`. Without `star_point` the pads are `excepted_unverified` ("the plane rule does not apply").
 
   ```json
+  {"kind": "vendor_reference_ground", "pad": "C3.2", "via_pin": "U1.F23", "source": "Nordic nRF52840 OPS v0.5 §56.8"}
+  ```
+  The pad is exempt from its own plane via. It must join `via_pin` on its own layer with 0 vias within `max_path_mm` (default 1 nH ÷ L′, about 3.0 mm), reported as `excepted_pass` or `excepted_fail` with the path. Source `nordic-nrf52840-ops-v0-5` §56.8: "grounded via VSS_PA pin F23 … to create additional filtering of harmonic components".
+
+  ```json
   {"kind": "datasheet", "pad": "U2.5", "rule": "EP to the shield pour only", "source": "XYZ datasheet §9.2"}
   ```
   `pad` (`REF.PAD` or `REF`) is required; `net` only narrows it, and a net-wide waiver is refused. The matched pads are reported `excepted_unverified` with the rule.

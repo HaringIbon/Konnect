@@ -778,6 +778,7 @@ Code: `design_intent.rs`, plus doc updates. Pass 17 is on another branch, so the
   - **`no_plane`** `{net, star_point?, max_path_mm?}`:
     - Each SMD pad must reach `star_point` by its own trace, a routed path that does not pass through another part's pad copper.
     - Without `star_point` the pads are `excepted_unverified` ("the plane rule does not apply").
+  - **`vendor_reference_ground`** `{pad, via_pin, max_path_mm?}`: the pad joins the named chip ground pin on its own layer with 0 vias (the hot-loop 0-via search; default 1 nH ÷ L′, about 3.0 mm) instead of having its own plane via. Source: [`nordic-nrf52840-ops-v0-5`] §56.8, "It is not directly connected to the ground plane, but grounded via VSS_PA pin F23. This is done to create additional filtering of harmonic components." Test: `vendor_reference_ground_joins_the_named_chip_pin_on_its_own_layer` (pass; fail through vias; fail when not joined).
   - **`datasheet`** `{pad, net?, rule}` (`pad` required, so a net-wide waiver is refused): the matched pads (plane nets, or the named net) are `excepted_unverified`, and the rule is echoed back.
   - **Validation:**
     - Schema-level: a source is required; pins must be `REF.PAD` and parts `REF`; lists must not be empty; limits must be positive.
@@ -848,7 +849,7 @@ Code: `design_intent.rs`, plus doc updates. Pass 17 is on another branch, so the
   - **Via inductance (information only):** `est_via_nh`, the barrel from the pad's layer to the nearest plane layer it lands on, from Pass 19's `barrel_nh` (Johnson [7.9], the cap value with no return via). The pass/fail limit is still on the connecting trace alone. Via inductance is not counted against it, even though the barrel down to In2 can outweigh the trace for +3V3 pads.
   - **Performance:** path reconstruction stops 5 mm past the limit. The Ethernet board takes about 0.6 s in a debug build.
 - **Merge:** `tier1-review-fixes` (Passes 17 and 19) is merged into this branch. Its `net_graph` grid join is kept, with the pad-outline fix on top. `layer_distance` (Pass 19) is kept; this pass's version is renamed `plane_distance` (`None` for the same layer).
-- **Tests after the fixes:** `plane_connection_tests` has 26:
+- **Tests after the fixes:** `plane_connection_tests` has 27:
   - two capacitors on one via fail, but only the one left without a via;
   - a pad with a via of its own passes even when a neighbour routes to that via;
   - a capacitor sharing a device's via under the widely spaced, closely spaced and unknown regimes, and on opposite sides;
@@ -859,7 +860,7 @@ Code: `design_intent.rs`, plus doc updates. Pass 17 is on another branch, so the
   - the hot-loop 0-via path;
   - `split_ground` with SB, J and W parts and `allowed_bridges`;
   - a net-only `datasheet` exception refused.
-  - `cargo test -p konnect-core --lib`: see the commit report.
+  - `cargo test -p konnect-core --lib` after the merge with Pass 19: 1897 passed, 0 failed, 23 ignored.
 - **Limits and what is not verified:**
   - Via inductance is reported (`est_via_nh`, information only) but not counted against the limit; `est_inductance_nh` covers only the connecting trace.
   - Part kinds (capacitor or device) are guessed from the reference prefix, and the greedy via assignment is not an optimal matching.
