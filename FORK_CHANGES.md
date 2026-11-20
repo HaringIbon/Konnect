@@ -1399,3 +1399,5 @@ Rebased by merging `safe-writes` 78bb158 (Pass 21); this pass was renumbered fro
 **Revised limits:**
 - An ambiguous layer is read both ways, so a board whose routability hinges on it is reported `tight`, never `doomed` or `fine`. Setting the layer's type resolves it.
 - Channel cuts no longer affect the verdict.
+  A crowded gap between two parts therefore no longer raises `tight` by itself; this is accepted because the calibration never saw it fire, and a gap that is the only way through is still counted by the full-board cut on the same line (third review, L-b).
+- When the caller names an ambiguous layer in `signal_layers`, the advisory metrics (cut utilisation, density) still block its pour, so they understate that layer's capacity. It can only add a `tight` reason, never `doomed` (third review, L-a; not fixed).
