@@ -435,7 +435,7 @@ fn collect_pads(tree: &SexpNode) -> Vec<PadInfo> {
                 layer: if back { "B.Cu" } else { "F.Cu" },
                 footprint_center: (fx, fy),
                 footprint_rotation: rot,
-                uuid: pad.find_str("uuid").map(str::to_string),
+                uuid: pad.find_str("uuid").or_else(|| pad.find_str("tstamp")).map(str::to_string),
                 shape: pad.get(3).and_then(SexpNode::as_str).unwrap_or("rect").to_string(),
                 roundrect_ratio: pad.find_f64("roundrect_rratio").unwrap_or(0.25),
             });

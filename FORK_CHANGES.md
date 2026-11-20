@@ -1256,9 +1256,9 @@ Rebased by merging `safe-writes` 78bb158 (Pass 21); this pass was renumbered fro
    - **Congestion grid** (`cell_mm`): supply per cell is Σ_layers free area / (w + s), from a raster built from the same shape–line intersections as the cuts (`lou-ispd2001-probabilistic-congestion-slides`: tracks per pitch; PCB layers are not directional). Demand is RUDY per airwire, its box clamped to one track pitch and weighted by the net's pitch (`circuitnet-routability-features`, `arxiv-2206-03032-xie-thesis-rudy`). Overflow uses CircuitNet's definition.
    - Cells with no free track at all (pin fields) are counted apart as `blocked_cells_with_demand`, not as overflow. Otherwise every fine-pitch pad cell overflowed.
    - More than 5 % of cells overflowing is `tight` (judgement). On the benchmark boards it never exceeded 0.9 %.
-4. **Density** (`holden-tt26-density-equation`): Wd = Σ Manhattan airwire length (pitch-weighted); Wc = Σ_layers free area / (w + s) · E; U = Wd / Wc. U > 1 is `doomed` and U > 1/1.2 is `tight` (the source's "about 20 %" spare when autorouting). E is calibrated below.
+4. **Density** (`holden-tt26-density-equation`): Wd = Σ Manhattan airwire length (pitch-weighted); Wc = Σ_layers free area / (w + s) · E; U = Wd / Wc. E is calibrated below. *Changed by the review (H2):* density only ever gives `tight` (judgement). U > 1 is `density.beyond_calibration`, "denser than any board routed so far"; U > 1/1.2 is `density.u_tight`.
 - **Pin density** (informational, no threshold): pins per cm² and per in² of board area (`cadence-burkhert-pcb-density-layer-count`).
-- **Verdict:** `doomed` if escape, a full-board cut or density says so; `tight` if any metric says so; else `fine`.
+- **Verdict:** `doomed` only if the pin escape or a full-board cut proves it (after the review, density no longer dooms); `tight` if any metric says so; else `fine`.
 - **`recommendation`:**
   - `doomed`: the failing necessary condition, and what to change first.
   - `tight`: the brief's tiebreaker, citing `kim-iccad11-simplr` (estimators miss what a router sees). Route the named worst nets first: the nets in the most crossings, on the worst cut and in the worst cells. Use a grouped `export_specctra_dsn`, about 10–20 passes and `per_net` import.
@@ -1320,7 +1320,8 @@ Rebased by merging `safe-writes` 78bb158 (Pass 21); this pass was renumbered fro
   | led_board Freerouting | 21 | 2708 | 0.008 | complete |
 
   - **E = 0.13**: the densest completed board, rounded up. This replaces the unsourced 0.5 placeholder. At 0.5 every board read U ≤ 0.25, so the metric could never fire.
-  - U > 1 now means "denser than any board routed so far", not a physical proof. The density `doomed` level rests on one dense completed board.
+  - U > 1 means "denser than any board routed so far", not a physical proof. E rests on one dense completed board, so since the review it can only make a board `tight`.
+  - `holden-tt42-density-equations` recommends a regression on your own boards to normalise the wiring-demand model. Here the same idea is applied to E, which has no other source.
   - Routed length is close to the Manhattan airwire length (demo 1396 against Wd 1341), so Wd needs no detour factor here.
 - **Pin density** (informational): module 24.2, Ethernet 15.8, demo 8.5, mcu 6.2, led 1.3 pins/cm². It ranks the boards' hand-routing effort, not Freerouting's result: the module is densest but has fewer open nets than the Ethernet board.
 
@@ -1351,3 +1352,29 @@ Rebased by merging `safe-writes` 78bb158 (Pass 21); this pass was renumbered fro
 - **Escape classification** uses the pad-centre bounding box. Modules with castellations, and connectors, get a rough side analysis. Escape demand counts only pads with an unrouted airwire, so a channel already used by existing tracks is not subtracted.
 - **Calibration:** E and the judgement thresholds come from 16 runs of 5 designs, all 2-signal-layer boards with inner planes, and one router (Freerouting 2.3.0, 40 passes). No 1-layer, 6-layer or BGA board was available, so the grid-escape and layers-needed paths are unit-tested only.
 - **Not validated live in KiCad's GUI.** The IPC (open board) source path is shared with `score_placement` but not exercised here. The MCP path was run against the release binary on saved files.
+
+### Review fixes (independent Opus review of f1dd99e)
+
+| # | Finding | Fix | Regression test |
+|---|---|---|---|
+| H1 | A BGA was `doomed` (sourced) when C = 0 at the class width, though UG1099 allows neck-down in the breakout. The same report gave `ug1099_layers` 2 | Escape doom is judged at the fab minimum (`min_track_width` / `min_clearance`). The class-rule result is `layers_needed_at_class_rules`, with `needs_neck_down`; it gives `tight` (`escape.neck_down`, judgement) when it exceeds the layers. A grid adds `c_at_fab_minimum` | `review_h1_bga_escape_is_judged_at_the_fab_minimum` |
+| H2 | Density `doomed` was labelled sourced, but E is a one-board fit; U > 1 is only 7.6 % denser than a completed board. TT26 also gives "layout performance 1.05 to 1.15" (U ≈ 0.87–0.95), which conflicts with a sourced 0.833 | Density can only give `tight`, both thresholds `judgement`, and the conflict is stated in the threshold text. "No router can finish" now appears only for cut and escape proofs. The tt42 citation now says what tt42 says (normalise the demand model on your own boards) | `holden_density_verdicts_follow_u` (rewritten) |
+| M3 | Inner layers typed `signal` (KiCad's default) with a full GND/+3V3 pour were routing layers. On the demo: 47 plane airwires became demand, 4 layers, U 0.93 → 0.54 | The pour-area test runs on every copper layer. An inner layer poured over at least half the board is a plane layer (`rules.plane_layers`): its net is a plane net and the layer is not routed on by default. If `signal_layers` names it, its pour is blocked | `review_m3_a_signal_typed_inner_layer_poured_over_the_board_is_a_plane` |
+| M4 | `nets: []` and `nets: ["GND"]` gave `fine`; names were not trimmed; `netclass_assignments` was ignored | Group arguments are read as `routing_group_argument` reads them: an empty array or a blank name is refused, names are trimmed. A group with no demand is refused, each net with its reason (left to its plane, single pad, already connected). `netclass_assignments` (string or array form) is applied before `netclass_patterns` | `review_m4_groups_are_read_as_export_specctra_dsn_reads_them`, `review_m4_netclass_assignments_come_before_patterns` |
+| M5 | A QFN pin wired to its own exposed pad (non-plane net) was counted as needing vias: `doomed` on one layer | A connection to another pad of the same part on a shared layer is a direct stub inside the part, not escape demand | `review_m5_a_pin_wired_to_its_own_exposed_pad_is_a_stub_not_escape` |
+| L6 | `crossings_by_part` counted a crossing twice when both airwires touch the part | Distinct crossings per part | `review_l6_a_crossing_counts_once_per_part` |
+| L7 | Channel cuts ran centre to centre, counting space inside a part's pad ring | The segment spans only the gap, courtyard to courtyard | `review_l7_channel_cuts_span_only_the_gap` |
+| L8 | `F&B.Cu` / `*.Cu` zone layers were not recognised; pads in tstamp-era files had no identity | Zone layer wildcards are expanded. A pad's `tstamp` is used when it has no `uuid`, and DRC items still fall back to the reported position | `review_l8_zone_layer_wildcards_are_expanded` |
+| L9 | Edge clearance was charged twice: the band, then `s` again in the lane formula | A free interval that ends on the edge band (or the outline) gets that end's `s` back | `review_l9_the_edge_band_is_not_charged_a_clearance_twice`; the partly-routed-cut test now expects `[2, 1]` lanes (one track fits beside the edge) |
+| L10 | The doom text did not say existing copper is kept (unlocked tracks count as fixed) | Cut and recommendation texts say "with existing copper kept" | (text) |
+| L11 | `-0.0` printed | `round3` returns `+0.0` | (all reports) |
+
+**After the review:**
+- The reviewer's repro boards now give: `bga` `tight` (`escape.neck_down`, was `doomed`); `qfn` `tight` (not doomed); `demo_sig` the same as the power-typed demo (2 layers, 47 plane airwires, U 0.93); `fb` with GND recognised on `F&B.Cu`.
+- The calibration table was re-run on all 16 boards: no verdict changed (none had been doomed by density or escape, and no channel cut had fired). With the edge fix (L9), the wall board's cut has 6 lanes (10 at the fab minimum, was 8) and width utilisation 0.93. It is still `doomed` on the lane count: 7 nets against 6 lanes.
+- **Tests:** 9 new or rewritten; `konnect-core --lib` 1999 passed, 0 failed.
+
+**Revised limits:**
+- Doom now comes only from proofs: a full-board cut, or an escape that does not fit even at the fab minimum.
+- Density is advisory.
+- A partial inner pour (less than half the board) on a signal-typed layer is still routed on, unblocked.

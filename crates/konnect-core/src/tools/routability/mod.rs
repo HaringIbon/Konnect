@@ -41,8 +41,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Layout efficiency used when the caller gives none. Holden
 /// (`holden-tt26-density-equation`) defines the factor but its table of
-/// typical values is an image not in the doc DB, and `holden-tt42-density-equations`
-/// says to fit it on your own boards. Calibrated (Pass 23, FORK_CHANGES.md):
+/// typical values is an image not in the doc DB. `holden-tt42-density-equations`
+/// recommends a regression on your own boards to normalise the wiring-demand
+/// model; the same idea is applied here to E, which has no other source. Calibrated (Pass 23, FORK_CHANGES.md):
 /// routed signal length over raw capacity (free area / pitch) on the
 /// benchmark boards was 0.126 for the densest completed one (`stm32_demo`),
 /// 0.109 / 0.072 for the nearly complete module and Ethernet boards and
@@ -67,12 +68,13 @@ pub(crate) struct Threshold {
 
 pub(crate) const THRESHOLDS: &[Threshold] = &[
     Threshold { id: "escape.layers", rule: "escape needs more signal layers than the board has", level: "doomed", value: 0.0, kind: "sourced", source: "wang-iccad06-escape-layer-minimization; xilinx-ug1099-bga-design-rules (Eq. 2-1 and the outermost-row rule)" },
-    Threshold { id: "cut.lower_bound", rule: "nets that must cross a full-board cut need more lanes than it has", level: "doomed", value: 1.0, kind: "sourced", source: "holden-tt42-density-equations (section crossing method); a necessary condition: every route between the two sides crosses the line" },
-    Threshold { id: "density.u_doomed", rule: "U = Wd / Wc above 1", level: "doomed", value: 1.0, kind: "sourced", source: "holden-tt26-density-equation (Wd > Wc: not enough wires); E itself is calibrated, not sourced" },
-    Threshold { id: "density.u_tight", rule: "U above 1/1.2 (less than about 20 % spare)", level: "tight", value: 0.833, kind: "sourced", source: "holden-tt26-density-equation (Wd < Wc: about 20 % is a good target, especially if autorouting)" },
+    Threshold { id: "cut.lower_bound", rule: "nets that must cross a full-board cut need more lanes than it has", level: "doomed", value: 1.0, kind: "sourced", source: "a geometric necessary condition (every route between the two sides crosses the line, so the line's free lanes bound the crossings); the section-crossing approach is named in holden-tt42-density-equations" },
+    Threshold { id: "density.beyond_calibration", rule: "U = Wd / Wc above 1: denser than the densest board routed so far (E is a one-board fit, so this is not a proof)", level: "tight", value: 1.0, kind: "judgement", source: "Konnect judgement; the Wd > Wc condition is holden-tt26-density-equation's, E is calibrated (FORK_CHANGES Pass 23)" },
+    Threshold { id: "density.u_tight", rule: "U above 1/1.2 (less than about 20 % spare)", level: "tight", value: 0.833, kind: "judgement", source: "Konnect judgement after holden-tt26-density-equation, which says both 'about 20 % is a good target, especially if autorouting' (U <= 0.83) and 'Try achieving a layout performance of from 1.05 to 1.15' (U about 0.87-0.95); the stricter reading is used" },
     Threshold { id: "crossings.layers", rule: "DSatur colours of the crossing graph exceed the signal layers by more than this", level: "tight", value: 1.0, kind: "judgement", source: "Konnect judgement, calibrated: the PoC mcu_board needs 3 colours on 2 layers and Freerouting completes it" },
     Threshold { id: "crossings.k_over_e", rule: "crossings per airwire", level: "tight", value: 0.3, kind: "judgement", source: "Konnect judgement" },
     Threshold { id: "crossings.vias", rule: "via estimate per airwire", level: "tight", value: 1.0, kind: "judgement", source: "Konnect judgement (2 vias per hop)" },
+    Threshold { id: "escape.neck_down", rule: "the escape fits the board's signal layers only with traces necked to the fab minimum in the breakout", level: "tight", value: 0.0, kind: "judgement", source: "Konnect judgement; neck-down in the breakout is allowed by xilinx-ug1099-bga-design-rules" },
     Threshold { id: "escape.channel", rule: "interior nets over a side's channel capacity", level: "tight", value: 0.8, kind: "judgement", source: "Konnect judgement" },
     Threshold { id: "escape.fanout_pitch", rule: "neighbouring pads that both need a trace closer than the fab-minimum track pitch (narrower than the class pitch is reported as needs_neck_down only: necking down in the breakout is allowed, xilinx-ug1099-bga-design-rules)", level: "tight", value: 1.0, kind: "judgement", source: "Konnect judgement, from Wang's C formula" },
     Threshold { id: "cut.utilization", rule: "airwire demand over a full-board cut's capacity", level: "tight", value: 0.8, kind: "judgement", source: "Konnect judgement" },
@@ -124,6 +126,25 @@ pub fn tools() -> Vec<ToolDef> {
     )]
 }
 
+/// `nets` / `net_classes` as `export_specctra_dsn` reads them
+/// (`routing_group_argument`): an empty array or a blank name is refused,
+/// names are trimmed.
+fn group_names(args: &Value, key: &str) -> Result<Option<Vec<String>>, CallToolResult> {
+    match &args[key] {
+        Value::Null => Ok(None),
+        Value::Array(items) if items.is_empty() => Err(refuse(format!("'{key}' must name at least one; omit it for the whole board"))),
+        Value::Array(items) => items
+            .iter()
+            .map(|v| match v.as_str().map(str::trim) {
+                Some(name) if !name.is_empty() => Ok(name.to_string()),
+                _ => Err(refuse(format!("'{key}': every entry must be a non-empty name"))),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        _ => Err(refuse(format!("'{key}' must be an array of names"))),
+    }
+}
+
 fn refuse(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(message.into())
 }
@@ -142,11 +163,11 @@ fn string_list(args: &Value, key: &str) -> Result<Option<Vec<String>>, CallToolR
 
 async fn handle_check_routability(args: &Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
-    let nets = match string_list(args, "nets") {
+    let nets = match group_names(args, "nets") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let classes = match string_list(args, "net_classes") {
+    let classes = match group_names(args, "net_classes") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -257,6 +278,9 @@ fn read_saved(board: &std::path::Path) -> anyhow::Result<Result<String, CallTool
 #[derive(Debug, Clone)]
 pub(crate) struct NetRules {
     classes: BTreeMap<String, (f64, f64)>,
+    /// `netclass_assignments`: an explicit net → class map, which KiCad
+    /// applies before the patterns.
+    assignments: BTreeMap<String, String>,
     patterns: Vec<(String, String)>,
     pub fab_w: f64,
     pub fab_s: f64,
@@ -288,21 +312,31 @@ impl NetRules {
             .flatten()
             .filter_map(|p| Some((p["pattern"].as_str()?.to_string(), p["netclass"].as_str()?.to_string())))
             .collect();
+        let assignments = settings["netclass_assignments"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(net, class)| {
+                let class = class.as_str().or_else(|| class.as_array().and_then(|a| a.first()).and_then(Value::as_str))?;
+                Some((net.clone(), class.to_string()))
+            })
+            .collect();
         let design = project.map(|p| &p["board"]["design_settings"]["rules"]).unwrap_or(&null);
         Self {
             fab_w: design["min_track_width"].as_f64().unwrap_or(default.0).min(default.0),
             fab_s: design["min_clearance"].as_f64().unwrap_or(default.1).min(default.1),
             edge_clearance: design["min_copper_edge_clearance"].as_f64().unwrap_or(0.0),
             classes,
+            assignments,
             patterns,
         }
     }
 
     pub(crate) fn class_of(&self, net: &str) -> String {
-        self.patterns
-            .iter()
-            .find(|(pattern, _)| crate::tools::pcb_routing::glob_matches(pattern, net))
-            .map(|(_, class)| class.clone())
+        self.assignments
+            .get(net)
+            .cloned()
+            .or_else(|| self.patterns.iter().find(|(pattern, _)| crate::tools::pcb_routing::glob_matches(pattern, net)).map(|(_, class)| class.clone()))
             .filter(|class| self.classes.contains_key(class))
             .unwrap_or_else(|| "Default".to_string())
     }
@@ -372,7 +406,7 @@ fn net_of(node: &SexpNode) -> Option<String> {
 
 impl BoardModel {
     pub(crate) fn read(tree: &SexpNode) -> Self {
-        let copper = konnect_sexp::layers::copper(&konnect_sexp::layers::layers(tree))
+        let copper: Vec<(String, String)> = konnect_sexp::layers::copper(&konnect_sexp::layers::layers(tree))
             .into_iter()
             .map(|l| (l.name.clone(), l.kind.clone()))
             .collect();
@@ -416,6 +450,15 @@ impl BoardModel {
                     layers.extend(node.children().unwrap_or_default().iter().skip(1).filter_map(SexpNode::as_str).map(str::to_string));
                 }
             }
+            // KiCad's wildcards: `F&B.Cu` (both outer layers), `*.Cu` (all copper).
+            let layers: Vec<String> = layers
+                .into_iter()
+                .flat_map(|l| match l.as_str() {
+                    "F&B.Cu" => vec!["F.Cu".to_string(), "B.Cu".to_string()],
+                    "*.Cu" => copper.iter().map(|(n, _)| n.clone()).collect(),
+                    _ => vec![l],
+                })
+                .collect();
             let fills = zone
                 .find_all("filled_polygon")
                 .into_iter()
@@ -445,28 +488,46 @@ fn polygon_area(points: &[Pt]) -> f64 {
     (0..n).map(|i| points[i].0 * points[(i + 1) % n].1 - points[(i + 1) % n].0 * points[i].1).sum::<f64>().abs() / 2.0
 }
 
-/// Nets whose connections planes or pours make, and why. Their airwires are
-/// fan-out work (a via per pad), not routing demand.
-pub(crate) fn plane_nets(model: &BoardModel, board_area: f64) -> BTreeMap<String, String> {
+/// Plane nets and plane layers.
+pub(crate) struct Planes {
+    /// Nets whose connections planes or pours make, and why. Their airwires
+    /// are fan-out work (a via per pad), not routing demand.
+    pub nets: BTreeMap<String, String>,
+    /// Inner copper layers that are planes: typed `power`, or (KiCad types
+    /// inner layers `signal` by default) poured over at least half the board.
+    /// Not routed on unless the caller names them, and then their pour is
+    /// blocked.
+    pub layers: BTreeSet<String>,
+}
+
+pub(crate) fn planes(model: &BoardModel, board_area: f64) -> Planes {
     let kind_of = |layer: &str| model.copper.iter().find(|(n, _)| n == layer).map(|(_, k)| k.as_str());
-    let mut out = BTreeMap::new();
+    let mut nets = BTreeMap::new();
+    let mut layers = BTreeSet::new();
     for zone in &model.zones {
         let Some(net) = &zone.net else { continue };
+        let large = board_area > 0.0 && polygon_area(&zone.outline) >= 0.5 * board_area;
         for layer in &zone.layers {
+            let outer = layer == "F.Cu" || layer == "B.Cu";
             let reason = match kind_of(layer) {
-                Some("power") => Some(format!("plane on {layer}")),
+                Some("power") => {
+                    layers.insert(layer.clone());
+                    Some(format!("plane on {layer}"))
+                }
                 Some("mixed") => Some(format!("pour on mixed layer {layer} (its area counts as blocked for routing)")),
-                Some(_) if (layer == "F.Cu" || layer == "B.Cu") && board_area > 0.0 && polygon_area(&zone.outline) >= 0.5 * board_area => {
-                    Some(format!("pour on {layer} over at least half the board (judgement)"))
+                Some(_) if large && outer => Some(format!("pour on {layer} over at least half the board (judgement)")),
+                Some(_) if large => {
+                    layers.insert(layer.clone());
+                    Some(format!("plane on {layer}: an inner layer typed signal but poured over at least half the board, treated as a plane layer (judgement)"))
                 }
                 _ => None,
             };
             if let Some(reason) = reason {
-                out.entry(net.clone()).or_insert(reason);
+                nets.entry(net.clone()).or_insert(reason);
             }
         }
     }
-    out
+    Planes { nets, layers }
 }
 
 // ─── Airwires ───────────────────────────────────────────────────────────────
@@ -745,7 +806,23 @@ fn to_local(p: Pt, centre: Pt, rotation: f64) -> Pt {
 /// The whole pre-check on a parsed board and its airwires. Pure: the tests
 /// call it with synthetic boards and airwires.
 pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airwire], group: Option<&Group>, options: &Options) -> Result<Value, String> {
-    // Signal layers.
+    if !model.outline.has_edges() {
+        return Err("the board has no Edge.Cuts outline: capacity cannot be measured".into());
+    }
+    let edges = model.outline.edges().to_vec();
+    // Raster resolution: about 3 million pixels per layer at most.
+    let bbox = edges.iter().fold((f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), |(a, b, c, d), &(p, q)| {
+        (a.min(p.0).min(q.0), b.min(p.1).min(q.1), c.max(p.0).max(q.0), d.max(p.1).max(q.1))
+    });
+    let res = (((bbox.2 - bbox.0) * (bbox.3 - bbox.1) / 3.0e6).sqrt()).max(0.05);
+    let mut raster = Raster::new(bbox, res, 0);
+    raster.mark_board(&edges);
+    let board_area = raster.total_inside_area();
+    let plane_info = planes(model, board_area);
+    let planes = &plane_info.nets;
+
+    // Signal layers: signal and mixed copper, minus inner layers that are
+    // planes (typed `power`, or poured over half the board whatever their type).
     let layers: Vec<String> = match &options.signal_layers {
         Some(names) => {
             let unknown: Vec<&String> = names.iter().filter(|n| !model.copper.iter().any(|(c, _)| c == *n)).collect();
@@ -758,66 +835,58 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
             }
             names.clone()
         }
-        None => model.copper.iter().filter(|(_, k)| k == "signal" || k == "mixed").map(|(n, _)| n.clone()).collect(),
+        None => model
+            .copper
+            .iter()
+            .filter(|(n, k)| (k == "signal" || k == "mixed") && !plane_info.layers.contains(n))
+            .map(|(n, _)| n.clone())
+            .collect(),
     };
     if layers.is_empty() {
         return Err("the board has no signal or mixed copper layer to route on".into());
     }
-    if !model.outline.has_edges() {
-        return Err("the board has no Edge.Cuts outline: capacity cannot be measured".into());
-    }
     let all: Vec<usize> = (0..layers.len()).collect();
-    let edges = model.outline.edges().to_vec();
-
-    // Raster resolution: about 3 million pixels per layer at most.
-    let bbox = edges.iter().fold((f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), |(a, b, c, d), &(p, q)| {
-        (a.min(p.0).min(q.0), b.min(p.1).min(q.1), c.max(p.0).max(q.0), d.max(p.1).max(q.1))
-    });
-    let res = (((bbox.2 - bbox.0) * (bbox.3 - bbox.1) / 3.0e6).sqrt()).max(0.05);
-    let mut raster = Raster::new(bbox, res, layers.len());
-    raster.mark_board(&edges);
-    let board_area = raster.total_inside_area();
-    let planes = plane_nets(model, board_area);
+    raster.blocked = vec![vec![false; raster.nx * raster.ny]; layers.len()];
 
     // Obstacles: pads, tracks, vias, keep-outs, mixed-layer pours, edge clearance.
     let mut obstacles: Vec<Obstacle> = Vec::new();
     for pad in &model.pads {
         let on = if pad.smd { layer_indices(&layers, &[pad.layer.to_string()]) } else { all.clone() };
         if !on.is_empty() {
-            obstacles.push(Obstacle { shape: Shape::Poly(pad.outline.clone()), layers: on, net: pad.net.clone(), pad: true });
+            obstacles.push(Obstacle { shape: Shape::Poly(pad.outline.clone()), layers: on, net: pad.net.clone(), pad: true, edge: false });
         }
     }
     for t in &model.tracks {
         let on = layer_indices(&layers, std::slice::from_ref(&t.seg.layer));
         if !on.is_empty() {
-            obstacles.push(Obstacle { shape: Shape::Capsule { a: t.seg.a, b: t.seg.b, r: t.width / 2.0 }, layers: on, net: t.seg.net.clone(), pad: false });
+            obstacles.push(Obstacle { shape: Shape::Capsule { a: t.seg.a, b: t.seg.b, r: t.width / 2.0 }, layers: on, net: t.seg.net.clone(), pad: false, edge: false });
         }
     }
     for v in &model.vias {
-        obstacles.push(Obstacle { shape: Shape::Circle { c: v.at, r: v.size / 2.0 }, layers: all.clone(), net: v.net.clone(), pad: false });
+        obstacles.push(Obstacle { shape: Shape::Circle { c: v.at, r: v.size / 2.0 }, layers: all.clone(), net: v.net.clone(), pad: false, edge: false });
     }
     for (polygon, specs) in model.outline.track_keepouts() {
         let on: Vec<usize> = (0..layers.len()).filter(|&l| specs.iter().any(|s| keepout_applies(s, &layers[l]))).collect();
         if !on.is_empty() && polygon.len() >= 3 {
-            obstacles.push(Obstacle { shape: Shape::Poly(polygon.to_vec()), layers: on, net: None, pad: false });
+            obstacles.push(Obstacle { shape: Shape::Poly(polygon.to_vec()), layers: on, net: None, pad: false, edge: false });
         }
     }
     let mixed: BTreeSet<&str> = model.copper.iter().filter(|(_, k)| k == "mixed").map(|(n, _)| n.as_str()).collect();
     let mut blocked_pours = Vec::new();
     for zone in &model.zones {
-        for layer in zone.layers.iter().filter(|l| mixed.contains(l.as_str())) {
+        for layer in zone.layers.iter().filter(|l| mixed.contains(l.as_str()) || plane_info.layers.contains(*l)) {
             let Some(l) = layers.iter().position(|x| x == layer) else { continue };
             let fills: Vec<&Vec<Pt>> = zone.fills.iter().filter(|(fl, _)| fl == layer).map(|(_, p)| p).collect();
             let polygons: Vec<Vec<Pt>> = if fills.is_empty() { vec![zone.outline.clone()] } else { fills.into_iter().cloned().collect() };
             for polygon in polygons.into_iter().filter(|p| p.len() >= 3) {
-                obstacles.push(Obstacle { shape: Shape::Poly(polygon), layers: vec![l], net: zone.net.clone(), pad: false });
+                obstacles.push(Obstacle { shape: Shape::Poly(polygon), layers: vec![l], net: zone.net.clone(), pad: false, edge: false });
             }
             blocked_pours.push(json!({ "net": zone.net, "layer": layer }));
         }
     }
     if rules.edge_clearance > 0.0 {
         for &(a, b) in &edges {
-            obstacles.push(Obstacle { shape: Shape::Capsule { a, b, r: rules.edge_clearance }, layers: all.clone(), net: None, pad: false });
+            obstacles.push(Obstacle { shape: Shape::Capsule { a, b, r: rules.edge_clearance }, layers: all.clone(), net: None, pad: false, edge: true });
         }
     }
     for o in &obstacles {
@@ -836,6 +905,24 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
         } else {
             demand.push(w.clone());
         }
+    }
+    if let Some(g) = group.filter(|_| demand.is_empty()) {
+        // As export_specctra_dsn: a group with nothing to route is refused,
+        // each net with its reason.
+        let why: Vec<String> = g
+            .nets
+            .iter()
+            .map(|net| {
+                let pads = model.pads.iter().filter(|p| p.net.as_deref() == Some(net.as_str())).count();
+                let reason = match planes.get(net) {
+                    Some(plane) => format!("left to its plane: {plane}"),
+                    None if pads < 2 => "it has a single pad, so there is nothing to connect".to_string(),
+                    None => "already connected (no airwire)".to_string(),
+                };
+                format!("'{net}' ({reason})")
+            })
+            .collect();
+        return Err(format!("no net of the group needs routing: {}", why.join("; ")));
     }
     let (w0, s0) = rules.default_rule();
     let pitch: Vec<f64> = demand.iter().map(|w| {
@@ -861,11 +948,15 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
         let (a, b) = (&demand[c.i].net, &demand[c.j].net);
         let key = if a <= b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
         pairs.entry(key).or_insert((0, c.at)).0 += 1;
-        for w in [&demand[c.i], &demand[c.j]] {
-            let refs: BTreeSet<&String> = [&w.a.pad, &w.b.pad].into_iter().flatten().map(|(r, _)| r).collect();
-            for r in refs {
-                *by_part.entry(r.clone()).or_default() += 1;
-            }
+        // Each crossing counts once per part, even when both airwires touch it.
+        let refs: BTreeSet<&String> = [&demand[c.i], &demand[c.j]]
+            .into_iter()
+            .flat_map(|w| [&w.a.pad, &w.b.pad])
+            .flatten()
+            .map(|(r, _)| r)
+            .collect();
+        for r in refs {
+            *by_part.entry(r.clone()).or_default() += 1;
         }
     }
     let mut pair_list: Vec<_> = pairs.into_iter().collect();
@@ -934,18 +1025,30 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
             let half = ((hw * relative.cos()).abs() + (hh * relative.sin()).abs(), (hw * relative.sin()).abs() + (hh * relative.cos()).abs());
             let key = (pad.reference.clone(), pad.number.clone());
             let is_demand = demand_pads.contains(&key);
+            // A connection to another pad of the same part on a shared layer
+            // (a pin to its own exposed pad) is a direct stub inside the
+            // part, not escape demand.
+            let same_part_same_layer = |other: &AirwireEnd| {
+                other.pad.as_ref().is_some_and(|(r, _)| r == &pad.reference)
+                    && (!pad.smd || match &other.layers {
+                        EndLayers::All => true,
+                        EndLayers::One(l) => l == pad.layer,
+                    })
+            };
             let far: Vec<Pt> = demand
                 .iter()
                 .filter_map(|w| {
                     let own = |end: &AirwireEnd| end.pad.as_ref() == Some(&key) && (end.at.0 - pad.center.0).hypot(end.at.1 - pad.center.1) < 1e-3;
                     if own(&w.a) {
-                        Some(w.b.at)
+                        Some(&w.b)
                     } else if own(&w.b) {
-                        Some(w.a.at)
+                        Some(&w.a)
                     } else {
                         None
                     }
                 })
+                .filter(|other| !same_part_same_layer(other))
+                .map(|other| other.at)
                 .map(|p| to_local(p, centre, rotation))
                 .collect();
             package_pads.push(PackagePad {
@@ -961,14 +1064,29 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
         }
         let package = Package { reference: reference.clone(), pads: package_pads, rotation };
         let (w, s) = dominant_rule(&package, rules);
-        packages.push((escape::analyse_package(&package, &destinations, w, s), w, s));
+        packages.push((escape::analyse_package(&package, &destinations, w, s, (rules.fab_w, rules.fab_s)), w, s));
     }
     let mut escape_json = Vec::new();
     for (report, w, s) in &packages {
+        let (fw, fs) = (rules.fab_w.min(*w), rules.fab_s.min(*s));
+        let over = |needed: Option<usize>| needed.is_none_or(|n| n > layers.len());
         if let Some(needed) = report.layers_needed.filter(|&n| n > layers.len()) {
-            reasons.push(Reason { metric: "escape", level: "doomed", threshold: "escape.layers", detail: format!("{} needs {needed} signal layers to escape its pins and the board routes on {}", report.reference, layers.len()), measured: json!(needed) });
+            reasons.push(Reason { metric: "escape", level: "doomed", threshold: "escape.layers", detail: format!("{} needs {needed} signal layers to escape its pins even with traces necked to the fab minimum ({fw}/{fs} mm), and the board routes on {}", report.reference, layers.len()), measured: json!(needed) });
         } else if report.layers_needed.is_none() {
-            reasons.push(Reason { metric: "escape", level: "doomed", threshold: "escape.layers", detail: format!("{}: inner rows cannot escape (no trace fits between pads at w = {w} mm, s = {s} mm); needs via-in-pad/HDI or narrower tracks", report.reference), measured: Value::Null });
+            reasons.push(Reason { metric: "escape", level: "doomed", threshold: "escape.layers", detail: format!("{}: inner rows cannot escape: no trace fits between pads even at the fab minimum ({fw}/{fs} mm); needs via-in-pad/HDI or a finer process", report.reference), measured: Value::Null });
+        } else if report.needs_neck_down && over(report.layers_needed_at_class_rules) {
+            reasons.push(Reason {
+                metric: "escape",
+                level: "tight",
+                threshold: "escape.neck_down",
+                detail: format!(
+                    "{}: at the class rules ({w}/{s} mm) the escape needs {} signal layers; it fits in {} only with traces necked to the fab minimum ({fw}/{fs} mm) in the breakout",
+                    report.reference,
+                    report.layers_needed_at_class_rules.map_or("more".to_string(), |n| n.to_string()),
+                    layers.len()
+                ),
+                measured: json!(report.layers_needed_at_class_rules),
+            });
         }
         for side in &report.sides {
             if side.interior_assigned > 0 && (side.channel_utilization > threshold("escape.channel").value) {
@@ -1001,7 +1119,7 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
             level: "doomed",
             threshold: "cut.lower_bound",
             detail: format!(
-                "the {} line {}={} crosses the whole board; {} nets must cross it ({}) but it has {} lanes ({} at the fab minimum)",
+                "the {} line {}={} crosses the whole board; with existing copper kept, {} nets must cross it ({}) but it has {} lanes ({} at the fab minimum)",
                 axis_name(worst.axis), if worst.axis == geom::Axis::Horizontal { "y" } else { "x" }, worst.at,
                 worst.demand_nets_lower_bound, worst.lower_bound_nets.iter().take(6).cloned().collect::<Vec<_>>().join(", "),
                 worst.capacity_lanes, worst.capacity_lanes_at_fab_minimum
@@ -1055,8 +1173,8 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
 
     // 4. Density.
     let density = capacity::density(&board, &demand, &pitch, options.efficiency);
-    if density.utilization > threshold("density.u_doomed").value {
-        reasons.push(Reason { metric: "density", level: "doomed", threshold: "density.u_doomed", detail: format!("wiring demand {} mm exceeds capacity {} mm (E = {}; with the calibrated E this means denser than any board routed so far)", density.demand_mm, density.capacity_mm, options.efficiency), measured: json!(density.utilization) });
+    if density.utilization > threshold("density.beyond_calibration").value {
+        reasons.push(Reason { metric: "density", level: "tight", threshold: "density.beyond_calibration", detail: format!("wiring demand {} mm exceeds capacity {} mm at E = {}: denser than any board routed so far, not a proof", density.demand_mm, density.capacity_mm, options.efficiency), measured: json!(density.utilization) });
     } else if density.utilization > threshold("density.u_tight").value {
         reasons.push(Reason { metric: "density", level: "tight", threshold: "density.u_tight", detail: format!("wiring demand {} mm against capacity {} mm leaves less than 20 % spare (E = {})", density.demand_mm, density.capacity_mm, options.efficiency), measured: json!(density.utilization) });
     }
@@ -1087,7 +1205,7 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
     let worst_nets = worst_nets(&demand, &crossing_list, worst_cuts.first().copied(), &congestion);
     let recommendation = match verdict {
         "doomed" => format!(
-            "Do not autoroute yet: a doomed reason is a necessary condition that fails, so no router can finish. Act on the named place first ({}), then check again.",
+            "Do not autoroute yet: a doomed reason is a proof (a full-board cut or a pin escape that cannot fit, with existing copper kept), so no router can finish. Act on the named place first ({}), then check again.",
             reasons.iter().filter(|r| r.level == "doomed").map(|r| r.detail.clone()).collect::<Vec<_>>().join("; ")
         ),
         "tight" => format!(
@@ -1124,6 +1242,7 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
             "fab_minimum": { "track_mm": rules.fab_w, "clearance_mm": rules.fab_s },
             "edge_clearance_mm": rules.edge_clearance,
             "blocked_pours": blocked_pours,
+            "plane_layers": plane_info.layers,
             "raster_mm": round3(res),
         },
         "crossings": crossings_json,

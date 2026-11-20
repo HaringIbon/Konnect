@@ -288,12 +288,12 @@ fn a_bga_grid_counts_rows_and_layers() {
         }
     }
     let package = Package { reference: "U9".into(), pads, rotation: 0.0 };
-    let report = escape::analyse_package(&package, &vec![Vec::new(); 36], 0.2, 0.2);
+    let report = escape::analyse_package(&package, &vec![Vec::new(); 36], 0.2, 0.2, (0.2, 0.2));
     let grid = report.grid.as_ref().unwrap();
     assert_eq!((grid.columns, grid.rows, grid.signal_rows, grid.c), (6, 6, 3, 0));
     assert_eq!(report.layers_needed, None);
     // At 0.1/0.1, C = 1 and D = floor((1.131 − 0.4 − 0.1)/0.2) = 3: 3 rows → 2 layers.
-    let report = escape::analyse_package(&package, &vec![Vec::new(); 36], 0.1, 0.1);
+    let report = escape::analyse_package(&package, &vec![Vec::new(); 36], 0.1, 0.1, (0.1, 0.1));
     let grid = report.grid.as_ref().unwrap();
     assert_eq!((grid.c, grid.d), (1, 3));
     assert_eq!(report.layers_needed, Some(2));
@@ -356,8 +356,9 @@ fn a_partly_routed_net_already_across_the_cut_owes_no_crossing() {
     let out = analyse(&m, &rules(), &airwires, None, &options()).unwrap();
     let doomed = &out["cuts"]["doomed"][0];
     assert_eq!(doomed["demand_nets_lower_bound"], 5, "{doomed}");
-    // The track splits B.Cu's 1 mm gap into two 0.4 mm slivers: no lane left there.
-    assert_eq!(doomed["capacity_lanes_per_layer"], json!([2, 0]), "{doomed}");
+    // The track splits B.Cu's 1 mm gap: 19.0–19.4 holds nothing, 19.6–20.0
+    // ends on the board edge (no edge clearance here), so one track fits.
+    assert_eq!(doomed["capacity_lanes_per_layer"], json!([2, 1]), "{doomed}");
 }
 
 #[test]
@@ -514,13 +515,16 @@ fn holden_density_verdicts_follow_u() {
     assert!(raw > 0.0 && raw < 0.1, "{}", out["density"]);
     assert_eq!(out["verdict"], "fine", "{:?}", reasons(&out));
     assert!(out["density"]["layout_efficiency_source"].as_str().unwrap().contains("calibrated"));
-    // E chosen so U is 0.9 → tight (sourced 20 % margin), then 1.5 → doomed.
-    for (u, level) in [(0.9, "tight"), (1.5, "doomed")] {
+    // Review H2: E is a one-board fit, so density never dooms. U 0.9 is
+    // tight (20 % margin), U 1.5 is tight "beyond calibration"; both judgement.
+    for (u, id) in [(0.9, "density.u_tight"), (1.5, "density.beyond_calibration")] {
         let o = Options { efficiency: raw / u, efficiency_given: true, ..options() };
         let out = analyse(&m, &rules(), &ws, None, &o).unwrap();
-        assert_eq!(out["verdict"], level, "{}", out["density"]);
+        assert_eq!(out["verdict"], "tight", "{}", out["density"]);
         let reason = out["reasons"].as_array().unwrap().iter().find(|r| r["metric"] == "density").unwrap();
-        assert_eq!(reason["threshold"]["kind"], "sourced");
+        assert_eq!(reason["threshold"]["id"], id);
+        assert_eq!(reason["threshold"]["kind"], "judgement");
+        assert!(!out["recommendation"].as_str().unwrap().contains("no router can finish"));
     }
 }
 
@@ -544,7 +548,7 @@ fn rudy_conserves_wire_length_and_finds_overflow() {
     assert!(c.worst_cells[0].utilization > 5.0);
     assert!((c.worst_cells[0].y - 10.5).abs() < 1e-9);
     // A pad covering a cell takes its supply away (SimPLR: obstacles count).
-    let pad = Obstacle { shape: Shape::Poly(vec![(5.0, 5.0), (6.0, 5.0), (6.0, 6.0), (5.0, 6.0)]), layers: vec![0], net: None, pad: true };
+    let pad = Obstacle { shape: Shape::Poly(vec![(5.0, 5.0), (6.0, 5.0), (6.0, 6.0), (5.0, 6.0)]), layers: vec![0], net: None, pad: true, edge: false };
     raster.mark_obstacle(&pad.shape, &pad.layers);
     let board = Board { layers: &layers, edges: &edges, obstacles: std::slice::from_ref(&pad), tracks: &[], raster: &raster, rules };
     let c = capacity::congestion(&board, &[wire("A", (5.2, 5.5), (5.8, 5.5))], &[0.4], 1.0);
@@ -639,11 +643,11 @@ fn fanout_pitch_uses_each_neighbours_own_track_width() {
     };
     let far = vec![Vec::new(); 16];
     let plain = Package { reference: "U5".into(), pads: [column(-3.0, None), column(3.0, None)].concat(), rotation: 0.0 };
-    let report = escape::analyse_package(&plain, &far, 0.2, 0.2);
+    let report = escape::analyse_package(&plain, &far, 0.2, 0.2, (0.2, 0.2));
     assert!(report.sides.iter().all(|s| s.fanout_pitch_ok), "{:?}", report.sides);
     // One 0.53 mm power trace beside a 0.2 mm one needs 0.565 mm: too tight at 0.5.
     let power = Package { reference: "U5".into(), pads: [column(-3.0, Some(3)), column(3.0, None)].concat(), rotation: 0.0 };
-    let report = escape::analyse_package(&power, &far, 0.2, 0.2);
+    let report = escape::analyse_package(&power, &far, 0.2, 0.2, (0.2, 0.2));
     let west = report.sides.iter().find(|s| s.faces == "west").unwrap();
     assert!(!west.fanout_pitch_ok);
     assert_eq!((west.tightest_demand_pitch_mm, west.needed_pitch_mm), (Some(0.5), Some(0.565)));
@@ -669,4 +673,174 @@ fn pads_too_close_even_for_fab_minimum_traces_make_the_board_tight() {
     let reason = out["reasons"].as_array().unwrap().iter().find(|r| r["threshold"]["id"] == "escape.fanout_pitch").expect("fan-out reason");
     assert_eq!(reason["level"], "tight");
     assert!(reason["detail"].as_str().unwrap().contains("U1 south"), "{reason}");
+}
+
+
+// ─── Review fixes (Pass 23 review of f1dd99e) ──────────────────────────────
+
+fn bga_package() -> Package {
+    let mut pads = Vec::new();
+    for j in 0..6 {
+        for i in 0..6 {
+            pads.push(PackagePad { number: format!("{i}{j}"), net: Some(format!("B{i}{j}")), local: (i as f64 * 0.8, j as f64 * 0.8), half: (0.2, 0.2), demand: true, round: true, rule: None });
+        }
+    }
+    Package { reference: "U9".into(), pads, rotation: 0.0 }
+}
+
+#[test]
+fn review_h1_bga_escape_is_judged_at_the_fab_minimum() {
+    // 0.8 mm BGA, 0.4 mm balls: C = 0 at 0.2/0.2 but 1 at 0.1/0.1 (neck-down
+    // in the breakout is allowed, UG1099).
+    let report = escape::analyse_package(&bga_package(), &vec![Vec::new(); 36], 0.2, 0.2, (0.1, 0.1));
+    assert_eq!(report.layers_needed, Some(2), "{report:?}");
+    assert_eq!(report.layers_needed_at_class_rules, None);
+    assert!(report.needs_neck_down);
+    let grid = report.grid.as_ref().unwrap();
+    assert_eq!((grid.c, grid.c_at_fab_minimum), (0, 1));
+    // Without a finer fab minimum it still cannot escape.
+    let stuck = escape::analyse_package(&bga_package(), &vec![Vec::new(); 36], 0.2, 0.2, (0.2, 0.2));
+    assert_eq!(stuck.layers_needed, None);
+    assert!(!stuck.needs_neck_down);
+}
+
+#[test]
+fn review_m5_a_pin_wired_to_its_own_exposed_pad_is_a_stub_not_escape() {
+    // EP and ring pad W1 share a non-plane net; on one layer this must not doom.
+    let mut extra = qfn("U1", 10.0, 10.0, 4, "AGND");
+    extra = extra.replace("(net \"U1_W1\")", "(net \"AGND\")");
+    let m = model(20.0, 20.0, &extra);
+    let airwires = mst_airwires(&m);
+    assert!(airwires.iter().any(|w| w.net == "AGND"), "{airwires:?}");
+    let one = Options { signal_layers: Some(vec!["F.Cu".into()]), ..options() };
+    let out = analyse(&m, &rules(), &airwires, None, &one).unwrap();
+    assert_ne!(out["verdict"], "doomed", "{:?}", reasons(&out));
+    let u1 = out["escape"].as_array().unwrap().iter().find(|e| e["reference"] == "U1").unwrap();
+    assert!(u1["interior_needs_via"].as_array().unwrap().is_empty(), "{u1}");
+    assert!(u1["via_outside_ring"].as_array().unwrap().is_empty(), "{u1}");
+}
+
+#[test]
+fn review_m3_a_signal_typed_inner_layer_poured_over_the_board_is_a_plane() {
+    let text = format!(
+        "(kicad_pcb (version 20260206) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" signal) (2 \"B.Cu\" signal) (25 \"Edge.Cuts\" user)) \
+         (gr_rect (start 0 0) (end 20 20) (layer \"Edge.Cuts\")) {}{} \
+         (zone (net \"GND\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 20 0) (xy 20 20) (xy 0 20)))))",
+        part("R1", 4.0, 10.0, "GND", "N"),
+        part("R2", 16.0, 10.0, "N", "GND")
+    );
+    let m = BoardModel::read(&parse_sexp(&text).unwrap());
+    let out = analyse(&m, &rules(), &mst_airwires(&m), None, &options()).unwrap();
+    assert_eq!(out["rules"]["signal_layers"], json!(["F.Cu", "B.Cu"]), "{}", out["rules"]);
+    assert_eq!(out["rules"]["plane_layers"], json!(["In1.Cu"]));
+    assert_eq!(out["airwires"]["plane_net_airwires"], 1);
+    assert_eq!(out["airwires"]["demand"], 1);
+    // Named by the caller, the layer is routed on with its pour blocked.
+    let with = Options { signal_layers: Some(vec!["F.Cu".into(), "In1.Cu".into(), "B.Cu".into()]), ..options() };
+    let out = analyse(&m, &rules(), &mst_airwires(&m), None, &with).unwrap();
+    let caps = &out["density"]["per_layer_capacity_mm"];
+    assert!(caps["In1.Cu"].as_f64().unwrap() < 0.05 * caps["B.Cu"].as_f64().unwrap(), "{caps}");
+}
+
+#[test]
+fn review_l8_zone_layer_wildcards_are_expanded() {
+    let extra = format!(
+        "{}{}(zone (net \"GND\") (layers \"F&B.Cu\") (polygon (pts (xy 0 0) (xy 20 0) (xy 20 20) (xy 0 20))))",
+        part("R1", 4.0, 10.0, "GND", "N"),
+        part("R2", 16.0, 10.0, "N", "GND")
+    );
+    let m = model(20.0, 20.0, &extra);
+    let zone = m.zones.iter().find(|z| z.net.as_deref() == Some("GND")).unwrap();
+    assert_eq!(zone.layers, vec!["F.Cu".to_string(), "B.Cu".to_string()]);
+    let out = analyse(&m, &rules(), &mst_airwires(&m), None, &options()).unwrap();
+    assert!(out["airwires"]["plane_nets"]["GND"].as_str().unwrap().contains("F.Cu"));
+}
+
+#[tokio::test]
+async fn review_m4_groups_are_read_as_export_specctra_dsn_reads_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.kicad_pcb");
+    let extra = format!(
+        "{}{}(zone (net \"GND\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 20 0) (xy 20 20) (xy 0 20))))",
+        part("R1", 4.0, 10.0, "GND", "N"),
+        part("R2", 16.0, 10.0, "N", "GND")
+    );
+    std::fs::write(&path, board_text(20.0, 20.0, &extra)).unwrap();
+    let ctx = crate::tools::ToolContext::new(crate::tools::ServerConfig::default(), std::sync::Arc::new(crate::router::ToolRouter::new()));
+    let text = |r: &CallToolResult| match &r.content[0] {
+        crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+        _ => String::new(),
+    };
+    // An empty array, a blank name, and a group left entirely to its plane are refused.
+    for (args, needle) in [
+        (json!({ "board": path, "airwires": "mst", "nets": [] }), "at least one"),
+        (json!({ "board": path, "airwires": "mst", "nets": ["  "] }), "non-empty"),
+        (json!({ "board": path, "airwires": "mst", "nets": ["GND"] }), "left to its plane"),
+    ] {
+        let r = handle_check_routability(&args, &ctx).await.unwrap();
+        assert!(r.is_error, "{args}");
+        assert!(text(&r).contains(needle), "{}: {}", args, text(&r));
+    }
+    // Names are trimmed.
+    let r = handle_check_routability(&json!({ "board": path, "airwires": "mst", "nets": [" N "] }), &ctx).await.unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+}
+
+#[test]
+fn review_m4_netclass_assignments_come_before_patterns() {
+    let project = json!({
+        "net_settings": {
+            "classes": [ { "name": "Default", "track_width": 0.2, "clearance": 0.2 }, { "name": "Power", "track_width": 0.5, "clearance": 0.25 }, { "name": "Fast", "track_width": 0.3, "clearance": 0.2 } ],
+            "netclass_assignments": { "/CLK": ["Fast"], "/VIN": "Power" },
+            "netclass_patterns": [ { "pattern": "/*", "netclass": "Power" } ]
+        }
+    });
+    let r = NetRules::from_project(Some(&project));
+    assert_eq!(r.class_of("/CLK"), "Fast");
+    assert_eq!(r.class_of("/VIN"), "Power");
+    assert_eq!(r.class_of("/OTHER"), "Power");
+}
+
+#[test]
+fn review_l6_a_crossing_counts_once_per_part() {
+    // Two airwires from U1 that cross each other: one crossing, U1 counted once.
+    let extra = format!("{}{}{}", qfn("U1", 10.0, 10.0, 4, "GNDX"), part("R1", 17.0, 9.0, "U1_W1", "Q"), part("R2", 3.0, 9.0, "U1_E2", "Q2"));
+    let m = model(20.0, 20.0, &extra);
+    let out = analyse(&m, &rules(), &mst_airwires(&m), None, &options()).unwrap();
+    assert_eq!(out["crossings"]["crossings"], 1);
+    let u1 = out["crossings"]["crossings_by_part"].as_array().unwrap().iter().find(|p| p["reference"] == "U1").unwrap();
+    assert_eq!(u1["crossings"], 1, "{}", out["crossings"]);
+}
+
+#[test]
+fn review_l9_the_edge_band_is_not_charged_a_clearance_twice() {
+    // 20 mm wide board, 0.5 mm edge clearance, nothing else on the line:
+    // free 0.5..19.5 = 19 mm, both ends on the edge band. 48 tracks need
+    // 48·0.2 + 47·0.2 = 19.0 mm, so 48 fit; charging s at the edges again gave 47.
+    let project = json!({ "board": { "design_settings": { "rules": { "min_copper_edge_clearance": 0.5 } } } });
+    let r = NetRules::from_project(Some(&project));
+    let m = model(20.0, 20.0, &crossing_nets(1));
+    let airwires: Vec<Airwire> = mst_airwires(&m).into_iter().filter(|w| w.net.starts_with('V')).collect();
+    let out = analyse(&m, &r, &airwires, None, &options()).unwrap();
+    let cut = out["cuts"]["worst"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["axis"] == "horizontal" && (5.0..15.0).contains(&c["at"].as_f64().unwrap()))
+        .expect("a horizontal cut clear of the parts");
+    assert_eq!(cut["capacity_lanes_per_layer"], json!([48, 48]), "{cut}");
+}
+
+#[test]
+fn review_l7_channel_cuts_span_only_the_gap() {
+    let pads = |x: f64| -> String { (0..8).map(|k| format!("(pad \"{}\" smd rect (at {x} {}) (size 0.5 0.3) (layers \"F.Cu\") (net \"Q{k}\"))", k + 1, -2.0 + 0.5 * k as f64)).collect() };
+    let a = format!("(footprint \"A\" (layer \"F.Cu\") (at 5 10) (property \"Reference\" \"A1\") (fp_rect (start -3 -3) (end 3 3) (layer \"F.CrtYd\")) {})", pads(-2.0));
+    let b = "(footprint \"A\" (layer \"F.Cu\") (at 13 10) (property \"Reference\" \"A2\") (fp_rect (start -3 -3) (end 3 3) (layer \"F.CrtYd\")) (pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\") (net \"Q\")))";
+    let m = model(20.0, 20.0, &format!("{a}{b}"));
+    // An airwire through A1's body (x = 6) is not in the gap (8..10).
+    let airwires = vec![wire("W0", (6.0, 1.0), (6.0, 19.0)), wire("W1", (9.0, 1.0), (9.0, 19.0))];
+    let out = analyse(&m, &rules(), &airwires, None, &options()).unwrap();
+    let channel = out["channels"].as_array().unwrap().iter().find(|c| c["between"] == json!(["A1", "A2"])).unwrap();
+    assert_eq!(channel["demand_airwires"], 1, "{channel}");
+    assert_eq!((channel["from"].as_f64().unwrap(), channel["to"].as_f64().unwrap()), (8.0, 10.0));
 }

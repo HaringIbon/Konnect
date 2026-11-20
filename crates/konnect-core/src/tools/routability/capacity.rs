@@ -41,6 +41,9 @@ pub(crate) struct Obstacle {
     pub layers: Vec<usize>,
     pub net: Option<String>,
     pub pad: bool,
+    /// The board-edge clearance band. A free interval ending on it needs no
+    /// track clearance at that end: the band already is the clearance.
+    pub edge: bool,
 }
 
 /// Track geometry for the cuts and the grid.
@@ -75,6 +78,23 @@ pub(crate) struct Board<'a> {
 fn lanes(gap: f64, w: f64, s: f64) -> usize {
     let n = ((gap - s) / (w + s) + 1e-9).floor();
     if n > 0.0 { n as usize } else { 0 }
+}
+
+/// A free interval and how many of its ends lie on the board edge (or its
+/// clearance band) rather than on copper or a keep-out.
+#[derive(Debug, Clone, Copy)]
+struct Open {
+    a: f64,
+    b: f64,
+    edge_ends: u8,
+}
+
+impl Open {
+    /// The gap as the lane formula sees it: an end on the edge band needs no
+    /// extra clearance, so it gets one `s` back (the formula charges s at both ends).
+    fn gap(&self, s: f64) -> f64 {
+        self.b - self.a + s * f64::from(self.edge_ends)
+    }
 }
 
 /// One cut: a line (or a segment of it) and what must cross it.
@@ -136,9 +156,10 @@ pub(crate) fn cut(board: &Board, airwires: &[Airwire], pitch: &[f64], axis: Axis
     let mut per_layer = Vec::new();
     let mut lanes_fab = 0;
     let mut capacity_width = 0.0;
-    let mut free_by_layer: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut free_by_layer: Vec<Vec<Open>> = Vec::new();
     for (l, name) in board.layers.iter().enumerate() {
         let mut blocked = Vec::new();
+        let mut edge_band = Vec::new();
         for obstacle in board.obstacles.iter().filter(|o| o.layers.contains(&l)) {
             let (x0, y0, x1, y1) = obstacle.shape.bbox();
             let (lo, hi) = match axis {
@@ -148,13 +169,25 @@ pub(crate) fn cut(board: &Board, airwires: &[Airwire], pitch: &[f64], axis: Axis
             if at < lo || at > hi {
                 continue;
             }
-            blocked.extend(obstacle.shape.line_intervals(axis, at));
+            let intervals = obstacle.shape.line_intervals(axis, at);
+            if obstacle.edge {
+                edge_band.extend(intervals.iter().copied());
+            }
+            blocked.extend(intervals);
         }
-        let open = subtract(&base, &merge(blocked));
-        per_layer.push(open.iter().map(|&(a, b)| lanes(b - a, rules.w, rules.s)).sum());
-        lanes_fab += open.iter().map(|&(a, b)| lanes(b - a, rules.fab_w, rules.fab_s)).sum::<usize>();
-        capacity_width += open.iter().map(|&(a, b)| (b - a - rules.s_min).max(0.0)).sum::<f64>();
-        let mut shown = open.clone();
+        let edge_band = merge(edge_band);
+        let free_now = subtract(&base, &merge(blocked));
+        // An end is on the edge when it is where the edge band stops, or the
+        // board outline itself (a full-board cut's base interval ends).
+        let on_edge = |x: f64| {
+            edge_band.iter().any(|&(lo, hi)| (x - lo).abs() < 1e-6 || (x - hi).abs() < 1e-6)
+                || (range.is_none() && base.iter().any(|&(lo, hi)| (x - lo).abs() < 1e-6 || (x - hi).abs() < 1e-6))
+        };
+        let open: Vec<Open> = free_now.iter().map(|&(a, b)| Open { a, b, edge_ends: u8::from(on_edge(a)) + u8::from(on_edge(b)) }).collect();
+        per_layer.push(open.iter().map(|o| lanes(o.gap(rules.s), rules.w, rules.s)).sum());
+        lanes_fab += open.iter().map(|o| lanes(o.gap(rules.fab_s), rules.fab_w, rules.fab_s)).sum::<usize>();
+        capacity_width += open.iter().map(|o| (o.gap(rules.s_min) - rules.s_min).max(0.0)).sum::<f64>();
+        let mut shown = free_now.clone();
         shown.sort_by(|a, b| (b.1 - b.0).total_cmp(&(a.1 - a.0)));
         free.insert(name.clone(), shown.into_iter().take(4).map(|(a, b)| (round3(a), round3(b))).collect());
         free_by_layer.push(open);
@@ -223,7 +256,7 @@ pub(crate) fn cut(board: &Board, airwires: &[Airwire], pitch: &[f64], axis: Axis
         free_by_layer
             .iter()
             .flatten()
-            .map(|&(a, b)| lanes(b - a, min_pitch - rules.s_min, rules.s_min))
+            .map(|o| lanes(o.gap(rules.s_min), min_pitch - rules.s_min, rules.s_min))
             .sum()
     };
     let mut net_list: Vec<(String, usize)> = nets.into_iter().collect();
@@ -294,7 +327,7 @@ pub(crate) struct ChannelCut {
 /// Cuts across the gap between neighbouring parts: for two parts facing
 /// each other across a gap of at most `max_gap` mm with no third part in it
 /// (one of them an IC or connector),
-/// segments from one part's centre to the other's at a quarter, half and
+/// segments across the gap (courtyard to courtyard) at a quarter, half and
 /// three quarters of their shared span. A route can go round, so these only
 /// ever say "tight".
 pub(crate) fn channel_cuts(board: &Board, airwires: &[Airwire], pitch: &[f64], parts: &[PartBox], max_gap: f64) -> Vec<ChannelCut> {
@@ -328,9 +361,9 @@ pub(crate) fn channel_cuts(board: &Board, airwires: &[Airwire], pitch: &[f64], p
                     .map(|t| {
                         let at = span_lo + t * (span_hi - span_lo);
                         if horizontal_gap {
-                            cut(board, airwires, pitch, Axis::Horizontal, at, Some(((ax0 + ax1) / 2.0, (bx0 + bx1) / 2.0)))
+                            cut(board, airwires, pitch, Axis::Horizontal, at, Some((ax1, bx0)))
                         } else {
-                            cut(board, airwires, pitch, Axis::Vertical, at, Some(((ay0 + ay1) / 2.0, (by0 + by1) / 2.0)))
+                            cut(board, airwires, pitch, Axis::Vertical, at, Some((ay1, by0)))
                         }
                     })
                     .max_by(|x, y| x.utilization.total_cmp(&y.utilization));

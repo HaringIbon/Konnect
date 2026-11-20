@@ -172,8 +172,13 @@ pub(crate) struct EscapeReport {
     /// Grid arrays: rows holding signal pads, C and D (Wang), and UG1099 Eq. 2-1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grid: Option<GridReport>,
-    /// Signal layers the escape needs; `None` when it cannot escape at all.
+    /// Signal layers the escape needs with traces necked to the fab minimum
+    /// in the breakout; `None` when it cannot escape even then.
     pub layers_needed: Option<usize>,
+    /// The same at the net classes' widths and clearances.
+    pub layers_needed_at_class_rules: Option<usize>,
+    /// The class widths need more layers than necked-down traces do.
+    pub needs_neck_down: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -185,6 +190,8 @@ pub(crate) struct GridReport {
     pub signal_rows: usize,
     pub c: usize,
     pub d: usize,
+    /// C with fab-minimum traces in the breakout.
+    pub c_at_fab_minimum: usize,
     pub boundary_channels: usize,
     pub ug1099_layers: Option<usize>,
 }
@@ -215,11 +222,24 @@ fn net_pad(pad: &PackagePad) -> NetPad {
 
 /// Analyse one package. `destinations[i]` are the far ends (footprint frame)
 /// of pad `i`'s demand airwires; `w`/`s` are the track width and clearance.
-pub(crate) fn analyse_package(package: &Package, destinations: &[Vec<Pt>], w: f64, s: f64) -> EscapeReport {
-    if let Some(report) = analyse_grid(package, w, s) {
-        return report;
+///
+/// Doom is judged at the fabricator minimum `fab` (w, s): necking down in
+/// the breakout area is allowed (`xilinx-ug1099-bga-design-rules`: "necking
+/// down the trace width in the critical space between the BGA pads/vias (the
+/// breakout area) is allowable"). The rest of the report is at the class
+/// rules; `layers_needed_at_class_rules` and `needs_neck_down` say whether
+/// the class widths alone would need more.
+pub(crate) fn analyse_package(package: &Package, destinations: &[Vec<Pt>], w: f64, s: f64, fab: (f64, f64)) -> EscapeReport {
+    let at = |w: f64, s: f64| analyse_grid(package, w, s).unwrap_or_else(|| analyse_perimeter(package, destinations, w, s));
+    let mut report = at(w, s);
+    let necked = at(fab.0.min(w), fab.1.min(s));
+    report.layers_needed_at_class_rules = report.layers_needed;
+    report.layers_needed = necked.layers_needed;
+    report.needs_neck_down = report.layers_needed_at_class_rules != report.layers_needed;
+    if let (Some(grid), Some(necked)) = (report.grid.as_mut(), necked.grid.as_ref()) {
+        grid.c_at_fab_minimum = necked.c;
     }
-    analyse_perimeter(package, destinations, w, s)
+    report
 }
 
 fn analyse_grid(package: &Package, w: f64, s: f64) -> Option<EscapeReport> {
@@ -253,6 +273,7 @@ fn analyse_grid(package: &Package, w: f64, s: f64) -> Option<EscapeReport> {
         signal_rows,
         c,
         d,
+        c_at_fab_minimum: c,
         boundary_channels: 4 * (n - 1),
         ug1099_layers: ug1099_layers(demand, n, c.max(1)),
     };
@@ -266,6 +287,8 @@ fn analyse_grid(package: &Package, w: f64, s: f64) -> Option<EscapeReport> {
         interior_needs_via: Vec::new(),
         via_outside_ring: Vec::new(),
         layers_needed: array_layers_needed(signal_rows, c),
+        layers_needed_at_class_rules: None,
+        needs_neck_down: false,
         grid: Some(grid),
     })
 }
@@ -452,9 +475,12 @@ fn analyse_perimeter(package: &Package, destinations: &[Vec<Pt>], w: f64, s: f64
         via_outside_ring,
         grid: None,
         layers_needed: Some(if pads.iter().any(|p| p.demand) { 1 + usize::from(needs_second_layer) } else { 0 }),
+        layers_needed_at_class_rules: None,
+        needs_neck_down: false,
     }
 }
 
 pub(crate) fn round3(v: f64) -> f64 {
-    if v.is_finite() { (v * 1000.0).round() / 1000.0 } else { v }
+    // `+ 0.0` turns a rounded -0.0 into 0.0.
+    if v.is_finite() { (v * 1000.0).round() / 1000.0 + 0.0 } else { v }
 }
