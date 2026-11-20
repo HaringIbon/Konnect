@@ -2578,3 +2578,16 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
   - Trials leave out teardrop zones the import created for the nets they drop.
   - The re-import of the kept nets also fails on more unconnected items than its trial or another net's regression.
   - A rolled-back import's error carries the undo warning.
+
+## Unreleased (fork): `check_routability` pre-check (Pass 23)
+
+- **New tool `check_routability`** (`placement` toolset, read-only; live board over IPC when open, else the saved file). Arguments: `board`; optional `nets` / `net_classes` (same group meaning as `export_specctra_dsn`; unknown names refused), `signal_layers` (copper layer names; default the stack-up's `signal` and `mixed` layers), `cell_mm` (0.25–5, default 1), `layout_efficiency` (0 < E ≤ 1, default 0.13), `airwires` (`auto` default, `kicad`, `mst`).
+- **Response:** `verdict` (`doomed` | `tight` | `fine`), `reasons[]` (`metric`, `level`, `detail`, `measured`, `threshold {id, value, kind: sourced|judgement, source}`), `recommendation`, `airwires` (`source`: `kicad_drc` or `mst`, `fallback_reason`, `total`, `demand`, `plane_net_airwires`, `outside_group`, `plane_nets`), `rules`, `crossings`, `escape[]`, `cuts {doomed[], worst[]}`, `channels[]`, `congestion`, `density`, `pin_density`, `rotation_hints[]`, `thresholds[]`, `board_source`, and `group` for a grouped check.
+- No existing tool changed. `placement` now lists 6 tools; the registry has 249 tools (256 with the meta-tools).
+- Review follow-ups (same pass):
+  - `rules` gains `plane_layers` (power-typed inner layers), `ambiguous_plane_layers` (signal-typed inner layers poured over at least half the board), `ambiguous_plane_layers_note` and `proof_layers` (the layers the doom proofs route on).
+  - `escape[]` gains `layers_needed_at_class_rules`, `needs_neck_down`, `interior_needs_via_at_class_rules_only` and `via_outside_ring_at_class_rules_only`; `grid` gains `c_at_fab_minimum`. `layers_needed` and the via lists are at the fab minimum.
+  - `congestion.blocked_cells_with_demand` is new.
+  - Channels are informational (`channels_note`).
+  - Density only ever gives `tight`.
+  - A group with nothing left to route returns `fine` with `group.note`; an empty array, a blank name, or a group of only plane or single-pad nets is refused.
