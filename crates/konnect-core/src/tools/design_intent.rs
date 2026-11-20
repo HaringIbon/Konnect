@@ -3487,7 +3487,9 @@ fn plane_connection_checks(
                 ("pass", Some(why)) => ("unverified", format!("{detail}; but {why}")),
                 (s, _) => (s, detail),
             };
-            let mut measured = json!({"pad": name, "net": net, "layer": pad.layer, "connection": connection});
+            // `pad_uuid` and `at` tell same-numbered pads apart (a SOT-223's pin 2
+            // and tab 2), for fanout_to_plane (Pass 24 review H1).
+            let mut measured = json!({"pad": name, "pad_uuid": pad.uuid, "at": [r3(pad.center.0), r3(pad.center.1)], "net": net, "layer": pad.layer, "connection": connection});
             let shown = assigned.map(|a| &a.0).or(pp.chained.as_ref()).or(pp.best.as_ref());
             if let Some(p) = shown {
                 if let (Value::Object(m), Value::Object(d)) = (&mut measured, describe(p)) {

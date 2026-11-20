@@ -122,8 +122,11 @@ pub(crate) struct FanoutPlan {
 /// What the low-inductance planner decided for one pad, and why.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct PadDecision {
-    /// `REF.PAD`.
+    /// `REF.PAD`; numbers can repeat, so `pad_uuid` and `at` identify it.
     pub pad: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pad_uuid: Option<String>,
+    pub at: [f64; 2],
     pub net: String,
     pub layer: String,
     /// `via` (own via against the pad), `via_in_pad` (declared filled and
@@ -589,7 +592,10 @@ enum Obstacle {
     /// A pad as its true (rotated) rectangle, with its part's reference:
     /// another part's pad is an obstacle even on the same net (Pass 24: a
     /// via inside a neighbour's same-net pad made a daisy chain).
-    Poly { corners: [Point; 4], net: Option<String>, layers: Layers, reference: String },
+    /// `center` tells the pad itself from its part's other pads; `large`
+    /// (an exposed pad) is the only same-part, same-net pad a site may
+    /// enter (review M1).
+    Poly { corners: [Point; 4], net: Option<String>, layers: Layers, reference: String, center: Point, large: bool },
     Segment { a: Point, b: Point, half_width: f64, net: Option<String>, layer: String },
     Circle { center: Point, radius: f64, net: Option<String> },
 }
@@ -606,6 +612,8 @@ fn pad_obstacle(pad: &PadInfo) -> Obstacle {
         net: pad.net.clone(),
         layers: if pad.smd { Layers::One(pad.layer) } else { Layers::All },
         reference: pad.reference.clone(),
+        center: pad.center,
+        large: pad.size.0.min(pad.size.1) >= FanoutOptions::default().large_pad_mm,
     }
 }
 
@@ -839,9 +847,29 @@ pub(crate) fn plan(
 //   allows it (`pwr.decoupling_via_sharing_with_device`): same side, planes
 //   > 0.5 mm apart, the via adjacent to the pad, never another capacitor's.
 
+/// One pad's identity across the judge and the planner: its KiCad UUID,
+/// else its name and centre. Pad numbers repeat (a SOT-223's pin 2 and tab
+/// 2, a switch's 1, 1, 2, 2), so `REF.PAD` alone collapses them (Pass 24
+/// review H1).
+pub(crate) fn pad_identity(name: &str, uuid: Option<&str>, center: Point) -> String {
+    match uuid.filter(|u| !u.is_empty()) {
+        Some(u) => format!("uuid:{u}"),
+        None => {
+            let r = |v: f64| (v * 1000.0).round() / 1000.0 + 0.0;
+            format!("{name}@{:.3},{:.3}", r(center.0), r(center.1))
+        }
+    }
+}
+
+fn identity_of(p: &PadInfo) -> String {
+    pad_identity(&format!("{}.{}", p.reference, p.number), p.uuid.as_deref(), p.center)
+}
+
 /// The judge's verdict on one pad of the board as it is.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JudgeVerdict {
+    /// `REF.PAD`.
+    pub pad: String,
     pub status: String,
     pub connection: String,
     pub detail: String,
@@ -870,13 +898,16 @@ pub(crate) struct LowInductance {
     pub via_in_pad: bool,
     /// `share_with_ic: auto`.
     pub share_with_ic: bool,
-    /// A shared IC via must sit within this of the capacitor pad (copper edge to pad edge).
-    pub share_max_gap_mm: f64,
+    /// A shared IC via must sit within this of the capacitor pad (copper
+    /// edge to pad edge). `None`: butted against the pad, no further than
+    /// the own-via placement would put it (drill edge `hole_gap_mm` from the
+    /// pad, plus one 0.05 mm search step), so no real trace (review L8).
+    pub share_max_gap_mm: Option<f64>,
     /// No via under another part's body on the pad's side (its courtyard
-    /// less the 0.25 mm courtyard margin).
+    /// less the courtyard excess, [`courtyard_margin`]).
     pub avoid_courtyards: bool,
     pub nets: BTreeMap<String, NetRegime>,
-    /// Keyed by (`REF.PAD`, net).
+    /// Keyed by ([`pad_identity`], net).
     pub verdicts: BTreeMap<(String, String), JudgeVerdict>,
 }
 
@@ -886,7 +917,7 @@ impl Default for LowInductance {
             hole_gap_mm: 0.25,
             via_in_pad: false,
             share_with_ic: true,
-            share_max_gap_mm: 0.5,
+            share_max_gap_mm: None,
             avoid_courtyards: true,
             nets: BTreeMap::new(),
             verdicts: BTreeMap::new(),
@@ -920,6 +951,28 @@ struct Courtyard {
     edges: Vec<(Point, Point)>,
     bbox: Bbox,
     back: bool,
+    /// How far the courtyard stands off the body ([`courtyard_margin`]).
+    margin: f64,
+}
+
+/// The courtyard excess around a part's body, by its kind: IPC-7351B
+/// nominal (density level B) 0.15 mm for two-terminal chips smaller than
+/// 0603 and 0.25 mm otherwise [docdb kicad-fpgen-ipc7351b-two-terminal,
+/// kicad-fpgen-ipc-definitions]; the KiCad library's 0.5 mm for connectors
+/// and 1 mm for BGAs [docdb kicad-fpgen-config-klcv3]. Smaller than 0603:
+/// two pads and a courtyard no longer than 2.4 mm (0402: 1.82 mm; 0603:
+/// 2.96 mm in KiCad's library).
+fn courtyard_margin(reference: &str, footprint_name: &str, pads: usize, bbox: Bbox) -> f64 {
+    let long = (bbox.2 - bbox.0).max(bbox.3 - bbox.1);
+    if footprint_name.to_ascii_uppercase().contains("BGA") {
+        1.0
+    } else if ref_kind(reference) == "connector" {
+        0.5
+    } else if pads == 2 && long < 2.4 {
+        0.15
+    } else {
+        0.25
+    }
 }
 
 impl Courtyard {
@@ -961,8 +1014,11 @@ fn courtyards(tree: &SexpNode) -> Vec<Courtyard> {
             .to_string();
         let board = |(x, y): Point| konnect_sexp::geometry::transform_pad(x, y, fx, fy, rot);
         let mut edges: Vec<(Point, Point)> = Vec::new();
+        // The footprint's own side only: a footprint drawing both would read
+        // as two nested outlines, hollow to the even-odd test (review L5).
+        let own = if back { "B.CrtYd" } else { "F.CrtYd" };
         for shape in footprint.children().unwrap_or_default() {
-            if !matches!(shape.find_str("layer"), Some("F.CrtYd" | "B.CrtYd")) {
+            if shape.find_str("layer") != Some(own) {
                 continue;
             }
             let local: Vec<(Point, Point)> = match shape.head() {
@@ -1012,7 +1068,10 @@ fn courtyards(tree: &SexpNode) -> Vec<Courtyard> {
                 y1 = y1.max(p.1);
             }
         }
-        out.push(Courtyard { reference, edges, bbox: (x0, y0, x1, y1), back });
+        let name = footprint.get(1).and_then(SexpNode::as_str).unwrap_or("");
+        let pads = footprint.find_all("pad").len();
+        let bbox = (x0, y0, x1, y1);
+        out.push(Courtyard { margin: courtyard_margin(&reference, name, pads, bbox), reference, edges, bbox, back });
     }
     out
 }
@@ -1152,10 +1211,6 @@ fn blocker<'a>(site: Point, pad: &PadInfo, net: &str, obstacles: &[&'a Obstacle]
     obstacles.iter().copied().find(|o| !site_is_clear(site, pad, net, std::slice::from_ref(*o), via_r, half_w, clear, via_site))
 }
 
-/// How far into another part's courtyard a via may reach: the courtyard
-/// margin around the body (KiCad library convention KLC F5.3, 0.25 mm), so
-/// a via may sit in the margin but not under the body.
-const COURTYARD_MARGIN_MM: f64 = 0.25;
 
 #[allow(clippy::too_many_arguments)]
 fn li_site(
@@ -1218,8 +1273,8 @@ fn li_site(
                 refusals.add("keep-out".into());
                 continue;
             }
-            if let Some(y) = yards.iter().find(|y| y.reference != pad.reference && (y.back == (pad.layer == "B.Cu")) && y.circle_reaches_body(site, via_r, COURTYARD_MARGIN_MM)) {
-                refusals.add(format!("under {}'s body (courtyard less its margin)", y.reference));
+            if let Some(y) = yards.iter().find(|y| y.reference != pad.reference && (y.back == (pad.layer == "B.Cu")) && y.circle_reaches_body(site, via_r, y.margin)) {
+                refusals.add(format!("under {}'s body (courtyard less {} mm)", y.reference, y.margin));
                 continue;
             }
             if let Some(hit) = blocker(site, pad, net, obstacles, via_r, half_w, options.clearance_mm, true) {
@@ -1342,7 +1397,7 @@ pub(crate) fn plan_low_inductance(
         if ref_kind(&pad.reference) != "device" {
             continue;
         }
-        if let Some(v) = li.verdicts.get(&(name(pad), net.to_string())) {
+        if let Some(v) = li.verdicts.get(&(identity_of(pad), net.to_string())) {
             if v.status == "pass" && matches!(v.connection.as_str(), "via" | "via_in_pad") {
                 if let Some(at) = v.via {
                     if let Some(&(_, r)) = copper.get(net).and_then(|c| c.vias.iter().find(|(c, _)| (c.0 - at.0).hypot(c.1 - at.1) < 0.01)) {
@@ -1356,7 +1411,7 @@ pub(crate) fn plan_low_inductance(
     let mut cap_used: Vec<Point> = li
         .verdicts
         .iter()
-        .filter(|((p, _), v)| ref_kind(p.split('.').next().unwrap_or("")) == "capacitor" && v.status != "fail")
+        .filter(|(_, v)| ref_kind(v.pad.split('.').next().unwrap_or("")) == "capacitor" && v.status != "fail")
         .filter_map(|(_, v)| v.via)
         .collect();
     // Planned own vias per pad index (for the partner of a two-pad part).
@@ -1369,6 +1424,8 @@ pub(crate) fn plan_low_inductance(
         let pname = name(pad);
         let mut decision = PadDecision {
             pad: pname.clone(),
+            pad_uuid: pad.uuid.clone(),
+            at: [round4(pad.center.0), round4(pad.center.1)],
             net: net.to_string(),
             layer: pad.layer.to_string(),
             action: "no_site",
@@ -1390,7 +1447,7 @@ pub(crate) fn plan_low_inductance(
             result.pads.push(decision);
             continue;
         }
-        let verdict = li.verdicts.get(&(pname.clone(), net.to_string()));
+        let verdict = li.verdicts.get(&(identity_of(pad), net.to_string()));
         if let Some(v) = verdict {
             if let Some((kind, source)) = &v.exception {
                 decision.action = "exception";
@@ -1524,7 +1581,9 @@ pub(crate) fn plan_low_inductance(
                             let hole = d - if drill > 0.0 { drill / 2.0 } else { drill_r };
                             let centre = (at.0 - pad.center.0).hypot(at.1 - pad.center.1);
                             let stub = (centre - exit_distance(pad, at) - size / 2.0).max(0.0);
-                            let ok = gap <= li.share_max_gap_mm.min(limit) + 1e-9
+                            let drill_of = if drill > 0.0 { drill / 2.0 } else { drill_r };
+                            let max_gap = li.share_max_gap_mm.unwrap_or(((li.hole_gap_mm + drill_of) - size / 2.0).max(0.0) + 0.05);
+                            let ok = gap <= max_gap.min(limit) + 1e-9
                                 && (li.via_in_pad || hole >= li.hole_gap_mm - 1e-9)
                                 && geometry.track_allowed(pad.center, at, width / 2.0, pad.layer)
                                 && site_is_clear_in(at, pad, net, &near, 0.0, width / 2.0, options.clearance_mm, false)
@@ -1535,7 +1594,7 @@ pub(crate) fn plan_low_inductance(
                     if best.is_none() {
                         // Say why an IC via right there was not taken: the other side.
                         if let Some(&(_, _, _, owner, _)) = device_vias.iter().find(|(at, size, _, owner, n)| {
-                            n == net && pads[*owner].layer != pad.layer && point_rect_distance_rot(*at, pad) - size / 2.0 <= li.share_max_gap_mm
+                            n == net && pads[*owner].layer != pad.layer && point_rect_distance_rot(*at, pad) - size / 2.0 <= li.share_max_gap_mm.unwrap_or(0.5)
                         }) {
                             share_note = Some(format!(
                                 "not shared with {}: it is on the other side ({}): \"Decoupling capacitors should never share a via with an active device when they are located on opposite sides of the board\" [docdb learnemc-decoupling-widely-spaced-planes]",
@@ -1750,9 +1809,11 @@ impl LowInductance {
             let exception = m.get("exception").filter(|e| e.is_object()).map(|e| {
                 (e["kind"].as_str().unwrap_or("").to_string(), e["source"].as_str().unwrap_or("").to_string())
             });
+            let at = m["at"].as_array().and_then(|a| Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?))).unwrap_or((f64::NAN, f64::NAN));
             self.verdicts.insert(
-                (v.pad.clone(), v.net.clone()),
+                (pad_identity(&v.pad, m["pad_uuid"].as_str(), at), v.net.clone()),
                 JudgeVerdict {
+                    pad: v.pad.clone(),
                     status: v.status.clone(),
                     connection: m["connection"].as_str().unwrap_or("").to_string(),
                     detail: v.detail.clone(),
@@ -1809,6 +1870,8 @@ pub(crate) fn self_check(verdicts: &[crate::tools::design_intent::PlaneVerdict],
             let m = &v.measured;
             let mut row = serde_json::json!({
                 "pad": v.pad,
+                "pad_uuid": m["pad_uuid"],
+                "at": m["at"],
                 "net": v.net,
                 "status": v.status,
                 "connection": m["connection"],
@@ -1974,10 +2037,13 @@ fn site_is_clear(
     let other = |owner: &Option<String>| owner.as_deref() != Some(net);
     for obstacle in obstacles {
         match obstacle {
-            Obstacle::Poly { corners, net: owner, layers, reference } => {
-                // Another net's pad, or another part's pad on the same net:
-                // touching it would join that part's copper (a daisy chain).
-                if other(owner) || *reference != pad.reference {
+            Obstacle::Poly { corners, net: owner, layers, reference, center, large } => {
+                // Another net's pad, another part's pad on the same net
+                // (touching it would join that part's copper: a daisy chain),
+                // or a small pad of the same part (a via in the neighbouring
+                // pin). Only the pad itself and its part's exposed pad are free.
+                let itself = *reference == pad.reference && (center.0 - pad.center.0).hypot(center.1 - pad.center.1) < 1e-6;
+                if other(owner) || *reference != pad.reference || (!itself && !large) {
                     let same_layer = match layers {
                         Layers::All => true,
                         Layers::One(layer) => *layer == pad.layer,
@@ -2670,12 +2736,12 @@ mod low_inductance_tests {
     /// the via went into the neighbour's same-net pad, a daisy chain).
     fn boxed_in() -> String {
         let walls = [
-            seg("SIG", "F.Cu", (13.9, 13.6), (13.9, 16.4)),
-            seg("SIG", "F.Cu", (13.9, 13.6), (16.2, 13.6)),
-            seg("SIG", "F.Cu", (13.9, 16.4), (16.2, 16.4)),
-            seg("SIG", "B.Cu", (13.9, 13.6), (13.9, 16.4)),
-            seg("SIG", "B.Cu", (13.9, 13.6), (16.2, 13.6)),
-            seg("SIG", "B.Cu", (13.9, 16.4), (16.2, 16.4)),
+            seg("SIG", "F.Cu", (13.9, 14.15), (13.9, 15.85)),
+            seg("SIG", "F.Cu", (13.9, 14.15), (16.2, 14.15)),
+            seg("SIG", "F.Cu", (13.9, 15.85), (16.2, 15.85)),
+            seg("SIG", "B.Cu", (13.9, 14.15), (13.9, 15.85)),
+            seg("SIG", "B.Cu", (13.9, 14.15), (16.2, 14.15)),
+            seg("SIG", "B.Cu", (13.9, 15.85), (16.2, 15.85)),
         ]
         .join(" ");
         format!("{} {} {walls}", cap("C6", 15.0, 15.0, "SIG2", "GND"), cap("C5", 16.75, 15.0, "GND", "SIG3"))
@@ -2698,22 +2764,29 @@ mod low_inductance_tests {
         for v in &r.after {
             assert_ne!(v.measured["connection"], "daisy_chain", "{v:?}");
         }
-        // C6.2's open side is C5.1: no legal site, so it is listed with what blocked it.
+        // C6.2's open side is C5.1: no legal site, so it is listed with what
+        // blocked it; every other plane pad gets its via.
         let d = r.decision("C6.2");
-        if d.action == "no_site" {
-            assert!(d.reason.contains("C5"), "{}", d.reason);
-        }
+        assert_eq!(d.action, "no_site", "{d:?}");
+        assert!(d.reason.contains("C5's same-net pad"), "{}", d.reason);
+        assert_eq!(r.decision("C5.1").action, "via", "{:?}", r.decision("C5.1"));
+        assert!(!legacy.fanouts.iter().any(|f| f.reference == "C6" && f.via), "legacy must not reach into C5.1 either: {legacy:?}");
     }
 
-    /// U1.5 (GND) owns the via at (15, 10.9); C5.2 (GND) is 0.32 mm from it.
+    /// U1.5 (GND) owns the via at (15, 10.9); C5.1 (GND) is butted against
+    /// it (copper 0.10 mm, drill edge 0.25 mm from the pad).
     fn beside_ic(cap_layer_bottom: bool) -> String {
+        beside_ic_at(cap_layer_bottom, 16.16)
+    }
+
+    fn beside_ic_at(cap_layer_bottom: bool, cap_x: f64) -> String {
         let u1 = if cap_layer_bottom {
             device("U1", "B.Cu", 15.0, 10.0, &[("5", 0.0, 0.0, "GND"), ("6", 0.0, -3.0, "SIG")])
         } else {
             device("U1", "F.Cu", 15.0, 10.0, &[("5", 0.0, 0.0, "GND"), ("6", 0.0, -3.0, "SIG")])
         };
         let layer = if cap_layer_bottom { "B.Cu" } else { "F.Cu" };
-        format!("{u1} {} {} {}", seg("GND", layer, (15.0, 10.0), (15.0, 10.9)), gnd_via(15.0, 10.9), cap("C5", 16.38, 10.9, "GND", "+3V3"))
+        format!("{u1} {} {} {}", seg("GND", layer, (15.0, 10.0), (15.0, 10.9)), gnd_via(15.0, 10.9), cap("C5", cap_x, 10.9, "GND", "+3V3"))
     }
 
     #[test]
@@ -2728,6 +2801,15 @@ mod low_inductance_tests {
         assert_eq!((v.status.as_str(), v.measured["connection"].as_str()), ("pass", Some("shared_via_ok")), "{v:?}");
         // The other pad still gets its own via.
         assert_eq!(r.decision("C5.2").action, "via");
+        // 0.32 mm away there would be a real trace: not shared by default
+        // (LearnEMC: no trace between the pads and the via), shared only
+        // with the explicit share_max_gap opt-in.
+        let apart = board(&beside_ic_at(false, 16.38));
+        let r = run(&apart, &intent(Some(WIDE)));
+        assert_eq!(r.decision("C5.1").action, "via", "{:?}", r.decision("C5.1"));
+        let opt_in = LowInductance { share_max_gap_mm: Some(0.5), ..LowInductance::default() };
+        let r = run_with(&apart, &intent(Some(WIDE)), &opt_in, &|_| FanoutOptions::default());
+        assert_eq!(r.decision("C5.1").action, "share", "{:?}", r.decision("C5.1"));
         // share_with_ic never: own via.
         let never = LowInductance { share_with_ic: false, ..LowInductance::default() };
         let r = run_with(&text, &intent(Some(WIDE)), &never, &|_| FanoutOptions::default());
@@ -2754,13 +2836,14 @@ mod low_inductance_tests {
 
     #[test]
     fn a_capacitor_never_shares_another_capacitors_via() {
-        // C2.2 owns the via at (15, 10.9); C5.1 sits where it shared U1's above.
+        // C2.2 owns the via at (15, 10.9); C5.1 is butted against it, where
+        // it shared U1's via above.
         let parts = format!(
             "{} {} {} {}",
             cap("C2", 14.52, 10.0, "+3V3", "GND"),
             seg("GND", "F.Cu", (15.0, 10.0), (15.0, 10.9)),
             gnd_via(15.0, 10.9),
-            cap("C5", 16.38, 10.9, "GND", "+3V3")
+            cap("C5", 16.16, 10.9, "GND", "+3V3")
         );
         let r = run(&board(&parts), &intent(Some(WIDE)));
         let d = r.decision("C5.1");
@@ -2802,9 +2885,11 @@ mod low_inductance_tests {
                 assert!(d >= 0.5 - 1e-6, "{f:?} is {d:.3} mm from {}.{}", p.reference, p.number);
             }
         }
+        // Both pads still have a legal site (to the left, x < 14.0): planned.
         for pad in ["C1.1", "C1.2"] {
             let d = r.decision(pad);
-            assert!(matches!(d.action, "via" | "no_site"), "{d:?}");
+            assert_eq!(d.action, "via", "{d:?}");
+            assert_eq!(r.verdict(pad).status, "pass", "{:?}", r.verdict(pad));
         }
     }
 
@@ -2865,6 +2950,112 @@ mod low_inductance_tests {
         assert!(r.plan.fanouts.iter().any(|f| !f.via));
     }
 
+    /// A SOT-223-like regulator: pin 2 and the tab are both numbered 2 on
+    /// GND. The tab has its vias (passes); pin 2 runs 5.7 mm to a via (fails).
+    fn sot223(tab_first: bool) -> String {
+        let tab = "(pad \"2\" smd rect (at 0 -3.15) (size 3.5 2.0) (layers \"F.Cu\") (net \"GND\"))";
+        let pins = "(pad \"1\" smd rect (at -2.3 0) (size 0.95 2.0) (layers \"F.Cu\") (net \"VIN\"))
+            (pad \"2\" smd rect (at 0 0) (size 0.95 2.0) (layers \"F.Cu\") (net \"GND\"))
+            (pad \"3\" smd rect (at 2.3 0) (size 0.95 2.0) (layers \"F.Cu\") (net \"VOUT\"))";
+        let pads = if tab_first { format!("{tab} {pins}") } else { format!("{pins} {tab}") };
+        format!(
+            "(footprint \"SOT-223\" (layer \"F.Cu\") (at 15 15) (property \"Reference\" \"U9\") {pads}) {} {} {} {}",
+            gnd_via(14.0, 11.85),
+            gnd_via(16.0, 11.85),
+            seg("GND", "F.Cu", (15.0, 15.0), (15.0, 20.7)),
+            gnd_via(15.0, 20.7)
+        )
+    }
+
+    #[test]
+    fn same_numbered_pads_get_their_own_verdicts_and_decisions() {
+        for tab_first in [true, false] {
+            let r = run(&board(&sot223(tab_first)), &intent(Some(WIDE)));
+            let by_at = |y: f64| r.plan.pads.iter().find(|d| d.pad == "U9.2" && (d.at[1] - y).abs() < 1e-6).unwrap_or_else(|| panic!("{:#?}", r.plan.pads));
+            let (tab, pin) = (by_at(11.85), by_at(15.0));
+            assert_eq!(tab.action, "kept", "tab_first {tab_first}: the tab passes and gets no grid: {tab:?}");
+            assert!(matches!(pin.action, "via" | "tie"), "tab_first {tab_first}: pin 2 fails (5.7 mm) and gets a via: {pin:?}");
+            assert!(!r.plan.fanouts.iter().any(|f| f.in_pad), "no via grid in the passing tab");
+            // The self-check tells the two apart too, and both pass.
+            let rows: Vec<&PlaneVerdict> = r.after.iter().filter(|v| v.pad == "U9.2").collect();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|v| v.status == "pass"), "{rows:#?}");
+            assert_ne!(rows[0].measured["at"], rows[1].measured["at"]);
+        }
+    }
+
+    #[test]
+    fn a_via_never_lands_in_a_neighbouring_pin_of_the_same_part() {
+        // Two GND pins of one IC at 0.65 mm pitch: pin 1's via must not sit
+        // in (or touch) pin 2, which the judge would then call pin 2's
+        // via_in_pad.
+        let ic = "(footprint \"IC\" (layer \"F.Cu\") (at 15 15) (property \"Reference\" \"U1\")
+               (pad \"1\" smd rect (at 0 0) (size 0.4 1.5) (layers \"F.Cu\") (net \"GND\"))
+               (pad \"2\" smd rect (at 0.65 0) (size 0.4 1.5) (layers \"F.Cu\") (net \"GND\")))";
+        let text = board(ic);
+        let r = run(&text, &intent(Some(WIDE)));
+        let p1 = pad_of(&text, "U1.1");
+        let p2 = pad_of(&text, "U1.2");
+        for f in r.plan.fanouts.iter().filter(|f| f.via) {
+            let other = if f.pad == "1" { &p2 } else { &p1 };
+            let d = point_polygon_distance((f.via_x, f.via_y), &other.corners());
+            assert!(d >= 0.3 + 0.2 - 1e-6, "{f:?} is {d:.3} mm from the neighbouring pin");
+        }
+        for v in &r.after {
+            assert_ne!(v.measured["connection"], "via_in_pad", "{v:?}");
+        }
+        assert_eq!(r.plan.fanouts.iter().filter(|f| f.via).count(), 2, "{:#?}", r.plan.pads);
+    }
+
+    #[test]
+    fn small_chips_have_a_smaller_courtyard_margin() {
+        // IPC-7351B nominal: 0.15 mm below 0603, 0.25 mm otherwise; 0.5 mm
+        // for connectors (KiCad library), 1 mm for BGAs.
+        let tree = konnect_sexp::parse_sexp(&board(
+            "(footprint \"C_0402\" (layer \"F.Cu\") (at 5 5) (property \"Reference\" \"C9\")
+               (fp_rect (start -0.91 -0.46) (end 0.91 0.46) (layer \"F.CrtYd\"))
+               (pad \"1\" smd rect (at -0.48 0) (size 0.56 0.62) (layers \"F.Cu\") (net \"A\"))
+               (pad \"2\" smd rect (at 0.48 0) (size 0.56 0.62) (layers \"F.Cu\") (net \"B\")))
+             (footprint \"C_0805\" (layer \"F.Cu\") (at 10 5) (property \"Reference\" \"C8\")
+               (fp_rect (start -1.7 -0.98) (end 1.7 0.98) (layer \"F.CrtYd\"))
+               (pad \"1\" smd rect (at -0.95 0) (size 1 1.45) (layers \"F.Cu\") (net \"A\"))
+               (pad \"2\" smd rect (at 0.95 0) (size 1 1.45) (layers \"F.Cu\") (net \"B\")))
+             (footprint \"USB\" (layer \"F.Cu\") (at 20 5) (property \"Reference\" \"J1\")
+               (fp_rect (start -4 -3) (end 4 3) (layer \"F.CrtYd\")))
+             (footprint \"BGA-64\" (layer \"B.Cu\") (at 20 20) (property \"Reference\" \"U5\")
+               (fp_rect (start -4 -4) (end 4 4) (layer \"B.CrtYd\")) (fp_rect (start -9 -9) (end 9 9) (layer \"F.CrtYd\")))",
+        ))
+        .unwrap();
+        let yards = courtyards(&tree);
+        let margin = |r: &str| yards.iter().find(|y| y.reference == r).unwrap().margin;
+        assert_eq!((margin("C9"), margin("C8"), margin("J1"), margin("U5")), (0.15, 0.25, 0.5, 1.0));
+        // A back-side footprint uses its B.CrtYd only: the F.CrtYd ring
+        // around it would make it look hollow to the even-odd test.
+        let u5 = yards.iter().find(|y| y.reference == "U5").unwrap();
+        assert!(u5.back && u5.inside((20.0, 20.0)));
+        assert!((u5.bbox.2 - u5.bbox.0 - 8.0).abs() < 1e-9, "{:?}", u5.bbox);
+    }
+
+    #[test]
+    fn legacy_mode_keeps_the_old_placement() {
+        // The legacy planner's own result on a lone 0603-ish capacitor, as
+        // before Pass 24: the GND via straight out along the part's axis
+        // (+x), at the first clear 0.05 mm step. Low-inductance mode puts it
+        // beside the pads instead.
+        let text = board(&cap("C1", 15.0, 15.0, "SIG", "GND"));
+        let tree = konnect_sexp::parse_sexp(&text).unwrap();
+        let (legacy, _) = plan_with_judge(&tree, &nets(), &|_| FanoutOptions::default(), true, &LowInductance::default(), &intent(Some(WIDE)));
+        assert_eq!(legacy.mode, "legacy");
+        assert!(legacy.pads.is_empty());
+        let f = &legacy.fanouts[0];
+        assert!((f.via_y - 15.0).abs() < 1e-9 && f.via_x > 15.48, "{f:?}");
+        assert!(f.placement.is_none() && f.via_gap_mm.is_none());
+        // Own pad edge 15.76; legacy keeps the via copper 0.05 mm off it.
+        assert!((f.via_x - (15.76 + 0.3 + 0.05)).abs() <= 0.05 + 1e-9, "{f:?}");
+        let r = run(&text, &intent(Some(WIDE)));
+        assert_eq!(r.decision("C1.2").placement, Some("side"));
+    }
+
     #[test]
     fn a_via_beside_a_fracture_slit_of_the_fill_is_on_the_plane() {
         // A fill with one square hole (2..4, 2..4), joined to the outline by
@@ -2890,22 +3081,14 @@ mod low_inductance_tests {
         let yards = courtyards(&tree);
         assert_eq!(yards.len(), 1);
         let y = &yards[0];
-        assert!(!y.circle_reaches_body((13.6, 13.6), 0.3, COURTYARD_MARGIN_MM), "cut corner");
-        assert!(y.circle_reaches_body((10.0, 10.0), 0.3, COURTYARD_MARGIN_MM), "body");
+        assert_eq!(y.margin, 0.25, "an IC: IPC-7351B nominal");
+        assert!(!y.circle_reaches_body((13.6, 13.6), 0.3, y.margin), "cut corner");
+        assert!(y.circle_reaches_body((10.0, 10.0), 0.3, y.margin), "body");
         // In the 0.25 mm margin, the via circle not reaching the body.
-        assert!(!y.circle_reaches_body((10.0, 14.3), 0.3, COURTYARD_MARGIN_MM));
-        assert!(y.circle_reaches_body((10.0, 13.9), 0.3, COURTYARD_MARGIN_MM));
+        assert!(!y.circle_reaches_body((10.0, 14.3), 0.3, y.margin));
+        assert!(y.circle_reaches_body((10.0, 13.9), 0.3, y.margin));
     }
 
-    #[test]
-    fn legacy_mode_is_the_old_planner() {
-        let text = board(&cap("C1", 15.0, 15.0, "+3V3", "GND"));
-        let tree = konnect_sexp::parse_sexp(&text).unwrap();
-        let (legacy, _) = plan_with_judge(&tree, &nets(), &|_| FanoutOptions::default(), true, &LowInductance::default(), &intent(Some(WIDE)));
-        assert_eq!(legacy.mode, "legacy");
-        assert!(legacy.pads.is_empty());
-        assert_eq!(legacy.fanouts, plan(&tree, &nets(), &|_| FanoutOptions::default()).fanouts);
-    }
 }
 
 #[cfg(test)]
@@ -3027,7 +3210,7 @@ mod board_validation {
         let vias = plan.fanouts.iter().filter(|f| f.via).count();
         let shared = plan.fanouts.iter().filter(|f| f.shares_via_of.is_some()).count();
         println!("  decisions {by:?}\n  placements {placements:?}\n  vias added {vias}, shared {shared}");
-        for d in plan.pads.iter().filter(|d| d.action == "no_site" || d.action == "share" || d.action == "not_planned") {
+        for d in plan.pads.iter().filter(|d| d.action == "no_site" || d.action == "share" || d.action == "not_planned" || d.action == "via_grid") {
             println!("    {} {} {}: {}", d.pad, d.net, d.action, d.reason.chars().take(260).collect::<String>());
         }
         let gaps: Vec<f64> = plan.pads.iter().filter(|d| d.action == "via").filter_map(|d| d.stub_mm).collect();
