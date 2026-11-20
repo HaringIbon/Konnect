@@ -868,7 +868,7 @@ fn netclass_fanout_options(
 }
 
 /// KiCad netclass pattern match: `*` and `?` wildcards, otherwise exact.
-fn glob_matches(pattern: &str, name: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, name: &str) -> bool {
     fn go(p: &[u8], n: &[u8]) -> bool {
         match (p.first(), n.first()) {
             (None, None) => true,
@@ -2844,7 +2844,7 @@ struct ApplyEvidence {
 /// DRC of `source` with the project's own rules: KiCad reads the
 /// `.kicad_pro` and `.kicad_dru` beside a board, so a bare copy elsewhere is
 /// checked against defaults. Returns the report and the JSON KiCad wrote.
-async fn drc_with_project_rules(
+pub(crate) async fn drc_with_project_rules(
     cli_path: &str,
     board: &Path,
     source: &str,

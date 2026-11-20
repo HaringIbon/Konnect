@@ -336,6 +336,9 @@ struct PadInfo {
     smd: bool,
     layer: &'static str,
     footprint_center: Point,
+    /// The footprint's rotation in degrees and the pad's KiCad UUID.
+    footprint_rotation: f64,
+    uuid: Option<String>,
     /// KiCad pad shape (`rect`, `circle`, `oval`, `roundrect`, …) and the
     /// roundrect corner ratio.
     shape: String,
@@ -431,6 +434,8 @@ fn collect_pads(tree: &SexpNode) -> Vec<PadInfo> {
                 smd: kind == "smd",
                 layer: if back { "B.Cu" } else { "F.Cu" },
                 footprint_center: (fx, fy),
+                footprint_rotation: rot,
+                uuid: pad.find_str("uuid").map(str::to_string),
                 shape: pad.get(3).and_then(SexpNode::as_str).unwrap_or("rect").to_string(),
                 roundrect_ratio: pad.find_f64("roundrect_rratio").unwrap_or(0.25),
             });
@@ -1216,6 +1221,15 @@ pub(crate) struct CopperPad {
     pub smd: bool,
     /// The true pad outline (circle, oval, roundrect sampled), convex.
     pub outline: Vec<(f64, f64)>,
+    /// Centre in board coordinates, size in the pad's own frame, and the
+    /// pad's board-space angle (degrees, as KiCad writes it).
+    pub center: (f64, f64),
+    pub size: (f64, f64),
+    pub angle: f64,
+    /// The owning footprint's position and rotation (degrees).
+    pub footprint_center: (f64, f64),
+    pub footprint_rotation: f64,
+    pub uuid: Option<String>,
 }
 
 pub(crate) fn copper_pads(tree: &SexpNode) -> Vec<CopperPad> {
@@ -1229,6 +1243,12 @@ pub(crate) fn copper_pads(tree: &SexpNode) -> Vec<CopperPad> {
             net: pad.net,
             layer: pad.layer,
             smd: pad.smd,
+            center: pad.center,
+            size: pad.size,
+            angle: pad.angle,
+            footprint_center: pad.footprint_center,
+            footprint_rotation: pad.footprint_rotation,
+            uuid: pad.uuid,
         })
         .collect()
 }
@@ -1283,6 +1303,17 @@ impl BoardOutline {
                 || inside(b)
                 || (0..4).any(|i| segments_intersect(a, b, corners[i], corners[(i + 1) % 4]))
         })
+    }
+
+    /// The outline's edges as straight segments (arcs and circles sampled).
+    pub(crate) fn edges(&self) -> &[(Point, Point)] {
+        &self.0.edges
+    }
+
+    /// Track keep-outs: polygons with the copper layers they apply to
+    /// (`*.Cu` and `F&B.Cu` spelled as KiCad writes them).
+    pub(crate) fn track_keepouts(&self) -> Vec<(&[Point], &[String])> {
+        self.0.keepouts.iter().filter(|k| k.no_tracks).map(|k| (k.polygon.as_slice(), k.layers.as_slice())).collect()
     }
 
     /// Distance from `p` to the nearest outline edge.

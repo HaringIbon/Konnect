@@ -2578,3 +2578,9 @@ They store intent in `<project>.intent.json`. When applied, intent writes net cl
   - Trials leave out teardrop zones the import created for the nets they drop.
   - The re-import of the kept nets also fails on more unconnected items than its trial or another net's regression.
   - A rolled-back import's error carries the undo warning.
+
+## Unreleased (fork): `check_routability` pre-check (Pass 23)
+
+- **New tool `check_routability`** (`placement` toolset, read-only; live board over IPC when open, else the saved file). Arguments: `board`; optional `nets` / `net_classes` (same group meaning as `export_specctra_dsn`; unknown names refused), `signal_layers` (copper layer names; default the stack-up's `signal` and `mixed` layers), `cell_mm` (0.25–5, default 1), `layout_efficiency` (0 < E ≤ 1, default 0.13), `airwires` (`auto` default, `kicad`, `mst`).
+- **Response:** `verdict` (`doomed` | `tight` | `fine`), `reasons[]` (`metric`, `level`, `detail`, `measured`, `threshold {id, value, kind: sourced|judgement, source}`), `recommendation`, `airwires` (`source`: `kicad_drc` or `mst`, `fallback_reason`, `total`, `demand`, `plane_net_airwires`, `outside_group`, `plane_nets`), `rules`, `crossings`, `escape[]`, `cuts {doomed[], worst[]}`, `channels[]`, `congestion`, `density`, `pin_density`, `rotation_hints[]`, `thresholds[]`, `board_source`, and `group` for a grouped check.
+- No existing tool changed. `placement` now lists 6 tools; the registry has 249 tools (256 with the meta-tools).

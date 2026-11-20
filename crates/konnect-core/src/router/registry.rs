@@ -100,9 +100,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "placement",
-        description: "Placement quality and automation: score with named deductions, plan decoupling rows and BGA fanouts, first placement, force-directed refinement",
+        description: "Placement quality and automation: score with named deductions, routability pre-check (doomed/tight/fine), plan decoupling rows and BGA fanouts, first placement, force-directed refinement",
         category: "pcb",
-        tool_count: 5,
+        tool_count: 6,
     },
     ToolsetMeta {
         name: "pcb_export",
@@ -190,7 +190,11 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "pcb_board" => Some(pcb_board::tools()),
         "pcb_components" => Some(pcb_components::tools()),
         "pcb_routing" => Some(pcb_routing::tools()),
-        "placement" => Some(placement::tools()),
+        "placement" => Some({
+            let mut tools = placement::tools();
+            tools.extend(routability::tools());
+            tools
+        }),
         "design_intent" => Some(design_intent::tools()),
         "pcb_export" => Some(pcb_export::tools()),
         "library" => Some(library::tools()),

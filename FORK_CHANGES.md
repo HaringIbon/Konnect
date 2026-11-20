@@ -1219,3 +1219,135 @@ Rebased by merging `safe-writes` 78bb158 (Pass 21); this pass was renumbered fro
 - `konnect-core --lib`: 1959 passed, 0 failed.
 - Workspace: 2662 passed, 1 failed (the environmental `conformance_test` pin-label test).
 - `doc_tool_counts`: 6/6.
+
+## Pass 23: routability pre-check (Tier 2, item 2)
+
+**Problem (WORKFLOW §3.2, §5 item 1):** a doomed placement cost a 10-minute autoroute to discover. Ratsnest crossings, pin-escape capacity and channel capacity were worked out by hand (the module board's 23 → 5 unrouted came from reasoning about pins round the package), and nothing said where the board was short or which part to turn.
+
+**New tool `check_routability`** (`placement` toolset, read-only, `tools/routability/`). It returns `doomed | tight | fine` in 1.2–2.1 s on the benchmark boards, with every reason naming its threshold as `sourced` (doc-DB slug) or `judgement`, the measured value, and the coordinates, parts and nets behind it.
+- **Airwires.** KiCad's own ratsnest when possible: an offline `kicad-cli pcb drc` with zones refilled, on a copy with the project's rules (`drc_with_project_rules`, made `pub(crate)`). This counts partial routing and pours. Each `unconnected_items` entry becomes an airwire between the nearest anchors of its two items, found by UUID: a pad's centre, a track's nearer end, a via, or a zone's fill vertices. Without kicad-cli, or with `airwires: "mst"`: KiCad's construction, re-done. Per net, copper that touches is joined (weight 0), then Kruskal between clusters (`kicad-10-0-8-ratsnest-data`, `RN_NET::kruskalMST`). `airwires.source` says which was used.
+- **Demand.** Nets with a zone on a `power` layer, a pour on a `mixed` layer, or an outer pour over at least half the board (judgement) are plane nets. Their airwires are reported as fan-out work (`plane_net_airwires`), not demand. The tool does not rebuild Pass 17's "kept for mixed planes" split; mixed-layer pours count as blocked area on that layer instead. `nets` / `net_classes` restrict demand to one routing group, as `export_specctra_dsn` does.
+- **Rules.** Per net, the net class's track width and clearance, matched by `netclass_patterns` (`glob_matches`, made `pub(crate)`). Also the project's `min_track_width` / `min_clearance` (the "fab minimum") and `min_copper_edge_clearance`. Signal layers are the stack-up's `signal` and `mixed` copper layers, or `signal_layers`.
+
+**Metrics** (one module each, reusable by the Tier 3 pin-swap optimiser):
+1. **Crossings** (`crossings.rs`):
+   - Proper crossings between airwires of different nets; per layer, airwires crossing other nets' existing copper; the worst net pairs with a location.
+   - Layers: DSatur colouring of the conflict graph. Vias: colour classes mapped to layers to minimise end vias (one per single-layer end on another layer) plus 2 per crossing left on one layer. This generalises "2 per SMD–SMD airwire off its layer".
+   - No planarity, thickness or crossing-number bound: the airwire graph is a forest (`wikipedia-graph-thickness`, `wikipedia-crossing-number`). Crossings as a placement signal: `arxiv-2210-14259-ns-place`.
+   - Can only give `tight`: more than layers + 1 colours, K/E ≥ 0.3, or more than 1 via per airwire (judgement, calibrated below).
+   - `rotation_hints`: for the three parts in most crossings, the crossings and airwire length with the part turned 90/180/270°, plus whether any turn `improves`. The airwires are kept, not rebuilt.
+2. **Pin escape** (`escape.rs`), for footprints with at least 8 SMD pads:
+   - Wang's `C = ⌊(p − d − s)/(w + s)⌋` per gap and `D = ⌊(√2·p − d − s)/(w + s)⌋` (`wang-iccad06-escape-layer-minimization`). The text extraction reads "2p"; the PDF in `docs/raw` (page 2, rendered and checked) and both worked examples confirm √2·p. With 2p, 225/100/25/25 would give D = 6, not 3.
+   - AN114's 3-trace table row is inconsistent (`intel-an114-bga-board-design`), so the general formula is used.
+   - **Perimeter parts** (QFN/QFP/SOIC): pads on the pad-centre bounding box form the sides; the rest are interior. Per side:
+     - pitch, pad width, C, ΣC;
+     - interior nets assigned to the side facing their destination (overflow goes to `interior_needs_via`);
+     - ring pads wired to something inside the ring when C = 0 (`via_outside_ring`: a part underneath, the centre pad);
+     - nets whose far end is behind the part (`behind`);
+     - whether neighbouring pads that both need a trace are a track pitch apart. This uses each pad's own net width: half of each width plus the larger clearance.
+   - **Grid arrays** (≥ 9 round pads on a ≥ 3×3 lattice): signal rows, C, D, the 4(n − 1) boundary channels, UG1099 Eq. 2-1, and `layers = 1 + ⌈max(0, R − (C+1))/C⌉` from the outermost-row rule (`xilinx-ug1099-bga-design-rules`). C = 0 with more than one signal row cannot escape.
+   - `doomed` (sourced) when the escape needs more signal layers than the board has. `tight` (judgement) when interior nets use more than 80 % of a side's channels, or neighbouring trace pads are closer than their traces need.
+3. **Capacity** (`capacity.rs`):
+   - **Full-board section cuts** every 0.5 mm, horizontal and vertical (the section-crossing method named in `holden-tt42-density-equations`). Capacity per layer is Σ ⌊(g − s)/(w + s)⌋ over the free intervals. The free intervals are the line inside the outline minus the union of pads, tracks, vias, track keep-outs, mixed-layer pours and the edge clearance (`kim-iccad11-simplr`: count partial obstacles, union first).
+   - **Demand on a cut** is the airwires crossing it, minus those crossing on their own pad. The **lower bound** is the nets with copper on both sides and none of their own across the line: each must cross at least once.
+   - A full-board straight line cannot be gone round. So lower bound > lanes (at the narrowest crossing net's pitch), or Σ(w + s) > Σ(g − s_min), is a proof that no router can finish (`doomed`, sourced). The cut also reports the lanes at the fab minimum: "fits only if necked down".
+   - Airwire utilisation over 0.8 on a cut is `tight` (judgement).
+   - **Channel cuts** run between two parts facing each other across ≤ 3 mm with no third part between, one of them with at least 8 pads, sharing at least 2 mm. Each is a segment from one part's centre to the other's at 1/4, 1/2 and 3/4 of the shared span. A route can go round a channel, so these give only `tight` (utilisation > 1 with ≥ 3 airwires; judgement).
+   - **Congestion grid** (`cell_mm`): supply per cell is Σ_layers free area / (w + s), from a raster built from the same shape–line intersections as the cuts (`lou-ispd2001-probabilistic-congestion-slides`: tracks per pitch; PCB layers are not directional). Demand is RUDY per airwire, its box clamped to one track pitch and weighted by the net's pitch (`circuitnet-routability-features`, `arxiv-2206-03032-xie-thesis-rudy`). Overflow uses CircuitNet's definition.
+   - Cells with no free track at all (pin fields) are counted apart as `blocked_cells_with_demand`, not as overflow. Otherwise every fine-pitch pad cell overflowed.
+   - More than 5 % of cells overflowing is `tight` (judgement). On the benchmark boards it never exceeded 0.9 %.
+4. **Density** (`holden-tt26-density-equation`): Wd = Σ Manhattan airwire length (pitch-weighted); Wc = Σ_layers free area / (w + s) · E; U = Wd / Wc. U > 1 is `doomed` and U > 1/1.2 is `tight` (the source's "about 20 %" spare when autorouting). E is calibrated below.
+- **Pin density** (informational, no threshold): pins per cm² and per in² of board area (`cadence-burkhert-pcb-density-layer-count`).
+- **Verdict:** `doomed` if escape, a full-board cut or density says so; `tight` if any metric says so; else `fine`.
+- **`recommendation`:**
+  - `doomed`: the failing necessary condition, and what to change first.
+  - `tight`: the brief's tiebreaker, citing `kim-iccad11-simplr` (estimators miss what a router sees). Route the named worst nets first: the nets in the most crossings, on the worst cut and in the worst cells. Use a grouped `export_specctra_dsn`, about 10–20 passes and `per_net` import.
+
+**Calibration on the benchmark boards.** The setup:
+- Copies in the session scratchpad; the board files were not touched.
+- "rip" = unlocked routing removed (as Pass 22). "base" and the perturbations = all routing removed.
+- Freerouting 2.3.0 headless, 40 passes, on pcbnew's own DSN. The routes were imported with `ImportSpecctraSES`, then counted with `kicad-cli pcb drc --refill-zones`.
+- "FR open" is KiCad's unconnected count after the route; in brackets, signal nets only. GND/+3V3 openings are plane fan-out work, which the tool does not count as demand.
+- Freerouting is deterministic here: 4 repeated runs, identical results.
+- The PoC `mcu_board` and `led_board` were added as boards Freerouting completes. `stm32_nrf_module_wall` is the base module with a 1 mm track/via keep-out across the board at y = 118–119, leaving a 2 mm gap at the right edge.
+
+| board | verdict | reasons | airwires | K | K/E | k | vias | worst cut util | U (E=0.13) | pins/cm² | time s | FR open (signal) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| led_board_base | fine | | 3 | 0 | 0.00 | 1 | 0 | 0.02 | 0.09 | 1.3 | 1.2 | 0 (0) |
+| mcu_board_base | fine | | 29 | 8 | 0.28 | 3 | 8 | 0.05 | 0.24 | 6.2 | 1.4 | 7 (0) |
+| stm32_nrf_module_rip | tight | crossings | 33 | 29 | 0.88 | 3 | 35 | 0.12 | 0.63 | 24.2 | 1.7 | 6 (2) |
+| stm32_nrf_module_base | tight | crossings | 39 | 30 | 0.77 | 3 | 43 | 0.11 | 0.66 | 24.2 | 1.4 | 19 (3) |
+| stm32_nrf_module_u1r90 | tight | crossings | 39 | 40 | 1.03 | 5 | 56 | 0.11 | 0.70 | 24.2 | 1.4 | 20 (2) |
+| stm32_nrf_module_u1r180 | tight | crossings | 39 | 47 | 1.21 | 5 | 55 | 0.16 | 0.74 | 24.2 | 1.4 | 20 (3) |
+| stm32_nrf_module_swapJ2J7 | tight | crossings | 39 | 32 | 0.82 | 4 | 45 | 0.11 | 0.69 | 24.2 | 1.4 | 19 (3) |
+| stm32_nrf_module_wall | **doomed** | cuts (sourced), crossings | 39 | 30 | 0.77 | 3 | 43 | **1.08** | 0.67 | 24.2 | 1.4 | 26 (10) |
+| stm32_demo_rip | tight | crossings, density | 63 | 228 | 3.62 | 11 | 190 | 0.19 | 0.90 | 8.5 | 1.8 | 1 (1) |
+| stm32_demo_base | tight | crossings, density | 66 | 244 | 3.70 | 11 | 195 | 0.19 | 0.93 | 8.5 | 1.6 | 20 (2) |
+| stm32_demo_u1r90 | tight | crossings, density | 66 | 196 | 2.97 | 13 | 174 | 0.19 | 0.94 | 8.5 | 1.6 | 27 (5) |
+| stm32_demo_u1r180 | tight | crossings, density | 66 | 273 | 4.14 | 12 | 206 | 0.19 | 0.96 | 8.5 | 1.5 | 21 (6) |
+| stm32_demo_swapJ5J6 | tight | crossings, density | 66 | 281 | 4.26 | 10 | 246 | 0.20 | 0.93 | 8.5 | 1.5 | 19 (2) |
+| eth_board_rip | tight | crossings | 58 | 25 | 0.43 | 3 | 56 | 0.06 | 0.26 | 15.8 | 2.1 | 9 (5) |
+| eth_board_base | tight | crossings | 136 | 95 | 0.70 | 5 | 163 | 0.09 | 0.52 | 15.8 | 1.6 | 45 (5) |
+| eth_board_u4r180 | tight | crossings | 136 | 198 | 1.46 | 8 | 259 | 0.16 | 0.59 | 15.8 | 1.7 | 50 (10) |
+
+- **Verdict class against Freerouting: 16 of 16 consistent.**
+  - The two boards it completes are `fine`.
+  - Every board it leaves 1–10 signal nets open on is `tight`.
+  - The wall board is `doomed`. The failing cut names 7 nets (/NRF_IRQ, /NRF_RESET, /NRF_RX, /NRF_TX, /NRST, /SWCLK, …) against 6 lanes (8 at the fab minimum). Freerouting left 10 signal connections open, mostly those nets.
+- **The verdict is coarse.** `tight` spans 1 to 10 open nets, and no metric ranks the boards well. Spearman rank correlation with signal nets open over the 16 runs:
+  - K/E 0.13, K 0.24, vias per airwire 0.19, U 0.16, worst cut utilisation 0.37, overflow fraction 0.06;
+  - without the wall board: K/E 0.21, K 0.33.
+  - Absolute crossing counts do not transfer between designs: the demo, at K/E 3.7, routes better than the Ethernet board at 0.7.
+- **Perturbations (base → perturbed) against Freerouting:**
+  - Agree: Ethernet U4 180° (K 95 → 198; open 5 → 10); demo U1 180° (K 244 → 273, U 0.93 → 0.96; open 2 → 6); module wall (open 3 → 10).
+  - Metrics worse, Freerouting unchanged: demo J5/J6 swap; module U1 180° and J2/J7 swap.
+  - Disagree: demo U1 90°: K 244 → 196 and `rotation_hints` proposes exactly this turn (195 predicted), but Freerouting went 2 → 5. Module U1 90°: K 30 → 40, open 3 → 2.
+  - So the rotation what-if is a hint, not a predictor. The `tight` recommendation (a short grouped Freerouting pass) is the real tiebreaker, as `kim-iccad11-simplr` warns.
+- **Thresholds calibrated on these runs (judgement):**
+  - `crossings.layers` is now colours > layers + 1: the completed `mcu_board` needs 3 colours on 2 layers.
+  - K/E ≥ 0.3 separates `mcu_board` (0.28, complete) from every failing board (≥ 0.43).
+  - Vias per airwire > 1 does not fire on the complete boards.
+  - The cut, channel and congestion thresholds never fired on a real board except the wall. The worst real cut was at 0.20 and overflow at 0.9 % of cells; failures on these boards are local, not capacity.
+- **Fitted E (layout efficiency).** Holden's E is the share of capacity a router can deliver; `holden-tt42-density-equations` says to fit it on your own boards. Measured as routed signal track on F/B (plane nets excluded) over raw capacity (free area / pitch, ripped board):
+
+  | board | routed signal track (mm) | raw capacity (mm) | ratio | state |
+  |---|---|---|---|---|
+  | stm32_demo as saved | 1396 | 11102 | 0.126 | complete |
+  | stm32_demo Freerouting (rip) | 1402 | 11001 | 0.127 | 1 signal open |
+  | stm32_nrf_module as saved | 401 | 3694 | 0.109 | 5 open |
+  | eth_board as saved | 1098 | 15186 | 0.072 | 2 open |
+  | mcu_board Freerouting | 237 | 9045 | 0.026 | complete |
+  | led_board Freerouting | 21 | 2708 | 0.008 | complete |
+
+  - **E = 0.13**: the densest completed board, rounded up. This replaces the unsourced 0.5 placeholder. At 0.5 every board read U ≤ 0.25, so the metric could never fire.
+  - U > 1 now means "denser than any board routed so far", not a physical proof. The density `doomed` level rests on one dense completed board.
+  - Routed length is close to the Manhattan airwire length (demo 1396 against Wd 1341), so Wd needs no detour factor here.
+- **Pin density** (informational): module 24.2, Ethernet 15.8, demo 8.5, mcu 6.2, led 1.3 pins/cm². It ranks the boards' hand-routing effort, not Freerouting's result: the module is densest but has fewer open nets than the Ethernet board.
+
+**Tests:** 31 new unit tests in `tools/routability/tests.rs`, plus 1 ignored real-board report (`ROUTABILITY_BOARD`).
+- Formulas: Wang C and D on the paper's worked examples, with a 2p-versus-√2·p check; the UG1099 row rule and Eq. 2-1.
+- Geometry: line intervals per shape, interval algebra, raster area.
+- Crossings: proper crossings only; DSatur; via and layer plan, including through-hole ends; the crossing bundle is `tight` and never `doomed`; the rotation what-if.
+- Escape:
+  - a QFN with C = 0 and a signal centre pad needs a via, so it is `doomed` on one layer;
+  - a part underneath needs a via outside the ring;
+  - a net behind the part is flagged;
+  - BGA rows and layers;
+  - fan-out pitch with per-net widths; the fab-minimum reason.
+- Cuts:
+  - a keep-out wall with a 1 mm gap proves doom; four nets still fit it;
+  - a wall that can be gone round does not doom;
+  - a partly routed net across the cut owes no crossing, and its track takes the lane;
+  - channel cuts name the parts and never doom.
+- Airwires: the spanning tree joins existing copper at zero weight; DRC items become airwires between the nearest anchors (by UUID, a track's nearer end).
+- Plane nets, mixed-layer pours, groups, net classes from the project, the density verdict path, RUDY overflow against pin-field cells, threshold labelling (only sourced thresholds can doom), the `signal_layers` check, and the handler on a saved board.
+- `konnect-core --lib`: 1990 passed, 0 failed (was 1959). `doc_tool_counts`: 6/6. 249 registered tools, 256 with the meta-tools.
+
+**Known limits:**
+- **Cuts** are axis-parallel lines only. A diagonal wall, or a slot that is not straight, cannot prove doom. Channel cuts are only examined next to parts with at least 8 pads.
+- **Airwires are straight lines between KiCad's anchors.** Crossings depend on the ratsnest topology, which a router does not follow. Differential pairs are not treated as one unit.
+- **Plane nets:** outer-layer pours are not counted as blocked, and mixed-layer pours are blocked in full. A net with a small pour on a mixed layer is treated as carried by it.
+- **Widths come from net classes only.** Per-net `.kicad_dru` width rules are not read; the boards here carry intent widths as classes.
+- **Escape classification** uses the pad-centre bounding box. Modules with castellations, and connectors, get a rough side analysis. Escape demand counts only pads with an unrouted airwire, so a channel already used by existing tracks is not subtracted.
+- **Calibration:** E and the judgement thresholds come from 16 runs of 5 designs, all 2-signal-layer boards with inner planes, and one router (Freerouting 2.3.0, 40 passes). No 1-layer, 6-layer or BGA board was available, so the grid-escape and layers-needed paths are unit-tested only.
+- **Not validated live in KiCad's GUI.** The IPC (open board) source path is shared with `score_placement` but not exercised here. The MCP path was run against the release binary on saved files.
