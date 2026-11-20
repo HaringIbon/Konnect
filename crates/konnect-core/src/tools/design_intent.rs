@@ -2960,16 +2960,7 @@ fn plane_distance(layers: &LayerStack, a: &str, b: &str) -> Option<f64> {
 
 /// Is the part a capacitor / an active device, by its reference?
 fn ref_kind(reference: &str) -> &'static str {
-    let starts = |p: &str| reference.strip_prefix(p).is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
-    if starts("C") {
-        "capacitor"
-    } else if starts("U") || starts("IC") || starts("Q") {
-        "device"
-    } else if starts("J") || starts("CN") || starts("P") || starts("X") {
-        "connector"
-    } else {
-        "other"
-    }
+    crate::tools::fanout::ref_kind(reference)
 }
 
 /// The decoupling regime of the net's planes.
@@ -3056,7 +3047,7 @@ fn plane_connection_checks(
             (None, Some(v)) => (v, "user (intent max_plane_stub_mm)".to_string()),
             _ => (default_limit, default_source.clone()),
         };
-        let required = json!({"max_stub_mm": limit, "source": limit_source, "plane_layers": my_planes, "plane_spacing_mm": regime.spacing_mm.map(r3), "regime": regime.name});
+        let required = json!({"max_stub_mm": limit, "source": limit_source, "plane_layers": my_planes, "plane_spacing_mm": regime.spacing_mm.map(r3), "regime": regime.name, "regime_note": regime.note});
         let net_pads: Vec<&CopperPad> = pads.iter().filter(|p| p.net.as_deref() == Some(net.as_str())).collect();
         if !net_pads.iter().any(|p| p.smd) {
             continue;
@@ -3560,6 +3551,47 @@ fn plane_connection_checks(
         }
     }
     checks
+}
+
+/// One pad's `plane_connection` verdict, for `fanout_to_plane` (Pass 24).
+#[derive(Debug, Clone)]
+pub(crate) struct PlaneVerdict {
+    /// `REF.PAD`.
+    pub pad: String,
+    pub net: String,
+    pub status: String,
+    pub detail: String,
+    pub measured: Value,
+    pub required: Value,
+}
+
+/// The `plane_connection` check alone, on a board, as `check_design_intent`
+/// runs it (same pads, copper, stack-up and exceptions).
+pub(crate) fn plane_verdicts(tree: &SexpNode, intent: &DesignIntent) -> Vec<PlaneVerdict> {
+    let pads = copper_pads(tree);
+    let copper = board_copper(tree);
+    let (layers, planes, _) = stack_and_planes(intent, Some(tree));
+    let vias = konnect_sexp::board::vias(tree).items;
+    plane_connection_checks(tree, intent, &pads, &copper, &vias, &layers, &planes)
+        .into_iter()
+        .filter(|c| c.kind == "plane_connection")
+        .map(|c| PlaneVerdict {
+            pad: c.measured["pad"].as_str().unwrap_or("").to_string(),
+            net: c.measured["net"].as_str().unwrap_or("").to_string(),
+            status: c.status.to_string(),
+            detail: c.detail,
+            measured: c.measured,
+            required: c.required,
+        })
+        .collect()
+}
+
+/// The design intent saved beside a board (`<stem>.intent.json`), or the
+/// empty intent when there is none, and the file it came from.
+pub(crate) fn intent_for_board(board: &Path) -> anyhow::Result<(DesignIntent, Option<PathBuf>)> {
+    let stem = project_stem(board)?;
+    let (intent, text) = load_intent(&stem)?;
+    Ok((intent, text.map(|_| intent_path(&stem))))
 }
 
 /// The plane-connection limits the check will use: the default with its

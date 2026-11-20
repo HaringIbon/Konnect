@@ -259,22 +259,36 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "fanout_to_plane",
-            "Drop every surface-mount pad on a plane net to its plane: a short stub on the pad's \
-             layer and a through via next to the pad, placed clear of every other net's pads, \
-             tracks and vias, keep-outs and the board edge (box-model checks; run DRC after). \
-             Plane nets default to the nets with a zone on an inner layer. Through-hole pads and \
-             pads already joined to a track or via are skipped. Items are locked by default so \
-             the autorouter keeps them. Use dry_run to inspect the plan first.",
+            "Drop every surface-mount pad on a plane net to its plane. Default mode \
+             'low_inductance' (Pass 24): every SMD pad that does not already pass the \
+             plane_connection check gets its own via against the pad (drill edge via_hole_gap, \
+             0.25 mm, from the pad edge; not in the pad unless via_in_pad 'filled_capped'), beside \
+             the pads of a two-pad part on the side facing the IC it serves, both pads treated \
+             alike; a capacitor pad shares an adjacent IC pin's via only when share_with_ic \
+             'auto', same side and planes > 0.5 mm apart in the stack-up. Never touches another \
+             part's pad (same net or not), another part's courtyard on the same side \
+             (avoid_courtyards), keep-outs, the edge, or copper on any layer. Intent exceptions \
+             are honoured. Every pad gets a decision in `pads` (via, share, kept, exception, \
+             through_hole, no_site with what blocked it), and `self_check` returns the \
+             plane_connection verdict per pad on the planned (dry run) or applied board. Mode \
+             'legacy' keeps the old planner. Items are locked by default; drc_gate undoes a \
+             fan-out that adds a DRC error. dry_run works on the saved file when KiCad is closed.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":       { "type": "string" },
                     "nets":        { "type": "array", "items": { "type": "string" }, "description": "Plane nets; defaults to nets with an inner-layer zone" },
+                    "mode":        { "type": "string", "enum": ["low_inductance", "legacy"], "default": "low_inductance" },
+                    "share_with_ic": { "type": "string", "enum": ["auto", "never"], "default": "auto", "description": "auto: a capacitor pad shares an adjacent IC pin's via when they are on the same side and the planes are > 0.5 mm apart (learnemc widely-spaced); never: own via always" },
+                    "via_in_pad":  { "type": "string", "enum": ["never", "filled_capped"], "default": "never", "description": "filled_capped declares filled and capped vias: small pads take the via in the pad, both pads of a two-pad part alike" },
+                    "via_hole_gap": { "type": "number", "default": 0.25, "description": "Pad edge to via drill edge, mm (Eurocircuits tombstoning guide)" },
+                    "share_max_gap": { "type": "number", "default": 0.5, "description": "A shared IC via must be this close to the capacitor pad (copper edge to pad edge), mm" },
+                    "avoid_courtyards": { "type": "boolean", "default": true, "description": "No via in another part's courtyard on the pad's side" },
                     "via_size":    { "type": "number", "default": 0.6 },
                     "via_drill":   { "type": "number", "default": 0.3 },
                     "track_width": { "type": "number", "default": 0.3 },
                     "clearance":   { "type": "number", "default": 0.2, "description": "Minimum copper clearance used when choosing via sites" },
-                    "max_stub":    { "type": "number", "default": 2.5, "description": "Longest stub from pad centre to via (mm)" },
+                    "max_stub":    { "type": "number", "default": 2.5, "description": "Longest stub from pad centre to via centre (mm); low_inductance also keeps the connecting trace within the plane_connection limit" },
                     "lock":        { "type": "boolean", "default": true },
                     "drc_gate":    { "type": "boolean", "default": true, "description": "Run KiCad DRC before and after (project rules, zones refilled) and undo the fan-out if it adds any DRC error" },
                     "dry_run":     { "type": "boolean", "default": false }
@@ -283,7 +297,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_fanout_to_plane(args, ctx).await }
         )
-        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         tool!(
             "plan_specctra_ses_import",
             "Validate a Freerouting Specctra SES against its revision-bound Konnect manifest and the exact live KiCad board. Returns every track and via that would be created and a per-net summary (tracks, vias, length); never mutates or saves the board.",
@@ -867,6 +881,11 @@ fn netclass_fanout_options(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn netclass_fanout_options_for_tests(board: &Path) -> impl Fn(&str) -> crate::tools::fanout::FanoutOptions + Send + 'static {
+    netclass_fanout_options(board)
+}
+
 /// KiCad netclass pattern match: `*` and `?` wildcards, otherwise exact.
 pub(crate) fn glob_matches(pattern: &str, name: &str) -> bool {
     fn go(p: &[u8], n: &[u8]) -> bool {
@@ -885,7 +904,7 @@ async fn handle_fanout_to_plane(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    use crate::tools::fanout::{plan, plane_nets, FanoutOptions};
+    use crate::tools::fanout::{board_with_plan, plan_with_judge, plane_nets, self_check, FanoutOptions, LowInductance};
     let board = get_path(args, "board")?;
     // Sizes come from each net's net class in the .kicad_pro; explicit
     // arguments override them for every net.
@@ -927,6 +946,46 @@ async fn handle_fanout_to_plane(
             "invalid fan-out geometry",
         ));
     }
+    let invalid = |field: &str, reason: &str| {
+        CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument { field: field.to_string(), reason: reason.to_string() },
+            format!("invalid {field}: {reason}"),
+        )
+    };
+    let legacy = match args["mode"].as_str().unwrap_or("low_inductance") {
+        "low_inductance" => false,
+        "legacy" => true,
+        _ => return Ok(invalid("mode", "must be 'low_inductance' or 'legacy'")),
+    };
+    let share_with_ic = match args["share_with_ic"].as_str().unwrap_or("auto") {
+        "auto" => true,
+        "never" => false,
+        _ => return Ok(invalid("share_with_ic", "must be 'auto' or 'never'")),
+    };
+    let via_in_pad = match args["via_in_pad"].as_str().unwrap_or("never") {
+        "never" => false,
+        "filled_capped" => true,
+        _ => return Ok(invalid("via_in_pad", "must be 'never' or 'filled_capped'")),
+    };
+    let mut settings = LowInductance { share_with_ic, via_in_pad, ..LowInductance::default() };
+    if let Some(gap) = args["via_hole_gap"].as_f64() {
+        if !(0.0..=2.0).contains(&gap) {
+            return Ok(invalid("via_hole_gap", "must be between 0 and 2 mm"));
+        }
+        settings.hole_gap_mm = gap;
+    }
+    if let Some(gap) = args["share_max_gap"].as_f64() {
+        if !(0.0..=2.0).contains(&gap) {
+            return Ok(invalid("share_max_gap", "must be between 0 and 2 mm"));
+        }
+        settings.share_max_gap_mm = gap;
+    }
+    settings.avoid_courtyards = args["avoid_courtyards"].as_bool().unwrap_or(settings.avoid_courtyards);
+    // The judge's limits and exceptions come from the intent beside the board.
+    let (intent, intent_file) = match crate::tools::design_intent::intent_for_board(&board) {
+        Ok(found) => found,
+        Err(error) => return Ok(invalid("board", &format!("the design intent beside the board cannot be used: {error:#}"))),
+    };
     let requested_nets = args["nets"].as_array().map(|nets| {
         nets.iter()
             .filter_map(|net| net.as_str().map(str::to_string))
@@ -938,17 +997,28 @@ async fn handle_fanout_to_plane(
     let cli_path = ctx.config.kicad_cli.clone();
     let runtime = tokio::runtime::Handle::current();
     let board_for_gate = board.canonicalize().unwrap_or_else(|_| board.clone());
+    let nets_for_plan = requested_nets.clone();
+    let planner = {
+        let settings = settings.clone();
+        let intent = intent.clone();
+        move |tree: &konnect_sexp::SexpNode| -> anyhow::Result<_> {
+            let nets = nets_for_plan.clone().unwrap_or_else(|| plane_nets(tree));
+            if nets.is_empty() {
+                anyhow::bail!("no plane nets: the board has no zone on an inner layer (a 2-layer board without a plane: the plane rule does not apply; declare a no_plane exception in the intent); pass `nets` to name them");
+            }
+            Ok(plan_with_judge(tree, &nets, &options_for, legacy, &settings, &intent))
+        }
+    };
+    let planner = std::sync::Arc::new(planner);
+    let live_planner = planner.clone();
 
     let result = with_board_ipc_classified(ctx, &board, move |client, document| {
         let snapshot = client.save_document_to_string_in(document.clone())?;
         let tree = konnect_sexp::parse_sexp(&snapshot).context("parse live board snapshot")?;
-        let nets = requested_nets.unwrap_or_else(|| plane_nets(&tree));
-        if nets.is_empty() {
-            anyhow::bail!("no plane nets: the board has no zone on an inner layer; pass `nets`");
-        }
-        let fanout = plan(&tree, &nets, &options_for);
+        let (fanout, before) = live_planner(&tree)?;
         if dry_run || fanout.fanouts.is_empty() {
-            return Ok((fanout, 0usize, None));
+            let after = (!fanout.fanouts.is_empty()).then(|| board_with_plan(&snapshot, &fanout));
+            return Ok((fanout, before, 0usize, None, after.or(Some(snapshot))));
         }
         let codes = client
             .get_nets_in(document.clone())?
@@ -965,11 +1035,15 @@ async fn handle_fanout_to_plane(
             let code = *codes
                 .get(&item.net)
                 .with_context(|| format!("live board has no net '{}'", item.net))?;
-            let mut via = konnect_ipc::builders::build_via(
-                &item.net, code, item.via_x, item.via_y, item.via_drill_mm, item.via_size_mm,
-            );
-            via.locked = locked;
-            items.push(konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via"));
+            // A tie into an exposed pad, or a stub to a shared IC via, places
+            // no via of its own (Pass 24: ties used to get one too).
+            if item.via {
+                let mut via = konnect_ipc::builders::build_via(
+                    &item.net, code, item.via_x, item.via_y, item.via_drill_mm, item.via_size_mm,
+                );
+                via.locked = locked;
+                items.push(konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via"));
+            }
             if !item.in_pad {
                 let mut stub = konnect_ipc::builders::build_track(
                     &item.net, code, &item.layer, item.track_width_mm,
@@ -984,8 +1058,9 @@ async fn handle_fanout_to_plane(
             anyhow::bail!("the board changed while the fan-out was planned; retry");
         }
         if drc_gate {
-            let evidence = gated_commit(client, document, &snapshot, "Fan out to plane", items, &board_for_gate, &cli_path, &runtime)?;
-            return Ok((fanout, evidence.created, Some(evidence)));
+            let evidence = gated_commit(client, document.clone(), &snapshot, "Fan out to plane", items, &board_for_gate, &cli_path, &runtime)?;
+            let after = client.save_document_to_string_in(document)?;
+            return Ok((fanout, before, evidence.created, Some(evidence), Some(after)));
         }
         let expected = items.len();
         let created = client.run_commit("Fan out to plane", |client| {
@@ -994,23 +1069,69 @@ async fn handle_fanout_to_plane(
         if created.len() != expected {
             anyhow::bail!("KiCad created {} of {} fan-out items", created.len(), expected);
         }
-        Ok((fanout, created.len(), None))
+        let after = client.save_document_to_string_in(document)?;
+        Ok((fanout, before, created.len(), None, Some(after)))
     })
     .await?;
+    // KiCad is not serving the board: a dry run plans from the saved file.
+    let (result, board_source) = match result {
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) if dry_run => (plan_saved(&board, &*planner), "saved_file"),
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) if dry_run && error.proves_not_open() => (plan_saved(&board, &*planner), "saved_file"),
+        Err(konnect_ipc::IpcFailure::Unreachable(message)) => {
+            return Ok(CallToolResult::error(format!("fanout_to_plane: KiCad is not reachable ({message}); applying needs the board open in KiCad, dry_run plans from the saved file")))
+        }
+        other => (other, "ipc"),
+    };
     match result {
-        Ok((fanout, created, gate)) => Ok(CallToolResult::json(&json!({
-            "drc_gate": gate,
-            "dry_run": dry_run,
-            "nets": fanout.nets,
-            "plane_source": fanout.plane_source,
-            "planned": fanout.fanouts.len(),
-            "created_items": created,
-            "locked": lock && !dry_run,
-            "through_hole_pads_skipped": fanout.through_hole_pads,
-            "fanouts": fanout.fanouts,
-            "skipped": fanout.skipped,
-            "next_step": if drc_gate && !dry_run { "KiCad DRC found no new errors (zones refilled); autoroute the remaining nets." } else { "Refill zones and run DRC." }
-        }))),
+        Ok((fanout, before, created, gate, after)) => {
+            let nets = fanout.nets.clone();
+            let after_verdicts = after
+                .as_deref()
+                .and_then(|text| konnect_sexp::parse_sexp(text).ok())
+                .map(|tree| crate::tools::design_intent::plane_verdicts(&tree, &intent));
+            let stage = if dry_run || fanout.fanouts.is_empty() { "planned (dry run: the plan's items added to the board text, zones not refilled)" } else { "applied (read back from KiCad)" };
+            let mut check = after_verdicts.as_deref().map(|v| self_check(v, &nets)).unwrap_or(serde_json::Value::Null);
+            if let serde_json::Value::Object(m) = &mut check {
+                m.insert("stage".into(), json!(stage));
+                m.insert("before".into(), self_check(&before, &nets)["summary"].clone());
+            }
+            let failing = check["failing"].as_u64().unwrap_or(0);
+            let shared = fanout.fanouts.iter().filter(|f| f.shares_via_of.is_some()).count();
+            let vias = fanout.fanouts.iter().filter(|f| f.via).count();
+            Ok(CallToolResult::json(&json!({
+                "drc_gate": gate,
+                "dry_run": dry_run,
+                "board_source": board_source,
+                "mode": fanout.mode,
+                "intent": intent_file.map(|p| p.display().to_string()),
+                "nets": fanout.nets,
+                "plane_source": fanout.plane_source,
+                "planned": fanout.fanouts.len(),
+                "vias_planned": vias,
+                "vias_shared": shared,
+                "created_items": created,
+                "locked": lock && !dry_run,
+                "through_hole_pads_skipped": fanout.through_hole_pads,
+                "settings": if legacy { serde_json::Value::Null } else { json!({
+                    "share_with_ic": if settings.share_with_ic { "auto" } else { "never" },
+                    "via_in_pad": if settings.via_in_pad { "filled_capped" } else { "never" },
+                    "via_hole_gap_mm": settings.hole_gap_mm,
+                    "share_max_gap_mm": settings.share_max_gap_mm,
+                    "avoid_courtyards": settings.avoid_courtyards,
+                }) },
+                "fanouts": fanout.fanouts,
+                "skipped": fanout.skipped,
+                "pads": fanout.pads,
+                "self_check": check,
+                "next_step": if failing > 0 {
+                    format!("{failing} pad(s) still fail plane_connection: see self_check.pads; a no_site decision in pads names what blocks each site (move the part, free the site, or declare an exception with its source)")
+                } else if drc_gate && !dry_run {
+                    "KiCad DRC found no new errors (zones refilled); autoroute the remaining nets.".to_string()
+                } else {
+                    "Refill zones and run DRC.".to_string()
+                }
+            })))
+        }
         Err(failure) => Ok(CallToolResult::error_kind(
             ToolErrorKind::HandlerError {
                 reason: failure.message().to_string(),
@@ -1018,6 +1139,32 @@ async fn handle_fanout_to_plane(
             format!("fanout_to_plane failed: {}", failure.message()),
         )),
     }
+}
+
+type FanoutOutcome = (
+    crate::tools::fanout::FanoutPlan,
+    Vec<crate::tools::design_intent::PlaneVerdict>,
+    usize,
+    Option<GateEvidence>,
+    Option<String>,
+);
+
+/// A plan with the judge's verdicts on the board it was made from.
+type JudgedPlan = (crate::tools::fanout::FanoutPlan, Vec<crate::tools::design_intent::PlaneVerdict>);
+
+/// A dry run on the saved board file (KiCad not serving it).
+fn plan_saved(
+    board: &Path,
+    planner: &dyn Fn(&konnect_sexp::SexpNode) -> anyhow::Result<JudgedPlan>,
+) -> Result<FanoutOutcome, konnect_ipc::IpcFailure> {
+    let run = || -> anyhow::Result<FanoutOutcome> {
+        let text = konnect_sexp::writer::read_consistent(board).with_context(|| format!("read {}", board.display()))?;
+        let tree = konnect_sexp::parse_sexp(&text).context("parse saved board")?;
+        let (fanout, before) = planner(&tree)?;
+        let after = if fanout.fanouts.is_empty() { text } else { crate::tools::fanout::board_with_plan(&text, &fanout) };
+        Ok((fanout, before, 0, None, Some(after)))
+    };
+    run().map_err(|e| konnect_ipc::IpcFailure::Rejected(format!("{e:#}")))
 }
 
 /// A zone as the board file records it.
