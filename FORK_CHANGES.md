@@ -1252,7 +1252,7 @@ Rebased by merging `safe-writes` 78bb158 (Pass 21); this pass was renumbered fro
    - **Demand on a cut** is the airwires crossing it, minus those crossing on their own pad. The **lower bound** is the nets with copper on both sides and none of their own across the line: each must cross at least once.
    - A full-board straight line cannot be gone round. So lower bound > lanes (at the narrowest crossing net's pitch), or Σ(w + s) > Σ(g − s_min), is a proof that no router can finish (`doomed`, sourced). The cut also reports the lanes at the fab minimum: "fits only if necked down".
    - Airwire utilisation over 0.8 on a cut is `tight` (judgement).
-   - **Channel cuts** run between two parts facing each other across ≤ 3 mm with no third part between, one of them with at least 8 pads, sharing at least 2 mm. Each is a segment from one part's centre to the other's at 1/4, 1/2 and 3/4 of the shared span. A route can go round a channel, so these give only `tight` (utilisation > 1 with ≥ 3 airwires; judgement).
+   - **Channel cuts** run between two parts facing each other across ≤ 3 mm with no third part between, one of them with at least 8 pads, sharing at least 2 mm. Each is a segment from one part's centre to the other's at 1/4, 1/2 and 3/4 of the shared span. A route can go round a channel, so these gave only `tight` (utilisation > 1 with ≥ 3 airwires; judgement). *Since the follow-up (N2) they are informational, measured between pad copper.*
    - **Congestion grid** (`cell_mm`): supply per cell is Σ_layers free area / (w + s), from a raster built from the same shape–line intersections as the cuts (`lou-ispd2001-probabilistic-congestion-slides`: tracks per pitch; PCB layers are not directional). Demand is RUDY per airwire, its box clamped to one track pitch and weighted by the net's pitch (`circuitnet-routability-features`, `arxiv-2206-03032-xie-thesis-rudy`). Overflow uses CircuitNet's definition.
    - Cells with no free track at all (pin fields) are counted apart as `blocked_cells_with_demand`, not as overflow. Otherwise every fine-pitch pad cell overflowed.
    - More than 5 % of cells overflowing is `tight` (judgement). On the benchmark boards it never exceeded 0.9 %.
@@ -1378,3 +1378,24 @@ Rebased by merging `safe-writes` 78bb158 (Pass 21); this pass was renumbered fro
 - Doom now comes only from proofs: a full-board cut, or an escape that does not fit even at the fab minimum.
 - Density is advisory.
 - A partial inner pour (less than half the board) on a signal-typed layer is still routed on, unblocked.
+
+### Follow-up (re-review of 457f664)
+
+**Principle:** doom proofs assume the most favourable reading of the board; the advisory (`tight`) metrics assume the less favourable one; both are disclosed.
+
+| # | Finding | Fix | Regression test |
+|---|---|---|---|
+| N1 | M3 turned a signal-typed inner layer with a flood of at least half the board into a plane for everything. A flooded routing layer (common; the pour yields to tracks) could then give a false sourced `doomed`. Repro: an 8×8 BGA with In2 signal + GND flood was `doomed`, "needs 3, routes on 2" | Such layers are now `rules.ambiguous_plane_layers`, with a note: "set the layer type to power if it is a plane, or remove/limit the pour if it is for routing". **Proofs** (`escape.layers`, `cut.lower_bound`) use `rules.proof_layers`: only `power`-typed inner layers are left out, ambiguous pours are unblocked, and full-board cuts are run on that set. **Advisory** metrics (crossings, cut utilisation, congestion, density) keep the M3 reading (a plane, pour blocked if named), so `demo_sig` still reads like the power-typed demo. The net is a plane net either way. An escape that fits only with the ambiguous layers is `tight` (`escape.ambiguous_layers`, judgement). Only `power`-typed inner layers are now in `plane_layers` | `followup_n1_a_flooded_signal_typed_inner_layer_never_proves_doom`, `followup_n1_the_cut_proof_reads_the_flood_as_routable`; `review_m3_…` updated |
+| N2 | Channel cuts ran courtyard to courtyard: close parts got 0 lanes (Ethernet U5–C25, 0.52 mm) and a false `tight` | Channels are measured between the parts' pad copper; the lane formula keeps the clearance at both ends. They are now **informational** (`channels_note`), never a verdict reason. A route can go round a channel, and when the gap is the only way through, the full-board cut along the same line counts it. The `channel.utilization` threshold is removed | `channel_cuts_name_the_parts_and_never_doom` (rewritten: 15 airwires, utilisation > 1, no reason), `review_l7_…` (copper extents) |
+| N3 | A group whose nets are all already connected was refused, but `export_specctra_dsn` accepts any net with 2 or more pins | Such a group returns `fine`, with `group.note` "nothing left to route: … already connected". Empty or blank names and groups of only plane or single-pad nets are still refused | `followup_n3_a_fully_routed_group_is_fine_with_a_note` |
+| N4 | Perimeter escape mixed rule sets: the via lists were at the class rules, `layers_needed` at the fab minimum | `interior_needs_via` and `via_outside_ring` now follow `layers_needed` (fab minimum). What only the class widths add is listed in `interior_needs_via_at_class_rules_only` / `via_outside_ring_at_class_rules_only`. The `sides[]` channel numbers stay at the class rules | `followup_n4_via_lists_follow_layers_needed_at_the_fab_minimum` |
+| N5 | M5 dropped every same-part connection on a shared layer, including pin to pin across the package past a different-net centre pad, and through-hole links | A direct stub only when both pads are SMD on one layer, one of them is an interior pad (off the pad-centre box), and the straight stub crosses no pad of another net. Everything else stays demand | `followup_n5_pin_to_pin_across_the_part_stays_demand`; `review_m5_…` still passes |
+
+**After the follow-up:**
+- The reviewer's `bga8` (In2 flooded): `tight`, with `escape.ambiguous_layers` naming In2.Cu (was `doomed`). `bga8nofill`: `tight` (`escape.neck_down`).
+- Tests: 5 new; `konnect-core --lib` 2004 passed, 0 failed.
+- The 16 calibration rows were re-run: no verdict changed.
+
+**Revised limits:**
+- An ambiguous layer is read both ways, so a board whose routability hinges on it is reported `tight`, never `doomed` or `fine`. Setting the layer's type resolves it.
+- Channel cuts no longer affect the verdict.

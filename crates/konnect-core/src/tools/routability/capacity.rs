@@ -301,7 +301,7 @@ pub(crate) fn full_board_cuts(board: &Board, airwires: &[Airwire], pitch: &[f64]
     out
 }
 
-/// A footprint's courtyard box, for the channel cuts.
+/// A footprint's copper box (the extent of its pads), for the channel cuts.
 #[derive(Debug, Clone)]
 pub(crate) struct PartBox {
     pub reference: String,
@@ -327,9 +327,11 @@ pub(crate) struct ChannelCut {
 /// Cuts across the gap between neighbouring parts: for two parts facing
 /// each other across a gap of at most `max_gap` mm with no third part in it
 /// (one of them an IC or connector),
-/// segments across the gap (courtyard to courtyard) at a quarter, half and
-/// three quarters of their shared span. A route can go round, so these only
-/// ever say "tight".
+/// segments across the gap (pad copper to pad copper; the lane formula
+/// keeps the clearance at both ends) at a quarter, half and three quarters
+/// of their shared span. Informational: a route can go round a channel, and
+/// when the gap is the only way through, the full-board cut along the same
+/// line already counts it.
 pub(crate) fn channel_cuts(board: &Board, airwires: &[Airwire], pitch: &[f64], parts: &[PartBox], max_gap: f64) -> Vec<ChannelCut> {
     let mut out = Vec::new();
     for (i, a) in parts.iter().enumerate() {

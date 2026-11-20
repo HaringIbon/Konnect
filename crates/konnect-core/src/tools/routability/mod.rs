@@ -74,11 +74,11 @@ pub(crate) const THRESHOLDS: &[Threshold] = &[
     Threshold { id: "crossings.layers", rule: "DSatur colours of the crossing graph exceed the signal layers by more than this", level: "tight", value: 1.0, kind: "judgement", source: "Konnect judgement, calibrated: the PoC mcu_board needs 3 colours on 2 layers and Freerouting completes it" },
     Threshold { id: "crossings.k_over_e", rule: "crossings per airwire", level: "tight", value: 0.3, kind: "judgement", source: "Konnect judgement" },
     Threshold { id: "crossings.vias", rule: "via estimate per airwire", level: "tight", value: 1.0, kind: "judgement", source: "Konnect judgement (2 vias per hop)" },
+    Threshold { id: "escape.ambiguous_layers", rule: "the escape fits only if inner layers typed signal but poured over half the board are routed on", level: "tight", value: 0.0, kind: "judgement", source: "Konnect judgement: doom proofs read such a layer as routable, advisory metrics as a plane" },
     Threshold { id: "escape.neck_down", rule: "the escape fits the board's signal layers only with traces necked to the fab minimum in the breakout", level: "tight", value: 0.0, kind: "judgement", source: "Konnect judgement; neck-down in the breakout is allowed by xilinx-ug1099-bga-design-rules" },
     Threshold { id: "escape.channel", rule: "interior nets over a side's channel capacity", level: "tight", value: 0.8, kind: "judgement", source: "Konnect judgement" },
     Threshold { id: "escape.fanout_pitch", rule: "neighbouring pads that both need a trace closer than the fab-minimum track pitch (narrower than the class pitch is reported as needs_neck_down only: necking down in the breakout is allowed, xilinx-ug1099-bga-design-rules)", level: "tight", value: 1.0, kind: "judgement", source: "Konnect judgement, from Wang's C formula" },
     Threshold { id: "cut.utilization", rule: "airwire demand over a full-board cut's capacity", level: "tight", value: 0.8, kind: "judgement", source: "Konnect judgement" },
-    Threshold { id: "channel.utilization", rule: "airwires through the gap between two parts over its capacity, with at least 3 airwires (a route can go round)", level: "tight", value: 1.0, kind: "judgement", source: "Konnect judgement" },
     Threshold { id: "congestion.overflow", rule: "share of grid cells whose RUDY demand exceeds supply", level: "tight", value: 0.05, kind: "judgement", source: "Konnect judgement; overflow as defined by circuitnet-routability-features, supply per lou-ispd2001-probabilistic-congestion-slides" },
 ];
 
@@ -493,17 +493,22 @@ pub(crate) struct Planes {
     /// Nets whose connections planes or pours make, and why. Their airwires
     /// are fan-out work (a via per pad), not routing demand.
     pub nets: BTreeMap<String, String>,
-    /// Inner copper layers that are planes: typed `power`, or (KiCad types
-    /// inner layers `signal` by default) poured over at least half the board.
-    /// Not routed on unless the caller names them, and then their pour is
-    /// blocked.
+    /// Inner copper layers typed `power`: never routed on unless the caller
+    /// names them, and then their pour is blocked.
     pub layers: BTreeSet<String>,
+    /// Inner layers typed `signal` (KiCad's default) but poured over at
+    /// least half the board: a plane or a routing layer with a flood, which
+    /// the file cannot tell apart. Doom proofs take the favourable reading
+    /// (routable, pour unblocked); advisory metrics the unfavourable one
+    /// (a plane). Their nets are plane nets either way.
+    pub ambiguous: BTreeSet<String>,
 }
 
 pub(crate) fn planes(model: &BoardModel, board_area: f64) -> Planes {
     let kind_of = |layer: &str| model.copper.iter().find(|(n, _)| n == layer).map(|(_, k)| k.as_str());
     let mut nets = BTreeMap::new();
     let mut layers = BTreeSet::new();
+    let mut ambiguous = BTreeSet::new();
     for zone in &model.zones {
         let Some(net) = &zone.net else { continue };
         let large = board_area > 0.0 && polygon_area(&zone.outline) >= 0.5 * board_area;
@@ -517,8 +522,8 @@ pub(crate) fn planes(model: &BoardModel, board_area: f64) -> Planes {
                 Some("mixed") => Some(format!("pour on mixed layer {layer} (its area counts as blocked for routing)")),
                 Some(_) if large && outer => Some(format!("pour on {layer} over at least half the board (judgement)")),
                 Some(_) if large => {
-                    layers.insert(layer.clone());
-                    Some(format!("plane on {layer}: an inner layer typed signal but poured over at least half the board, treated as a plane layer (judgement)"))
+                    ambiguous.insert(layer.clone());
+                    Some(format!("pour on {layer}: an inner layer typed signal but poured over at least half the board (ambiguous: a plane for the advisory metrics, routable for the doom proofs)"))
                 }
                 _ => None,
             };
@@ -527,7 +532,7 @@ pub(crate) fn planes(model: &BoardModel, board_area: f64) -> Planes {
             }
         }
     }
-    Planes { nets, layers }
+    Planes { nets, layers, ambiguous }
 }
 
 // ─── Airwires ───────────────────────────────────────────────────────────────
@@ -803,6 +808,52 @@ fn to_local(p: Pt, centre: Pt, rotation: f64) -> Pt {
     konnect_sexp::geometry::transform_pad(p.0 - centre.0, p.1 - centre.1, 0.0, 0.0, -rotation)
 }
 
+/// Obstacles on `layers`: pads, tracks, vias, keep-outs, pours on
+/// `blocked` layers, and the board-edge clearance band.
+fn obstacles_for(model: &BoardModel, layers: &[String], blocked: &BTreeSet<String>, edges: &[(Pt, Pt)], rules: &NetRules) -> (Vec<Obstacle>, Vec<Value>) {
+    let all: Vec<usize> = (0..layers.len()).collect();
+    let mut obstacles: Vec<Obstacle> = Vec::new();
+    for pad in &model.pads {
+        let on = if pad.smd { layer_indices(layers, &[pad.layer.to_string()]) } else { all.clone() };
+        if !on.is_empty() {
+            obstacles.push(Obstacle { shape: Shape::Poly(pad.outline.clone()), layers: on, net: pad.net.clone(), pad: true, edge: false });
+        }
+    }
+    for t in &model.tracks {
+        let on = layer_indices(layers, std::slice::from_ref(&t.seg.layer));
+        if !on.is_empty() {
+            obstacles.push(Obstacle { shape: Shape::Capsule { a: t.seg.a, b: t.seg.b, r: t.width / 2.0 }, layers: on, net: t.seg.net.clone(), pad: false, edge: false });
+        }
+    }
+    for v in &model.vias {
+        obstacles.push(Obstacle { shape: Shape::Circle { c: v.at, r: v.size / 2.0 }, layers: all.clone(), net: v.net.clone(), pad: false, edge: false });
+    }
+    for (polygon, specs) in model.outline.track_keepouts() {
+        let on: Vec<usize> = (0..layers.len()).filter(|&l| specs.iter().any(|s| keepout_applies(s, &layers[l]))).collect();
+        if !on.is_empty() && polygon.len() >= 3 {
+            obstacles.push(Obstacle { shape: Shape::Poly(polygon.to_vec()), layers: on, net: None, pad: false, edge: false });
+        }
+    }
+    let mut blocked_pours = Vec::new();
+    for zone in &model.zones {
+        for layer in zone.layers.iter().filter(|l| blocked.contains(*l)) {
+            let Some(l) = layers.iter().position(|x| x == layer) else { continue };
+            let fills: Vec<&Vec<Pt>> = zone.fills.iter().filter(|(fl, _)| fl == layer).map(|(_, p)| p).collect();
+            let polygons: Vec<Vec<Pt>> = if fills.is_empty() { vec![zone.outline.clone()] } else { fills.into_iter().cloned().collect() };
+            for polygon in polygons.into_iter().filter(|p| p.len() >= 3) {
+                obstacles.push(Obstacle { shape: Shape::Poly(polygon), layers: vec![l], net: zone.net.clone(), pad: false, edge: false });
+            }
+            blocked_pours.push(json!({ "net": zone.net, "layer": layer }));
+        }
+    }
+    if rules.edge_clearance > 0.0 {
+        for &(a, b) in edges {
+            obstacles.push(Obstacle { shape: Shape::Capsule { a, b, r: rules.edge_clearance }, layers: all.clone(), net: None, pad: false, edge: true });
+        }
+    }
+    (obstacles, blocked_pours)
+}
+
 /// The whole pre-check on a parsed board and its airwires. Pure: the tests
 /// call it with synthetic boards and airwires.
 pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airwire], group: Option<&Group>, options: &Options) -> Result<Value, String> {
@@ -821,77 +872,56 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
     let plane_info = planes(model, board_area);
     let planes = &plane_info.nets;
 
-    // Signal layers: signal and mixed copper, minus inner layers that are
-    // planes (typed `power`, or poured over half the board whatever their type).
-    let layers: Vec<String> = match &options.signal_layers {
-        Some(names) => {
-            let unknown: Vec<&String> = names.iter().filter(|n| !model.copper.iter().any(|(c, _)| c == *n)).collect();
-            if !unknown.is_empty() || names.is_empty() {
-                return Err(format!(
-                    "signal_layers must name copper layers of the board (board copper: {}); unknown: {}",
-                    model.copper.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>().join(", "),
-                    unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-                ));
-            }
-            names.clone()
+    // Signal layers. Advisory metrics: signal and mixed copper minus inner
+    // planes (power-typed, and signal-typed inner layers poured over half the
+    // board). Doom proofs take the most favourable reading: only power-typed
+    // inner layers are left out, and ambiguous pours are not blocked.
+    let check_names = |names: &Vec<String>| -> Result<(), String> {
+        let unknown: Vec<&String> = names.iter().filter(|n| !model.copper.iter().any(|(c, _)| c == *n)).collect();
+        if !unknown.is_empty() || names.is_empty() {
+            return Err(format!(
+                "signal_layers must name copper layers of the board (board copper: {}); unknown: {}",
+                model.copper.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>().join(", "),
+                unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            ));
         }
-        None => model
+        Ok(())
+    };
+    let default_layers = |skip_ambiguous: bool| -> Vec<String> {
+        model
             .copper
             .iter()
-            .filter(|(n, k)| (k == "signal" || k == "mixed") && !plane_info.layers.contains(n))
+            .filter(|(n, k)| (k == "signal" || k == "mixed") && !plane_info.layers.contains(n) && !(skip_ambiguous && plane_info.ambiguous.contains(n)))
             .map(|(n, _)| n.clone())
-            .collect(),
+            .collect()
     };
-    if layers.is_empty() {
+    let (layers, proof_layers): (Vec<String>, Vec<String>) = match &options.signal_layers {
+        Some(names) => {
+            check_names(names)?;
+            (names.clone(), names.clone())
+        }
+        None => (default_layers(true), default_layers(false)),
+    };
+    if proof_layers.is_empty() {
         return Err("the board has no signal or mixed copper layer to route on".into());
     }
-    let all: Vec<usize> = (0..layers.len()).collect();
+    if layers.is_empty() {
+        return Err(format!(
+            "every routable layer is poured over at least half the board ({}): name the routing layers with signal_layers, or set plane layers to the power type",
+            plane_info.ambiguous.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
     raster.blocked = vec![vec![false; raster.nx * raster.ny]; layers.len()];
-
-    // Obstacles: pads, tracks, vias, keep-outs, mixed-layer pours, edge clearance.
-    let mut obstacles: Vec<Obstacle> = Vec::new();
-    for pad in &model.pads {
-        let on = if pad.smd { layer_indices(&layers, &[pad.layer.to_string()]) } else { all.clone() };
-        if !on.is_empty() {
-            obstacles.push(Obstacle { shape: Shape::Poly(pad.outline.clone()), layers: on, net: pad.net.clone(), pad: true, edge: false });
-        }
-    }
-    for t in &model.tracks {
-        let on = layer_indices(&layers, std::slice::from_ref(&t.seg.layer));
-        if !on.is_empty() {
-            obstacles.push(Obstacle { shape: Shape::Capsule { a: t.seg.a, b: t.seg.b, r: t.width / 2.0 }, layers: on, net: t.seg.net.clone(), pad: false, edge: false });
-        }
-    }
-    for v in &model.vias {
-        obstacles.push(Obstacle { shape: Shape::Circle { c: v.at, r: v.size / 2.0 }, layers: all.clone(), net: v.net.clone(), pad: false, edge: false });
-    }
-    for (polygon, specs) in model.outline.track_keepouts() {
-        let on: Vec<usize> = (0..layers.len()).filter(|&l| specs.iter().any(|s| keepout_applies(s, &layers[l]))).collect();
-        if !on.is_empty() && polygon.len() >= 3 {
-            obstacles.push(Obstacle { shape: Shape::Poly(polygon.to_vec()), layers: on, net: None, pad: false, edge: false });
-        }
-    }
-    let mixed: BTreeSet<&str> = model.copper.iter().filter(|(_, k)| k == "mixed").map(|(n, _)| n.as_str()).collect();
-    let mut blocked_pours = Vec::new();
-    for zone in &model.zones {
-        for layer in zone.layers.iter().filter(|l| mixed.contains(l.as_str()) || plane_info.layers.contains(*l)) {
-            let Some(l) = layers.iter().position(|x| x == layer) else { continue };
-            let fills: Vec<&Vec<Pt>> = zone.fills.iter().filter(|(fl, _)| fl == layer).map(|(_, p)| p).collect();
-            let polygons: Vec<Vec<Pt>> = if fills.is_empty() { vec![zone.outline.clone()] } else { fills.into_iter().cloned().collect() };
-            for polygon in polygons.into_iter().filter(|p| p.len() >= 3) {
-                obstacles.push(Obstacle { shape: Shape::Poly(polygon), layers: vec![l], net: zone.net.clone(), pad: false, edge: false });
-            }
-            blocked_pours.push(json!({ "net": zone.net, "layer": layer }));
-        }
-    }
-    if rules.edge_clearance > 0.0 {
-        for &(a, b) in &edges {
-            obstacles.push(Obstacle { shape: Shape::Capsule { a, b, r: rules.edge_clearance }, layers: all.clone(), net: None, pad: false, edge: true });
-        }
-    }
+    let mixed: BTreeSet<String> = model.copper.iter().filter(|(_, k)| k == "mixed").map(|(n, _)| n.clone()).collect();
+    let advisory_blocked: BTreeSet<String> = mixed.iter().chain(&plane_info.layers).chain(&plane_info.ambiguous).cloned().collect();
+    let proof_blocked: BTreeSet<String> = mixed.iter().chain(&plane_info.layers).cloned().collect();
+    let (obstacles, blocked_pours) = obstacles_for(model, &layers, &advisory_blocked, &edges, rules);
     for o in &obstacles {
         raster.mark_obstacle(&o.shape, &o.layers);
     }
+    let proof_differs = proof_layers != layers || !plane_info.ambiguous.is_empty();
+    let (proof_obstacles, _) = if proof_differs { obstacles_for(model, &proof_layers, &proof_blocked, &edges, rules) } else { (Vec::new(), Vec::new()) };
+    let ambiguous_used: Vec<&String> = plane_info.ambiguous.iter().filter(|l| proof_layers.contains(l)).collect();
 
     // Demand: airwires of routable nets in the group.
     let mut plane_airwires = 0usize;
@@ -906,9 +936,23 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
             demand.push(w.clone());
         }
     }
+    let mut group_note = None;
     if let Some(g) = group.filter(|_| demand.is_empty()) {
-        // As export_specctra_dsn: a group with nothing to route is refused,
-        // each net with its reason.
+        // As export_specctra_dsn: a group none of whose nets is routable (all
+        // left to planes, or single pads) is refused, each net with its
+        // reason. A group of routable nets that are already connected is
+        // checked and reported "nothing left to route".
+        let routable: Vec<&String> = g
+            .nets
+            .iter()
+            .filter(|net| !planes.contains_key(*net) && model.pads.iter().filter(|p| p.net.as_deref() == Some(net.as_str())).count() >= 2)
+            .collect();
+        if !routable.is_empty() {
+            group_note = Some(format!(
+                "nothing left to route: {} already connected",
+                routable.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ")
+            ));
+        }
         let why: Vec<String> = g
             .nets
             .iter()
@@ -922,7 +966,9 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
                 format!("'{net}' ({reason})")
             })
             .collect();
-        return Err(format!("no net of the group needs routing: {}", why.join("; ")));
+        if group_note.is_none() {
+            return Err(format!("no net of the group needs routing: {}", why.join("; ")));
+        }
     }
     let (w0, s0) = rules.default_rule();
     let pitch: Vec<f64> = demand.iter().map(|w| {
@@ -1019,6 +1065,10 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
         }
         let mut package_pads = Vec::new();
         let mut destinations = Vec::new();
+        // Interior pads (centre pad, inner rows): not on the pad-centre box.
+        let locals: Vec<Pt> = pads.iter().map(|p| to_local(p.center, centre, rotation)).collect();
+        let (lx0, ly0, lx1, ly1) = locals.iter().fold((f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), |(a, b, c, d), &(x, y)| (a.min(x), b.min(y), c.max(x), d.max(y)));
+        let interior = |q: Pt| q.0 - lx0 > 0.05 && lx1 - q.0 > 0.05 && q.1 - ly0 > 0.05 && ly1 - q.1 > 0.05;
         for pad in pads {
             let relative = (pad.angle - rotation).to_radians();
             let (hw, hh) = (pad.size.0 / 2.0, pad.size.1 / 2.0);
@@ -1028,12 +1078,29 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
             // A connection to another pad of the same part on a shared layer
             // (a pin to its own exposed pad) is a direct stub inside the
             // part, not escape demand.
+            // A connection to an interior pad of the same part (a pin to its
+            // own exposed pad) is a direct stub, not escape demand, when both
+            // are SMD on one layer and the straight stub crosses no pad of
+            // another net. Anything else (pin to pin across the part, a
+            // through-hole link) stays demand.
             let same_part_same_layer = |other: &AirwireEnd| {
-                other.pad.as_ref().is_some_and(|(r, _)| r == &pad.reference)
-                    && (!pad.smd || match &other.layers {
-                        EndLayers::All => true,
-                        EndLayers::One(l) => l == pad.layer,
+                let Some((r, n)) = other.pad.as_ref() else { return false };
+                if r != &pad.reference || !pad.smd || other.layers != EndLayers::One(pad.layer.to_string()) {
+                    return false;
+                }
+                let Some(target) = pads.iter().find(|q| &q.number == n && (q.center.0 - other.at.0).hypot(q.center.1 - other.at.1) < 1e-3) else { return false };
+                // One end must be interior (the stub runs from the pin inward).
+                if !target.smd || !(interior(to_local(target.center, centre, rotation)) || interior(to_local(pad.center, centre, rotation))) {
+                    return false;
+                }
+                let steps = (((other.at.0 - pad.center.0).hypot(other.at.1 - pad.center.1)) / 0.02).ceil().max(1.0) as usize;
+                !pads.iter().filter(|q| q.net != pad.net && q.layer == pad.layer && q.smd).any(|q| {
+                    (0..=steps).any(|k| {
+                        let t = k as f64 / steps as f64;
+                        let p = (pad.center.0 + t * (other.at.0 - pad.center.0), pad.center.1 + t * (other.at.1 - pad.center.1));
+                        crate::tools::fanout::point_in_polygon(p, &q.outline)
                     })
+                })
             };
             let far: Vec<Pt> = demand
                 .iter()
@@ -1070,8 +1137,20 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
     for (report, w, s) in &packages {
         let (fw, fs) = (rules.fab_w.min(*w), rules.fab_s.min(*s));
         let over = |needed: Option<usize>| needed.is_none_or(|n| n > layers.len());
-        if let Some(needed) = report.layers_needed.filter(|&n| n > layers.len()) {
-            reasons.push(Reason { metric: "escape", level: "doomed", threshold: "escape.layers", detail: format!("{} needs {needed} signal layers to escape its pins even with traces necked to the fab minimum ({fw}/{fs} mm), and the board routes on {}", report.reference, layers.len()), measured: json!(needed) });
+        if let Some(needed) = report.layers_needed.filter(|&n| n > proof_layers.len()) {
+            reasons.push(Reason { metric: "escape", level: "doomed", threshold: "escape.layers", detail: format!("{} needs {needed} signal layers to escape its pins even with traces necked to the fab minimum ({fw}/{fs} mm), and the board has {} routable layers", report.reference, proof_layers.len()), measured: json!(needed) });
+        } else if let Some(needed) = report.layers_needed.filter(|&n| n > layers.len()) {
+            reasons.push(Reason {
+                metric: "escape",
+                level: "tight",
+                threshold: "escape.ambiguous_layers",
+                detail: format!(
+                    "{} needs {needed} signal layers to escape; that fits only if the poured signal-typed layer(s) {} are routed on",
+                    report.reference,
+                    ambiguous_used.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+                measured: json!(needed),
+            });
         } else if report.layers_needed.is_none() {
             reasons.push(Reason { metric: "escape", level: "doomed", threshold: "escape.layers", detail: format!("{}: inner rows cannot escape: no trace fits between pads even at the fab minimum ({fw}/{fs} mm); needs via-in-pad/HDI or a finer process", report.reference), measured: Value::Null });
         } else if report.needs_neck_down && over(report.layers_needed_at_class_rules) {
@@ -1105,9 +1184,16 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
         escape_json.push(value);
     }
 
-    // 3a. Full-board cuts.
+    // 3a. Full-board cuts: the proof on the favourable layer set, the
+    // advisory utilisation on the unfavourable one.
     let cuts = capacity::full_board_cuts(&board, &demand, &pitch, CUT_STEP_MM);
-    let doomed_cuts: Vec<&capacity::Cut> = cuts.iter().filter(|c| c.proves_doom()).collect();
+    let proof_cuts = if proof_differs {
+        let proof_board = Board { layers: &proof_layers, edges: &edges, obstacles: &proof_obstacles, tracks: &tracks, raster: &raster, rules: cut_rules };
+        capacity::full_board_cuts(&proof_board, &demand, &pitch, CUT_STEP_MM)
+    } else {
+        cuts.clone()
+    };
+    let doomed_cuts: Vec<&capacity::Cut> = proof_cuts.iter().filter(|c| c.proves_doom()).collect();
     let worst_cuts: Vec<&capacity::Cut> = {
         let mut sorted: Vec<&capacity::Cut> = cuts.iter().filter(|c| c.demand_airwires > 0).collect();
         sorted.sort_by(|a, b| b.utilization.total_cmp(&a.utilization));
@@ -1127,7 +1213,7 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
             measured: json!(worst.lower_bound_utilization),
         });
     }
-    if let Some(worst) = worst_cuts.first().filter(|c| c.utilization > threshold("cut.utilization").value && !c.proves_doom()) {
+    if let Some(worst) = worst_cuts.first().filter(|c| c.utilization > threshold("cut.utilization").value && doomed_cuts.is_empty()) {
         reasons.push(Reason {
             metric: "cuts",
             level: "tight",
@@ -1137,27 +1223,25 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
         });
     }
 
-    // 3a'. Channels between parts.
-    let parts: Vec<PartBox> = model
-        .parts
-        .iter()
-        .filter(|p| p.bbox_source != konnect_sexp::board::CourtyardSource::AnchorOnly)
-        .map(|p| {
-            let reference = p.reference.clone().unwrap_or_default();
-            let pads = model.pads.iter().filter(|q| q.reference == reference).count();
-            PartBox { reference, bbox: p.bbox, pads }
-        })
+    // 3a'. Channels between parts, measured between their copper (pad
+    // extents), not their courtyards: routes may run over a courtyard.
+    let mut copper_boxes: BTreeMap<&str, ((f64, f64, f64, f64), usize)> = BTreeMap::new();
+    for pad in &model.pads {
+        let e = copper_boxes.entry(pad.reference.as_str()).or_insert(((f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), 0));
+        for &(x, y) in &pad.outline {
+            e.0 = (e.0 .0.min(x), e.0 .1.min(y), e.0 .2.max(x), e.0 .3.max(y));
+        }
+        e.1 += 1;
+    }
+    let parts: Vec<PartBox> = copper_boxes
+        .into_iter()
+        .filter(|(r, _)| !r.is_empty())
+        .map(|(reference, (bbox, pads))| PartBox { reference: reference.to_string(), bbox, pads })
         .collect();
     let channels = capacity::channel_cuts(&board, &demand, &pitch, &parts, CHANNEL_MAX_GAP_MM);
-    if let Some(worst) = channels.iter().find(|c| c.cut.utilization > threshold("channel.utilization").value && c.cut.demand_airwires >= 3) {
-        reasons.push(Reason {
-            metric: "channels",
-            level: "tight",
-            threshold: "channel.utilization",
-            detail: format!("between {} and {} (gap {} mm): {} airwires against {} lanes", worst.between[0], worst.between[1], worst.gap_mm, worst.cut.demand_airwires, worst.cut.capacity_lanes),
-            measured: json!(worst.cut.utilization),
-        });
-    }
+    // Informational only: a route can go round a channel, and when the gap
+    // is the only way through, the full-board cut along the same line
+    // already sees it (and proves doom if it does not fit).
 
     // 3b. Congestion grid.
     let congestion = capacity::congestion(&board, &demand, &pitch, options.cell_mm);
@@ -1213,12 +1297,13 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
             worst_nets,
             reasons.iter().map(|r| r.metric).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(", ")
         ),
+        _ if group_note.is_some() => format!("Fine: {}.", group_note.clone().unwrap_or_default()),
         _ => "Fine: no metric is near its limit; autoroute.".to_string(),
     };
 
     let group_json = group.map(|g| {
         let plane_in_group: Vec<Value> = g.nets.iter().filter_map(|n| planes.get(n).map(|r| json!({ "net": n, "reason": r }))).collect();
-        json!({ "nets": g.nets, "requested_nets": g.requested_nets, "classes": g.classes, "not_demand": plane_in_group })
+        json!({ "nets": g.nets, "requested_nets": g.requested_nets, "classes": g.classes, "not_demand": plane_in_group, "note": group_note })
     });
     let demand_nets: BTreeSet<&String> = demand.iter().map(|w| &w.net).collect();
     let mut out = json!({
@@ -1243,6 +1328,9 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
             "edge_clearance_mm": rules.edge_clearance,
             "blocked_pours": blocked_pours,
             "plane_layers": plane_info.layers,
+            "ambiguous_plane_layers": plane_info.ambiguous,
+            "proof_layers": proof_layers,
+            "ambiguous_plane_layers_note": if plane_info.ambiguous.is_empty() { Value::Null } else { json!("These inner layers are typed signal but poured over at least half the board. The doom proofs (escape, full-board cuts) treat them as routable with the pour unblocked; the advisory metrics (crossings, congestion, density) treat them as planes. Set the layer type to power if it is a plane, or remove/limit the pour if it is for routing.") },
             "raster_mm": round3(res),
         },
         "crossings": crossings_json,
@@ -1259,6 +1347,7 @@ pub(crate) fn analyse(model: &BoardModel, rules: &NetRules, all_airwires: &[Airw
             v["gap_mm"] = json!(c.gap_mm);
             v
         }).collect::<Vec<_>>(),
+        "channels_note": "informational, never a verdict reason: a route can go round a channel, and when the gap is the only way through, the full-board cut along the same line counts it",
         "congestion": congestion,
         "density": density,
         "pin_density": pin_density,

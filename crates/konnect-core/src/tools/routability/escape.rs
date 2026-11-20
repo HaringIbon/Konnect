@@ -118,7 +118,7 @@ fn board_direction(normal: Pt, rotation: f64) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct NetPad {
     pub net: String,
     pub pad: String,
@@ -169,6 +169,10 @@ pub(crate) struct EscapeReport {
     /// centre pad) while the ring has no channel (C = 0): the route needs a
     /// via outside the ring and another layer under it.
     pub via_outside_ring: Vec<NetPad>,
+    /// Interior nets and ring pads that need a via only at the class widths
+    /// (with fab-minimum traces they fit a channel).
+    pub interior_needs_via_at_class_rules_only: Vec<NetPad>,
+    pub via_outside_ring_at_class_rules_only: Vec<NetPad>,
     /// Grid arrays: rows holding signal pads, C and D (Wang), and UG1099 Eq. 2-1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grid: Option<GridReport>,
@@ -235,6 +239,13 @@ pub(crate) fn analyse_package(package: &Package, destinations: &[Vec<Pt>], w: f6
     let necked = at(fab.0.min(w), fab.1.min(s));
     report.layers_needed_at_class_rules = report.layers_needed;
     report.layers_needed = necked.layers_needed;
+    // The via lists follow `layers_needed` (fab minimum); what only the
+    // class widths would add is listed apart, under the neck-down note.
+    let extra = |class: &[NetPad], necked: &[NetPad]| -> Vec<NetPad> { class.iter().filter(|c| !necked.contains(c)).cloned().collect() };
+    report.interior_needs_via_at_class_rules_only = extra(&report.interior_needs_via, &necked.interior_needs_via);
+    report.via_outside_ring_at_class_rules_only = extra(&report.via_outside_ring, &necked.via_outside_ring);
+    report.interior_needs_via = necked.interior_needs_via.clone();
+    report.via_outside_ring = necked.via_outside_ring.clone();
     report.needs_neck_down = report.layers_needed_at_class_rules != report.layers_needed;
     if let (Some(grid), Some(necked)) = (report.grid.as_mut(), necked.grid.as_ref()) {
         grid.c_at_fab_minimum = necked.c;
@@ -289,6 +300,8 @@ fn analyse_grid(package: &Package, w: f64, s: f64) -> Option<EscapeReport> {
         layers_needed: array_layers_needed(signal_rows, c),
         layers_needed_at_class_rules: None,
         needs_neck_down: false,
+        interior_needs_via_at_class_rules_only: Vec::new(),
+        via_outside_ring_at_class_rules_only: Vec::new(),
         grid: Some(grid),
     })
 }
@@ -477,6 +490,8 @@ fn analyse_perimeter(package: &Package, destinations: &[Vec<Pt>], w: f64, s: f64
         layers_needed: Some(if pads.iter().any(|p| p.demand) { 1 + usize::from(needs_second_layer) } else { 0 }),
         layers_needed_at_class_rules: None,
         needs_neck_down: false,
+        interior_needs_via_at_class_rules_only: Vec::new(),
+        via_outside_ring_at_class_rules_only: Vec::new(),
     }
 }
 

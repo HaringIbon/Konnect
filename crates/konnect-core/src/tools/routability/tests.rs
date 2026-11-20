@@ -363,19 +363,25 @@ fn a_partly_routed_net_already_across_the_cut_owes_no_crossing() {
 
 #[test]
 fn channel_cuts_name_the_parts_and_never_doom() {
-    // A1 is an 8-pad part (channels are examined next to ICs and connectors).
-    let pads: String = (0..8).map(|k| format!("(pad \"{}\" smd rect (at -2 {}) (size 0.5 0.3) (layers \"F.Cu\") (net \"Q\"))", k + 1, -2.0 + 0.5 * k as f64)).collect();
-    let a = format!("(footprint \"A\" (layer \"F.Cu\") (at 5 10) (property \"Reference\" \"A1\") (fp_rect (start -3 -3) (end 3 3) (layer \"F.CrtYd\")) {pads})");
-    let b = "(footprint \"A\" (layer \"F.Cu\") (at 13 10) (property \"Reference\" \"A2\") (fp_rect (start -3 -3) (end 3 3) (layer \"F.CrtYd\")) \
-        (pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\") (net \"Q\")))";
-    let m = model(20.0, 20.0, &format!("{a}{b}"));
-    let airwires: Vec<Airwire> = (0..5).map(|i| wire(&format!("W{i}"), (8.6 + 0.1 * i as f64, 1.0), (8.7 + 0.1 * i as f64, 19.0))).collect();
+    // A1: an 8-pad column at x = 7 (copper 6.75..7.25); A2: one 1 × 3 mm pad
+    // at x = 10 (copper 9.5..10.5). The channel is measured between copper.
+    let m = model(20.0, 20.0, &channel_parts());
+    let airwires: Vec<Airwire> = (0..15).map(|i| wire(&format!("W{i}"), (8.0 + 0.1 * i as f64, 1.0), (8.05 + 0.1 * i as f64, 19.0))).collect();
     let out = analyse(&m, &rules(), &airwires, None, &options()).unwrap();
-    let channel = &out["channels"][0];
-    assert_eq!(channel["between"], json!(["A1", "A2"]), "{}", out["channels"]);
-    assert!((channel["gap_mm"].as_f64().unwrap() - 2.0).abs() < 1e-6);
-    assert_eq!(channel["demand_airwires"], 5);
+    let channel = out["channels"].as_array().unwrap().iter().find(|c| c["between"] == json!(["A1", "A2"])).expect("the A1–A2 channel");
+    assert!((channel["gap_mm"].as_f64().unwrap() - 2.25).abs() < 1e-6, "{channel}");
+    assert_eq!(channel["demand_airwires"], 15);
+    assert!(channel["utilization"].as_f64().unwrap() > 1.0, "{channel}");
     assert_eq!(channel["proves_doom"], false);
+    // Review N2: informational only, never a verdict reason.
+    assert!(!out["reasons"].as_array().unwrap().iter().any(|r| r["metric"] == "channels"), "{}", out["reasons"]);
+}
+
+fn channel_parts() -> String {
+    let pads: String = (0..8).map(|k| format!("(pad \"{}\" smd rect (at 2 {}) (size 0.5 0.3) (layers \"F.Cu\") (net \"Q{k}\"))", k + 1, -2.0 + 0.5 * k as f64)).collect();
+    let a = format!("(footprint \"A\" (layer \"F.Cu\") (at 5 10) (property \"Reference\" \"A1\") (fp_rect (start -3 -3) (end 3 3) (layer \"F.CrtYd\")) {pads})");
+    let b = "(footprint \"A\" (layer \"F.Cu\") (at 13 10) (property \"Reference\" \"A2\") (fp_rect (start -4 -3) (end 3 3) (layer \"F.CrtYd\")) (pad \"1\" smd rect (at -3 0) (size 1 3) (layers \"F.Cu\") (net \"Q\")))";
+    format!("{a}{b}")
 }
 
 // ─── Partial routing, airwires ──────────────────────────────────────────────
@@ -732,7 +738,8 @@ fn review_m3_a_signal_typed_inner_layer_poured_over_the_board_is_a_plane() {
     let m = BoardModel::read(&parse_sexp(&text).unwrap());
     let out = analyse(&m, &rules(), &mst_airwires(&m), None, &options()).unwrap();
     assert_eq!(out["rules"]["signal_layers"], json!(["F.Cu", "B.Cu"]), "{}", out["rules"]);
-    assert_eq!(out["rules"]["plane_layers"], json!(["In1.Cu"]));
+    // Follow-up N1: reported as ambiguous (advisory metrics read it as a plane).
+    assert_eq!(out["rules"]["ambiguous_plane_layers"], json!(["In1.Cu"]));
     assert_eq!(out["airwires"]["plane_net_airwires"], 1);
     assert_eq!(out["airwires"]["demand"], 1);
     // Named by the caller, the layer is routed on with its pour blocked.
@@ -833,14 +840,122 @@ fn review_l9_the_edge_band_is_not_charged_a_clearance_twice() {
 
 #[test]
 fn review_l7_channel_cuts_span_only_the_gap() {
-    let pads = |x: f64| -> String { (0..8).map(|k| format!("(pad \"{}\" smd rect (at {x} {}) (size 0.5 0.3) (layers \"F.Cu\") (net \"Q{k}\"))", k + 1, -2.0 + 0.5 * k as f64)).collect() };
-    let a = format!("(footprint \"A\" (layer \"F.Cu\") (at 5 10) (property \"Reference\" \"A1\") (fp_rect (start -3 -3) (end 3 3) (layer \"F.CrtYd\")) {})", pads(-2.0));
-    let b = "(footprint \"A\" (layer \"F.Cu\") (at 13 10) (property \"Reference\" \"A2\") (fp_rect (start -3 -3) (end 3 3) (layer \"F.CrtYd\")) (pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\") (net \"Q\")))";
-    let m = model(20.0, 20.0, &format!("{a}{b}"));
-    // An airwire through A1's body (x = 6) is not in the gap (8..10).
+    let m = model(20.0, 20.0, &channel_parts());
+    // An airwire left of A1's copper (x = 6) is not in the gap (7.25..9.5).
     let airwires = vec![wire("W0", (6.0, 1.0), (6.0, 19.0)), wire("W1", (9.0, 1.0), (9.0, 19.0))];
     let out = analyse(&m, &rules(), &airwires, None, &options()).unwrap();
     let channel = out["channels"].as_array().unwrap().iter().find(|c| c["between"] == json!(["A1", "A2"])).unwrap();
     assert_eq!(channel["demand_airwires"], 1, "{channel}");
-    assert_eq!((channel["from"].as_f64().unwrap(), channel["to"].as_f64().unwrap()), (8.0, 10.0));
+    assert_eq!((channel["from"].as_f64().unwrap(), channel["to"].as_f64().unwrap()), (7.25, 9.5));
+}
+
+
+// ─── Follow-up (re-review of 457f664) ───────────────────────────────────────
+
+/// F.Cu / In1.Cu (power, GND plane) / In2.Cu (signal, flooded with `flood`) /
+/// B.Cu, a QFN whose centre pad carries a signal net to a resistor.
+fn flooded_inner_board(flood: bool) -> BoardModel {
+    let zone = if flood { "(zone (net \"GND\") (layers \"In2.Cu\") (polygon (pts (xy 0 0) (xy 20 0) (xy 20 20) (xy 0 20))))" } else { "" };
+    let text = format!(
+        "(kicad_pcb (version 20260206) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" power) (6 \"In2.Cu\" signal) (2 \"B.Cu\" power) (25 \"Edge.Cuts\" user)) \
+         (gr_rect (start 0 0) (end 20 20) (layer \"Edge.Cuts\")) {}{} \
+         (zone (net \"GND\") (layers \"In1.Cu\") (polygon (pts (xy 0 0) (xy 20 0) (xy 20 20) (xy 0 20)))) {zone})",
+        qfn("U1", 10.0, 10.0, 4, "SIG"),
+        part("R1", 3.0, 10.0, "SIG", "GND")
+    );
+    BoardModel::read(&parse_sexp(&text).unwrap())
+}
+
+#[test]
+fn followup_n1_a_flooded_signal_typed_inner_layer_never_proves_doom() {
+    // Routing layers: F.Cu, and In2.Cu if its flood is read as routable. The
+    // centre pad needs a second layer: favourable reading → no doom.
+    let m = flooded_inner_board(true);
+    let out = analyse(&m, &rules(), &mst_airwires(&m), None, &options()).unwrap();
+    assert_ne!(out["verdict"], "doomed", "{:?}", reasons(&out));
+    assert_eq!(out["rules"]["ambiguous_plane_layers"], json!(["In2.Cu"]));
+    assert_eq!(out["rules"]["proof_layers"], json!(["F.Cu", "In2.Cu"]));
+    assert_eq!(out["rules"]["signal_layers"], json!(["F.Cu"]), "advisory metrics read it as a plane");
+    assert!(out["rules"]["ambiguous_plane_layers_note"].as_str().unwrap().contains("layer type to power"));
+    let reason = out["reasons"].as_array().unwrap().iter().find(|r| r["threshold"]["id"] == "escape.ambiguous_layers").expect("tight, with the layer named");
+    assert!(reason["detail"].as_str().unwrap().contains("In2.Cu"));
+    // Without the flood In2.Cu is an ordinary routing layer: no ambiguity.
+    let m = flooded_inner_board(false);
+    let out = analyse(&m, &rules(), &mst_airwires(&m), None, &options()).unwrap();
+    assert_eq!(out["rules"]["signal_layers"], json!(["F.Cu", "In2.Cu"]));
+    assert!(out["rules"]["ambiguous_plane_layers"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn followup_n1_the_cut_proof_reads_the_flood_as_routable() {
+    // A keep-out wall on F.Cu only, gap 1 mm: on F.Cu alone 6 nets cannot
+    // cross, but In2.Cu (flooded, signal-typed) could carry them.
+    let text = format!(
+        "(kicad_pcb (version 20260206) (layers (0 \"F.Cu\" signal) (6 \"In2.Cu\" signal) (2 \"B.Cu\" power) (25 \"Edge.Cuts\" user)) \
+         (gr_rect (start 0 0) (end 20 20) (layer \"Edge.Cuts\")) {} \
+         (zone (layers \"F.Cu\") (keepout (tracks not_allowed) (vias not_allowed)) (polygon (pts (xy -1 9.5) (xy 19 9.5) (xy 19 10.5) (xy -1 10.5)))) \
+         (zone (net \"GND\") (layers \"In2.Cu\") (polygon (pts (xy 0 0) (xy 20 0) (xy 20 20) (xy 0 20)))))",
+        crossing_nets(6)
+    );
+    let m = BoardModel::read(&parse_sexp(&text).unwrap());
+    let airwires: Vec<Airwire> = mst_airwires(&m).into_iter().filter(|w| w.net.starts_with('V')).collect();
+    let out = analyse(&m, &rules(), &airwires, None, &options()).unwrap();
+    assert_ne!(out["verdict"], "doomed", "{:?}", reasons(&out));
+    assert!(out["cuts"]["doomed"].as_array().unwrap().is_empty());
+    assert!(reasons(&out).contains(&("cuts".to_string(), "tight".to_string())), "advisory: the F.Cu-only cut is over: {:?}", reasons(&out));
+}
+
+#[tokio::test]
+async fn followup_n3_a_fully_routed_group_is_fine_with_a_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.kicad_pcb");
+    let extra = format!(
+        "{}{}(segment (start 4.8 10) (end 15.2 10) (width 0.2) (layer \"F.Cu\") (net \"N\"))",
+        part("R1", 4.0, 10.0, "A", "N"),
+        part("R2", 16.0, 10.0, "N", "B")
+    );
+    std::fs::write(&path, board_text(20.0, 20.0, &extra)).unwrap();
+    let ctx = crate::tools::ToolContext::new(crate::tools::ServerConfig::default(), std::sync::Arc::new(crate::router::ToolRouter::new()));
+    let r = handle_check_routability(&json!({ "board": path, "airwires": "mst", "nets": ["N"] }), &ctx).await.unwrap();
+    let crate::mcp::protocol::ToolContent::Text { text } = &r.content[0] else { panic!() };
+    assert!(!r.is_error, "{text}");
+    let out: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(out["verdict"], "fine");
+    assert!(out["group"]["note"].as_str().unwrap().contains("nothing left to route"), "{}", out["group"]);
+}
+
+#[test]
+fn followup_n4_via_lists_follow_layers_needed_at_the_fab_minimum() {
+    // 0.5 mm QFN, 0.25 mm pads: C = 0 at 0.2/0.2 but 1 at 0.075/0.075. The
+    // centre pad's net fits a channel when necked down.
+    let project = json!({
+        "net_settings": { "classes": [ { "name": "Default", "track_width": 0.2, "clearance": 0.2 } ] },
+        "board": { "design_settings": { "rules": { "min_track_width": 0.075, "min_clearance": 0.075 } } }
+    });
+    let fine_process = NetRules::from_project(Some(&project));
+    let m = model(20.0, 20.0, &format!("{}{}", qfn("U1", 10.0, 10.0, 4, "SIG"), part("R1", 3.0, 10.0, "SIG", "Z")));
+    let one = Options { signal_layers: Some(vec!["F.Cu".into()]), ..options() };
+    let out = analyse(&m, &fine_process, &mst_airwires(&m), None, &one).unwrap();
+    let u1 = out["escape"].as_array().unwrap().iter().find(|e| e["reference"] == "U1").unwrap();
+    assert_eq!(u1["layers_needed"], 1, "{u1}");
+    assert!(u1["interior_needs_via"].as_array().unwrap().is_empty(), "{u1}");
+    assert_eq!(u1["interior_needs_via_at_class_rules_only"][0]["net"], "SIG", "{u1}");
+    assert_eq!(u1["needs_neck_down"], true);
+    assert_ne!(out["verdict"], "doomed");
+}
+
+#[test]
+fn followup_n5_pin_to_pin_across_the_part_stays_demand() {
+    // W1 and E2 share a net; the straight stub between them crosses the
+    // centre pad (another net), so it is escape demand on both sides.
+    let extra = qfn("U1", 10.0, 10.0, 4, "GNDX").replace("(net \"U1_E2\")", "(net \"U1_W1\")");
+    let m = model(20.0, 20.0, &extra);
+    let airwires = mst_airwires(&m);
+    assert!(airwires.iter().any(|w| w.net == "U1_W1"), "{airwires:?}");
+    let out = analyse(&m, &rules(), &airwires, None, &options()).unwrap();
+    let u1 = out["escape"].as_array().unwrap().iter().find(|e| e["reference"] == "U1").unwrap();
+    for faces in ["west", "east"] {
+        let side = u1["sides"].as_array().unwrap().iter().find(|s| s["faces"] == faces).unwrap();
+        assert_eq!(side["demand_pads"], 1, "{faces}: {side}");
+    }
 }
