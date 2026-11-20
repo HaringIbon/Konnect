@@ -282,7 +282,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "share_with_ic": { "type": "string", "enum": ["auto", "never"], "default": "auto", "description": "auto: a capacitor pad shares an adjacent IC pin's via when they are on the same side and the planes are > 0.5 mm apart (learnemc widely-spaced); never: own via always" },
                     "via_in_pad":  { "type": "string", "enum": ["never", "filled_capped"], "default": "never", "description": "filled_capped declares filled and capped vias: small pads take the via in the pad, both pads of a two-pad part alike" },
                     "via_hole_gap": { "type": "number", "default": 0.25, "description": "Pad edge to via drill edge, mm (Eurocircuits tombstoning guide)" },
-                    "share_max_gap": { "type": "number", "default": 0.5, "description": "A shared IC via must be this close to the capacitor pad (copper edge to pad edge), mm" },
+                    "share_max_gap": { "type": "number", "description": "A shared IC via must be this close to the capacitor pad (copper edge to pad edge), mm. Omitted: butted, i.e. no trace beyond the via-against-pad placement ((via_hole_gap + drill/2) - size/2 + 0.05; 0.15 mm for a 0.6/0.3 via), per learnemc-decoupling-widely-spaced-planes. A larger value (e.g. 0.5) is an explicit, unsourced opt-in that allows a short trace" },
                     "avoid_courtyards": { "type": "boolean", "default": true, "description": "No via in another part's courtyard on the pad's side" },
                     "via_size":    { "type": "number", "default": 0.6 },
                     "via_drill":   { "type": "number", "default": 0.3 },

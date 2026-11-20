@@ -1491,3 +1491,10 @@ Also: three MCP dispatch tests used fixed names in the shared temp dir and colli
 - The cost weights, the 15 mm IC search and the "smaller than 0603" test (two pads, courtyard ≤ 2.4 mm) are Konnect judgements; the courtyard excess values are IPC-7351B nominal as encoded by KiCad's footprint generator, not read from IPC-7351B itself or from KLC F5.3 (both unreachable here).
 - Pad identity uses the file's pad UUID; a board without pad UUIDs falls back to name and centre (3 decimals).
 - Apply over live IPC is still not exercised against KiCad; the handler tests cover argument handling, the saved-file dry run, response assembly and the IPC item list.
+
+**Second review (re-review of 1fc8ba3): merge, with two small fixes applied:**
+- The input schema no longer advertises `share_max_gap` default 0.5. Omitting it means butted, as the code does. A client that fills in schema defaults would otherwise have silently opted back into sharing over a short trace.
+- `courtyard_margin`: an `X*` reference whose footprint is a crystal, oscillator or resonator keeps the standard 0.25 mm, not the 0.5 mm connector offset (test `a_crystal_referenced_x_keeps_the_standard_courtyard_margin`).
+- **Known, not fixed:**
+  - Exception pads that are on no plane net are emitted without `pad_uuid`/`at`, so they never match a planned pad. No effect today: such nets have no inner zone and are not fan-out nets.
+  - `schematic_placement_tests::native_placement_preserves_unique_and_reused_paths_with_committed_readback` still fails intermittently in full runs and passes alone. This predates Pass 24.

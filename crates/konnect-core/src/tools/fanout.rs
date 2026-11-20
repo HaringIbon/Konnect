@@ -966,13 +966,22 @@ fn courtyard_margin(reference: &str, footprint_name: &str, pads: usize, bbox: Bb
     let long = (bbox.2 - bbox.0).max(bbox.3 - bbox.1);
     if footprint_name.to_ascii_uppercase().contains("BGA") {
         1.0
-    } else if ref_kind(reference) == "connector" {
+    } else if ref_kind(reference) == "connector" && !is_frequency_part(footprint_name) {
+        // A crystal or oscillator referenced X* is a two-pad/four-pad body,
+        // not a connector: it keeps the standard 0.25 mm offset.
         0.5
     } else if pads == 2 && long < 2.4 {
         0.15
     } else {
         0.25
     }
+}
+
+/// Crystal, oscillator or resonator footprints (the `X*` prefix is shared
+/// with connectors in `ref_kind`).
+fn is_frequency_part(footprint_name: &str) -> bool {
+    let name = footprint_name.to_ascii_lowercase();
+    ["crystal", "oscillator", "resonator"].iter().any(|k| name.contains(k))
 }
 
 impl Courtyard {
@@ -2181,6 +2190,14 @@ fn segment_hits_polygon(a: Point, b: Point, half_width: f64, polygon: &[Point]) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_crystal_referenced_x_keeps_the_standard_courtyard_margin() {
+        let bbox = (0.0, 0.0, 3.2, 2.5);
+        assert_eq!(courtyard_margin("X1", "Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm", 4, bbox), 0.25);
+        assert_eq!(courtyard_margin("X2", "Connector_PinHeader_2.54mm:PinHeader_1x04", 4, bbox), 0.5);
+        assert_eq!(courtyard_margin("J1", "Connector_USB:USB_C_Receptacle", 16, bbox), 0.5);
+    }
+
     use super::*;
     use konnect_sexp::parse_sexp;
 
