@@ -663,7 +663,10 @@ mod path_argument_taxonomy_tests {
     #[tokio::test]
     async fn a_present_but_unusable_path_is_not_an_argument_error() {
         let handler = handler().await;
-        let missing_file = std::env::temp_dir().join("konnect-194-does-not-exist.kicad_pcb");
+        // A private directory: a fixed name in the shared temp dir collides
+        // with concurrent test runs (other worktrees).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing_file = dir.path().join("konnect-194-does-not-exist.kicad_pcb");
         let (result, _, kind) = handler
             .dispatch_tool(
                 "get_board_info",
@@ -715,7 +718,8 @@ mod required_argument_dispatch_tests {
         // A path argument is supplied where the handler reads one first, so
         // the assertion is about the field named rather than whichever
         // argument happens to be checked earliest.
-        let sch = std::env::temp_dir().join("konnect-218.kicad_sch");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sch = dir.path().join("konnect-218.kicad_sch");
         let s = sch.display().to_string();
         let cases: Vec<(&str, Value, &str)> = vec![
             ("search_symbols", json!({}), "query"),
@@ -789,7 +793,8 @@ mod required_argument_dispatch_tests {
     #[tokio::test]
     async fn the_dispatch_accepts_all_four_sheet_pin_edges_and_refuses_a_fifth() {
         let handler = handler().await;
-        let schematic_path = std::env::temp_dir().join("konnect-sides.kicad_sch");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let schematic_path = dir.path().join("konnect-sides.kicad_sch");
         let schematic_path_string = schematic_path.display().to_string();
 
         // Each tool gets only its own arguments: the records are closed, so a
